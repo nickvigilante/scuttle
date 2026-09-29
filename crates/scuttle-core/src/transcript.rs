@@ -62,7 +62,11 @@ impl Transcript {
     /// Applies one stream event. Returns `Applied::Reconnect` when the stream must be reopened.
     pub fn apply(&mut self, ev: &StreamEvent) -> Applied {
         if self.pending_history.is_some() && ev.kind != StreamEventType::Message {
-            self.flush_history();
+            if ev.kind == StreamEventType::HistoryReset {
+                self.pending_history = None;
+            } else {
+                self.flush_history();
+            }
         }
         let Some(e) = ev.event.as_ref() else {
             return match ev.kind {
@@ -336,6 +340,11 @@ mod tests {
         t.apply(&ev(json!({"type": "history_reset"})));
         t.apply(&ev(message(5, "user", "msg5")));
         t.apply(&ev(json!({"type": "history_reset"})));
+        assert_eq!(
+            ids(&t),
+            Vec::<i64>::new(),
+            "first buffer discarded, not flushed"
+        );
         t.apply(&ev(message(7, "user", "msg7")));
         t.apply(&ev(
             json!({"type": "status", "status": {"status": "running"}}),
