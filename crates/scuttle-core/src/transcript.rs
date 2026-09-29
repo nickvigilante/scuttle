@@ -53,9 +53,7 @@ impl Transcript {
         let Some(buffer) = self.pending_history.take() else {
             return;
         };
-        if let Some(first) = buffer.iter().filter_map(|m| m.id).min() {
-            self.messages.retain(|id, _| *id < first);
-        }
+        self.messages.clear();
         for m in buffer {
             self.upsert(m);
         }
@@ -90,6 +88,7 @@ impl Transcript {
                 }
                 let assistant = m.role.as_ref().map(|r| r.as_str()) == Some("assistant");
                 self.upsert(m);
+                self.last_error = None;
                 self.retry = None;
                 if assistant {
                     self.live.clear();
@@ -109,10 +108,19 @@ impl Transcript {
                 match status {
                     Some(ChatStatus::Waiting) => {
                         self.live.set_idle(true);
+                        self.last_error = None;
                         self.retry = None;
                     }
-                    Some(ChatStatus::Running) => self.live.set_idle(false),
-                    _ => {}
+                    Some(ChatStatus::Running) => {
+                        self.live.set_idle(false);
+                        self.last_error = None;
+                        self.retry = None;
+                    }
+                    Some(ChatStatus::Error) => {}
+                    _ => {
+                        self.last_error = None;
+                        self.retry = None;
+                    }
                 }
                 self.status = status;
                 Applied::Changed
@@ -124,6 +132,7 @@ impl Transcript {
                     .and_then(|x| x.message.clone())
                     .unwrap_or_else(|| "unknown error".into());
                 self.last_error = Some(message);
+                self.retry = None;
                 self.live.clear();
                 Applied::Changed
             }
@@ -242,7 +251,7 @@ mod tests {
         t.apply(&ev(
             json!({"type": "status", "status": {"status": "running"}}),
         ));
-        assert_eq!(ids(&t), vec![1, 2, 3]);
+        assert_eq!(ids(&t), vec![3]);
         let edited = t.messages().last().unwrap();
         assert_eq!(edited.content[0].text.as_deref(), Some("edited"));
     }
@@ -305,5 +314,49 @@ mod tests {
         t.apply(&ev(part(1, "hi")));
         assert_eq!(ids(&t), vec![7]);
         assert_eq!(t.live.blocks, vec![LiveBlock::Text("hi".into())]);
+    }
+
+    #[test]
+    fn history_reset_with_no_replacements_clears_history() {
+        let mut t = Transcript::default();
+        for id in 1..=3 {
+            t.apply(&ev(message(id, "user", "msg")));
+        }
+        assert_eq!(ids(&t), vec![1, 2, 3]);
+        t.apply(&ev(json!({"type": "history_reset"})));
+        t.apply(&ev(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        assert_eq!(ids(&t), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn second_history_reset_restarts_buffering() {
+        let mut t = Transcript::default();
+        t.apply(&ev(json!({"type": "history_reset"})));
+        t.apply(&ev(message(5, "user", "msg5")));
+        t.apply(&ev(json!({"type": "history_reset"})));
+        t.apply(&ev(message(7, "user", "msg7")));
+        t.apply(&ev(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        assert_eq!(ids(&t), vec![7]);
+    }
+
+    #[test]
+    fn last_error_clears_when_the_chat_recovers() {
+        let mut t = Transcript::default();
+        t.apply(&ev(json!({"type": "error", "error": {"message": "boom"}})));
+        assert_eq!(t.last_error.as_deref(), Some("boom"));
+        assert_eq!(t.retry, None);
+        t.apply(&ev(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        assert_eq!(t.last_error, None);
+        t.apply(&ev(json!({"type": "error", "error": {"message": "oops"}})));
+        assert_eq!(t.last_error.as_deref(), Some("oops"));
+        t.apply(&ev(message(1, "user", "recovery")));
+        assert_eq!(t.last_error, None);
+        assert_eq!(t.retry, None);
     }
 }
