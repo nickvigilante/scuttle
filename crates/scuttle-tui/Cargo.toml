@@ -34,6 +34,7 @@ uuid.workspace = true
 insta = "1"
 portable-pty = "0.9"
 secrecy = "0.10"
+tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-tungstenite = "0.30"
 vt100 = "0.15"
 wiremock = "0.6"

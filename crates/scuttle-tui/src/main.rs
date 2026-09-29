@@ -9,6 +9,8 @@ mod runtime;
 mod terminal;
 mod theme;
 mod transcript_view;
+#[cfg(test)]
+mod turn_tests;
 mod wrap;
 
 use std::ops::ControlFlow;
