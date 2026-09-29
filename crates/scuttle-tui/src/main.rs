@@ -2,6 +2,7 @@
 // pieces exercised only by their own unit tests.
 #![allow(dead_code)]
 
+mod clipboard;
 mod composer;
 mod footer;
 mod highlight;
