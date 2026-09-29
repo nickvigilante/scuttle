@@ -47,7 +47,7 @@ pub enum CopyTarget {
 }
 
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum Msg {
     Started {
         org_id: Uuid,
@@ -58,6 +58,10 @@ pub enum Msg {
         messages: Vec<types::CodersdkChatMessage>,
     },
     ChatCreated(Box<types::CodersdkChat>),
+    /// The runtime sends this when `Effect::CreateChat` fails.
+    CreateFailed {
+        message: String,
+    },
     Stream(StreamEvent),
     StreamEnded {
         error: Option<String>,
@@ -116,6 +120,8 @@ pub enum Effect {
     ShowHelp,
     Copy(CopyTarget),
     SetMouse(bool),
+    /// Puts text back in the composer after a failed chat creation.
+    RestoreComposer(String),
     Quit,
 }
 
@@ -140,7 +146,9 @@ pub struct App {
     pub connection: Connection,
     pub busy: BusyBehavior,
     pub mouse: bool,
-    creating: bool,
+    pub models_loaded: bool,
+    /// The text of the message sent with the in-flight `Effect::CreateChat`, if any.
+    creating: Option<String>,
     pending_text: Option<String>,
     reconnect_attempt: u32,
 }
@@ -158,6 +166,15 @@ impl App {
         matches!(
             self.transcript.status,
             Some(ChatStatus::Running | ChatStatus::Interrupting | ChatStatus::RequiresAction)
+        )
+    }
+
+    /// Whether `Msg::Interrupt` should send `Effect::Interrupt`. Unlike `is_running`, this
+    /// excludes `Interrupting` since an interrupt is already in flight.
+    pub fn can_interrupt(&self) -> bool {
+        matches!(
+            self.transcript.status,
+            Some(ChatStatus::Running | ChatStatus::RequiresAction)
         )
     }
 
@@ -197,7 +214,11 @@ impl App {
                 effects
             }
             Msg::ChatLoaded { chat, messages } => {
-                let Some(id) = chat.id else { return vec![] };
+                let Some(id) = chat.id else {
+                    self.error("The server returned a chat without an id.");
+                    self.connection = Connection::Idle;
+                    return vec![];
+                };
                 self.selected_model = self.selected_model.or(chat.last_model_config_id);
                 self.selected_workspace = chat.workspace_id;
                 self.chat_id = Some(id);
@@ -210,8 +231,11 @@ impl App {
                 }]
             }
             Msg::ChatCreated(chat) => {
-                let Some(id) = chat.id else { return vec![] };
-                self.creating = false;
+                let Some(id) = chat.id else {
+                    return self.fail_create("the server returned a chat without an id".into());
+                };
+                let workspace_mismatch = self.selected_workspace != chat.workspace_id;
+                self.creating = None;
                 self.chat_id = Some(id);
                 self.chat = Some(chat);
                 self.connection = Connection::Connecting;
@@ -227,23 +251,41 @@ impl App {
                         busy: self.busy,
                     });
                 }
+                if workspace_mismatch {
+                    effects.push(Effect::SetWorkspace {
+                        chat: id,
+                        workspace: self.selected_workspace,
+                    });
+                }
                 effects
             }
-            Msg::Stream(ev) => {
-                self.connection = Connection::Live;
-                self.reconnect_attempt = 0;
-                match self.transcript.apply(&ev) {
-                    Applied::Reconnect(_) => match self.chat_id {
-                        Some(chat) => vec![Effect::ReconnectAfter {
+            Msg::CreateFailed { message } => self.fail_create(message),
+            Msg::Stream(ev) => match self.transcript.apply(&ev) {
+                Applied::Reconnect(_) => match self.chat_id {
+                    Some(chat) => {
+                        self.reconnect_attempt += 1;
+                        self.connection = Connection::Reconnecting {
+                            attempt: self.reconnect_attempt,
+                        };
+                        let delay = if self.reconnect_attempt == 1 {
+                            Duration::ZERO
+                        } else {
+                            backoff(self.reconnect_attempt)
+                        };
+                        vec![Effect::ReconnectAfter {
                             chat,
                             after_id: self.transcript.last_message_id(),
-                            delay: Duration::ZERO,
-                        }],
-                        None => vec![],
-                    },
-                    _ => vec![],
+                            delay,
+                        }]
+                    }
+                    None => vec![],
+                },
+                _ => {
+                    self.connection = Connection::Live;
+                    self.reconnect_attempt = 0;
+                    vec![]
                 }
-            }
+            },
             Msg::StreamEnded { .. } => {
                 let Some(chat) = self.chat_id else {
                     return vec![];
@@ -268,6 +310,7 @@ impl App {
                     .into_iter()
                     .filter(|m| m.enabled != Some(false))
                     .collect();
+                self.models_loaded = true;
                 vec![]
             }
             Msg::WorkspacesLoaded(workspaces) => {
@@ -283,18 +326,29 @@ impl App {
             }
             Msg::WorkspaceChosen(ws) => self.set_workspace(ws),
             Msg::ApiFailed { action, message } => {
-                self.creating = false;
                 self.error(format!("Could not {action}: {message}"));
                 vec![]
             }
             Msg::Submit(text) => self.submit(text),
             Msg::Command(cmd) => self.command(cmd),
             Msg::Interrupt => match self.chat_id {
-                Some(chat) if self.is_running() => vec![Effect::Interrupt(chat)],
+                Some(chat) if self.can_interrupt() => vec![Effect::Interrupt(chat)],
                 _ => vec![],
             },
             Msg::Refresh => vec![],
         }
+    }
+
+    /// Restores whatever text was typed for the failed `Effect::CreateChat` (and anything
+    /// queued behind it) to the composer, and records the failure.
+    fn fail_create(&mut self, message: String) -> Vec<Effect> {
+        let in_flight = self.creating.take().unwrap_or_default();
+        let restored = match self.pending_text.take() {
+            Some(pending) => format!("{in_flight}\n\n{pending}"),
+            None => in_flight,
+        };
+        self.error(format!("Could not create the chat: {message}"));
+        vec![Effect::RestoreComposer(restored)]
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
@@ -319,7 +373,7 @@ impl App {
                 busy: self.busy,
             }];
         }
-        if self.creating {
+        if self.creating.is_some() {
             self.pending_text = Some(match self.pending_text.take() {
                 Some(prev) => format!("{prev}\n\n{text}"),
                 None => text,
@@ -331,7 +385,7 @@ impl App {
             self.error("Not connected to Coder yet.");
             return vec![];
         };
-        self.creating = true;
+        self.creating = Some(text.clone());
         vec![Effect::CreateChat {
             org,
             text,
@@ -353,6 +407,10 @@ impl App {
 
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         match cmd {
+            Command::Model(_) if !self.models_loaded => {
+                self.info("Models are still loading.");
+                vec![]
+            }
             Command::Model(None) => vec![Effect::ShowPicker(Picker::Model)],
             Command::Model(Some(name)) => {
                 let wanted = name.to_lowercase();
@@ -382,6 +440,10 @@ impl App {
                     vec![]
                 }
             },
+            Command::Compact | Command::Clear if self.creating.is_some() => {
+                self.info("The chat is still being created.");
+                vec![]
+            }
             Command::Compact | Command::Clear => match self.chat_id {
                 Some(chat) => vec![if cmd == Command::Compact {
                     Effect::Compact(chat)
@@ -471,6 +533,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_loaded_without_id_shows_an_error() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = Uuid::new_v4();
+        let requested = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: org,
+            open_chat: Some(requested),
+        });
+        assert_eq!(app.connection, Connection::Connecting);
+        let chat_without_id: Box<types::CodersdkChat> = Box::new(
+            serde_json::from_value(json!({"title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}}))
+                .unwrap(),
+        );
+        let effects = app.update(Msg::ChatLoaded {
+            chat: chat_without_id,
+            messages: vec![],
+        });
+        assert!(effects.is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Error(_))));
+        assert_eq!(app.connection, Connection::Idle);
+    }
+
+    #[test]
     fn submit_on_blank_chat_creates_one_chat() {
         let mut app = App::new(BusyBehavior::Queue, true);
         let org = started(&mut app);
@@ -505,6 +590,82 @@ mod tests {
             text: "two".into(),
             model: None,
             busy: BusyBehavior::Queue
+        }));
+    }
+
+    #[test]
+    fn unrelated_api_failure_does_not_reset_creation() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("two".into()));
+        app.update(Msg::ApiFailed {
+            action: "load models",
+            message: "HTTP 500".into(),
+        });
+        let effects = app.update(Msg::Submit("three".into()));
+        assert!(effects.is_empty(), "no second CreateChat: {effects:?}");
+    }
+
+    #[test]
+    fn failed_create_restores_all_typed_text() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("two".into()));
+        let effects = app.update(Msg::CreateFailed {
+            message: "HTTP 500".into(),
+        });
+        assert_eq!(effects, vec![Effect::RestoreComposer("one\n\ntwo".into())]);
+        let org = app.org_id.unwrap();
+        let effects = app.update(Msg::Submit("three".into()));
+        assert_eq!(
+            effects,
+            vec![Effect::CreateChat {
+                org,
+                text: "three".into(),
+                model: None,
+                workspace: None
+            }]
+        );
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::ChatCreated(chat(id)));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendMessage { text, .. } if text == "two"))
+        );
+    }
+
+    #[test]
+    fn chat_created_without_id_is_a_failed_create() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("hi".into()));
+        let chat_without_id: Box<types::CodersdkChat> = Box::new(
+            serde_json::from_value(json!({"title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}}))
+                .unwrap(),
+        );
+        let effects = app.update(Msg::ChatCreated(chat_without_id));
+        assert_eq!(effects, vec![Effect::RestoreComposer("hi".into())]);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("without an id"))
+        );
+    }
+
+    #[test]
+    fn workspace_chosen_during_create_is_applied_after_creation() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("hello".into()));
+        let ws = Uuid::new_v4();
+        let effects = app.update(Msg::WorkspaceChosen(Some(ws)));
+        assert!(effects.is_empty());
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::ChatCreated(chat(id)));
+        assert!(effects.contains(&Effect::SetWorkspace {
+            chat: id,
+            workspace: Some(ws)
         }));
     }
 
@@ -607,6 +768,40 @@ mod tests {
                 delay: Duration::ZERO
             }]
         );
+        assert_eq!(app.connection, Connection::Reconnecting { attempt: 1 });
+    }
+
+    #[test]
+    fn repeated_stream_gaps_back_off() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        let part = |seq| json!({"type": "message_part", "message_part": {"history_version": 1, "generation_attempt": 1, "seq": seq, "part": {"type": "text", "text": "x"}}});
+        app.update(ev(part(1)));
+        let first = app.update(ev(part(4)));
+        assert_eq!(
+            first,
+            vec![Effect::ReconnectAfter {
+                chat: id,
+                after_id: None,
+                delay: Duration::ZERO
+            }]
+        );
+        assert_eq!(app.connection, Connection::Reconnecting { attempt: 1 });
+        let second = app.update(ev(part(9)));
+        assert_eq!(
+            second,
+            vec![Effect::ReconnectAfter {
+                chat: id,
+                after_id: None,
+                delay: backoff(2)
+            }]
+        );
+        assert_eq!(app.connection, Connection::Reconnecting { attempt: 2 });
     }
 
     #[test]
@@ -668,6 +863,34 @@ mod tests {
     }
 
     #[test]
+    fn commands_while_creating_explain_the_wait() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("hello".into()));
+        assert!(app.update(Msg::Command(Command::Compact)).is_empty());
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still being created"))
+        );
+        assert!(app.update(Msg::Command(Command::Clear)).is_empty());
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still being created"))
+        );
+    }
+
+    #[test]
+    fn model_commands_before_models_load_explain_the_wait() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        assert!(app.update(Msg::Command(Command::Model(None))).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still loading")));
+        assert!(
+            app.update(Msg::Command(Command::Model(Some("big model".into()))))
+                .is_empty()
+        );
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still loading")));
+    }
+
+    #[test]
     fn submit_parses_slash_commands() {
         let mut app = App::new(BusyBehavior::Queue, true);
         started(&mut app);
@@ -693,6 +916,21 @@ mod tests {
             json!({"type": "status", "status": {"status": "running"}}),
         ));
         assert_eq!(app.update(Msg::Interrupt), vec![Effect::Interrupt(id)]);
+    }
+
+    #[test]
+    fn interrupt_is_not_sent_while_interrupting() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        app.update(ev(
+            json!({"type": "status", "status": {"status": "interrupting"}}),
+        ));
+        assert!(app.update(Msg::Interrupt).is_empty());
     }
 
     #[test]
