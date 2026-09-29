@@ -19,6 +19,8 @@ pub struct Composer {
     history: Vec<String>,
     history_pos: Option<usize>,
     draft: String,
+    /// Whether the terminal reports modified Enter keys distinctly (keyboard enhancement).
+    enhanced: bool,
 }
 
 /// Normalizes CRLF and lone CR line endings to LF, because bracketed paste in several
@@ -50,11 +52,18 @@ impl Composer {
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            enhanced: true,
         }
     }
 
     pub fn widget(&self) -> &TextArea<'static> {
         &self.area
+    }
+
+    /// Records whether keyboard enhancement is active. Without it, terminals report Ctrl+Enter
+    /// and Cmd+Enter as a plain Enter, so the `ModifierEnter` preference sends with Alt+Enter.
+    pub fn set_enhanced(&mut self, enhanced: bool) {
+        self.enhanced = enhanced;
     }
 
     /// Replaces the hint shown while the composer is empty.
@@ -138,7 +147,12 @@ impl Composer {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let sup = key.modifiers.contains(KeyModifiers::SUPER);
         match key.code {
-            KeyCode::Enter if alt => self.area.insert_newline(),
+            KeyCode::Enter if alt => {
+                if shortcut == SendShortcut::ModifierEnter && !self.enhanced {
+                    return self.submit();
+                }
+                self.area.insert_newline();
+            }
             KeyCode::Enter => {
                 let send = match shortcut {
                     SendShortcut::Enter => !shift && !ctrl && !sup,
@@ -151,6 +165,7 @@ impl Composer {
             }
             KeyCode::Char('j') if ctrl => self.area.insert_newline(),
             KeyCode::Char('g') if ctrl => return ComposerAction::OpenEditor,
+            KeyCode::Esc if !self.slash_matches().is_empty() => self.set_text(""),
             KeyCode::Esc => return ComposerAction::Interrupt,
             KeyCode::Tab => {
                 if let Some(first) = self.slash_matches().first() {
@@ -233,6 +248,75 @@ mod tests {
                 SendShortcut::ModifierEnter
             ),
             ComposerAction::Submit("a\n".into())
+        );
+    }
+
+    #[test]
+    fn modifier_enter_without_enhancement_sends_with_alt_enter() {
+        let mut c = Composer::new(10);
+        c.set_enhanced(false);
+        type_str(&mut c, "a");
+        // Without enhancement, Ctrl+Enter arrives as a plain Enter, which adds a line.
+        assert_eq!(
+            c.handle_key(
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                SendShortcut::ModifierEnter
+            ),
+            ComposerAction::None
+        );
+        type_str(&mut c, "b");
+        assert_eq!(
+            c.handle_key(
+                key(KeyCode::Enter, KeyModifiers::ALT),
+                SendShortcut::ModifierEnter
+            ),
+            ComposerAction::Submit("a\nb".into())
+        );
+    }
+
+    #[test]
+    fn enter_mode_without_enhancement_sends_with_enter_and_alt_enter_adds_a_line() {
+        let mut c = Composer::new(10);
+        c.set_enhanced(false);
+        type_str(&mut c, "a");
+        assert_eq!(
+            c.handle_key(key(KeyCode::Enter, KeyModifiers::ALT), SendShortcut::Enter),
+            ComposerAction::None
+        );
+        type_str(&mut c, "b");
+        assert_eq!(
+            c.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), SendShortcut::Enter),
+            ComposerAction::Submit("a\nb".into())
+        );
+    }
+
+    #[test]
+    fn modifier_enter_with_enhancement_keeps_alt_enter_as_a_newline() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "a");
+        assert_eq!(
+            c.handle_key(
+                key(KeyCode::Enter, KeyModifiers::ALT),
+                SendShortcut::ModifierEnter
+            ),
+            ComposerAction::None
+        );
+        assert_eq!(c.text(), "a\n");
+    }
+
+    #[test]
+    fn escape_with_the_slash_menu_showing_clears_instead_of_interrupting() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "/co");
+        assert!(!c.slash_matches().is_empty());
+        assert_eq!(
+            c.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), SendShortcut::Enter),
+            ComposerAction::None
+        );
+        assert_eq!(c.text(), "");
+        assert_eq!(
+            c.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), SendShortcut::Enter),
+            ComposerAction::Interrupt
         );
     }
 

@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use scuttle_core::app::{App, CopyTarget, Effect, Msg, Notice};
 use scuttle_core::commands::COMMANDS;
 use scuttle_core::config::{self, LocalConfig};
+use scuttle_core::density::SendShortcut;
 
 use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
@@ -29,6 +30,23 @@ const PLACEHOLDER_SHIFT: &str =
     "Message the agent. Enter to send, Shift+Enter for a new line, /help for commands.";
 const PLACEHOLDER_ALT: &str =
     "Message the agent. Enter to send, Alt+Enter for a new line, /help for commands.";
+const PLACEHOLDER_MODIFIER: &str =
+    "Message the agent. Ctrl+Enter to send, Enter for a new line, /help for commands.";
+const PLACEHOLDER_MODIFIER_ALT: &str =
+    "Message the agent. Alt+Enter to send, Enter for a new line, /help for commands.";
+
+/// Leaves the terminal, runs the editor, and resumes. Resume is attempted even when leaving
+/// failed, but the editor only runs on a terminal that was fully left. Returns the editor's
+/// outcome and the resume's outcome.
+fn editor_round_trip(
+    leave: impl FnOnce() -> std::io::Result<()>,
+    run: impl FnOnce() -> std::io::Result<()>,
+    resume: impl FnOnce() -> std::io::Result<()>,
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    let edited = leave().and_then(|()| run());
+    let resumed = resume();
+    (edited, resumed)
+}
 
 pub struct Tui {
     pub core: App,
@@ -53,6 +71,10 @@ pub struct Tui {
     notices_seen: usize,
     /// Set when the screen may hold foreign output, for example after the external editor.
     needs_full_redraw: bool,
+    /// Whether keyboard enhancement flags are active, which decides the send and newline keys.
+    keyboard_enhanced: bool,
+    /// Set when the app must quit with an error, for example when the terminal cannot be restored.
+    fatal: Option<String>,
 }
 
 impl Tui {
@@ -81,22 +103,42 @@ impl Tui {
             active_notice: None,
             notices_seen: 0,
             needs_full_redraw: false,
+            keyboard_enhanced: true,
+            fatal: None,
         }
     }
 
-    /// Picks the composer hint for whether the terminal distinguishes Shift+Enter.
+    /// Records whether the terminal reports modified Enter keys distinctly, which decides the
+    /// composer's send and newline keys and its hint.
     pub fn set_keyboard_enhanced(&mut self, enhanced: bool) {
-        self.composer.set_placeholder(if enhanced {
-            PLACEHOLDER_SHIFT
-        } else {
-            PLACEHOLDER_ALT
-        });
+        self.keyboard_enhanced = enhanced;
+        self.composer.set_enhanced(enhanced);
+        self.refresh_placeholder();
+    }
+
+    /// Picks the composer hint from the send preference and the keyboard enhancement state.
+    fn refresh_placeholder(&mut self) {
+        let text = match (self.core.prefs.send_shortcut, self.keyboard_enhanced) {
+            (SendShortcut::Enter, true) => PLACEHOLDER_SHIFT,
+            (SendShortcut::Enter, false) => PLACEHOLDER_ALT,
+            (SendShortcut::ModifierEnter, true) => PLACEHOLDER_MODIFIER,
+            (SendShortcut::ModifierEnter, false) => PLACEHOLDER_MODIFIER_ALT,
+        };
+        if self.composer.widget().placeholder_text() != text {
+            self.composer.set_placeholder(text);
+        }
+    }
+
+    /// The reason the app must quit with an error, if any. Resets it.
+    pub fn take_fatal(&mut self) -> Option<String> {
+        self.fatal.take()
     }
 
     /// Feeds a message to the core and keeps UI state consistent with the result.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         let effects = self.core.update(msg);
         self.prune_live_toggles();
+        self.refresh_placeholder();
         effects
     }
 
@@ -236,7 +278,21 @@ impl Tui {
         run: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let path = std::env::temp_dir().join(format!("scuttle-{}.md", uuid::Uuid::new_v4()));
-        std::fs::write(&path, self.composer.text())?;
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path)?;
+            if let Err(e) = file.write_all(self.composer.text().as_bytes()) {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        }
         let result = run(&path).and_then(|_| std::fs::read_to_string(&path));
         self.needs_full_redraw = true;
         let _ = std::fs::remove_file(&path);
@@ -310,7 +366,9 @@ impl Tui {
             }
             Event::Mouse(m) => {
                 match m.kind {
-                    MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
+                    MouseEventKind::Down(MouseButton::Left) if !self.overlay_showing() => {
+                        self.click(m.column, m.row)
+                    }
                     MouseEventKind::ScrollUp => self.scroll_up(3),
                     MouseEventKind::ScrollDown => self.scroll_down(3),
                     _ => {}
@@ -321,8 +379,28 @@ impl Tui {
         }
     }
 
+    /// Whether the help box, a picker, or the slash menu covers the transcript.
+    fn overlay_showing(&self) -> bool {
+        self.show_help || self.picker.is_some() || !self.composer.slash_matches().is_empty()
+    }
+
     fn key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.active_notice = None;
+        // Handled before the overlays, so a double Ctrl+C quits from anywhere.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let now = Instant::now();
+            if self
+                .last_ctrl_c
+                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
+            {
+                return vec![Effect::Quit];
+            }
+            self.last_ctrl_c = Some(now);
+            self.show_help = false;
+            self.picker = None;
+            self.notice(Notice::Info("Press Ctrl+C again to quit.".into()));
+            return vec![];
+        }
         if self.show_help {
             self.show_help = false;
             return vec![];
@@ -344,18 +422,6 @@ impl Tui {
                 }
                 None => vec![],
             };
-        }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            let now = Instant::now();
-            if self
-                .last_ctrl_c
-                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
-            {
-                return vec![Effect::Quit];
-            }
-            self.last_ctrl_c = Some(now);
-            self.notice(Notice::Info("Press Ctrl+C again to quit.".into()));
-            return vec![];
         }
         let page = self.area.height.max(1) as usize;
         match key.code {
@@ -391,29 +457,51 @@ impl Tui {
             .filter(|e| !e.trim().is_empty())
             .unwrap_or_else(|| "vi".into());
         let mouse = self.core.mouse;
-        let mut enhanced = crate::terminal::keyboard_enhanced();
+        let mut resumed = Ok(());
         let result = self.edit_with(|path| {
-            crate::terminal::leave()?;
-            // `$1` keeps the path out of the shell parse while still allowing `EDITOR="code -w"`.
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{editor} \"$1\""))
-                .arg("sh")
-                .arg(path)
-                .status();
-            let restored = crate::terminal::resume(mouse);
-            enhanced = crate::terminal::keyboard_enhanced();
-            match status {
-                Ok(s) if s.success() => restored,
-                Ok(s) => Err(std::io::Error::other(format!("editor exited with {s}"))),
-                Err(e) => Err(e),
-            }
+            let (edited, resume) = editor_round_trip(
+                crate::terminal::leave,
+                || {
+                    // `$1` keeps the path out of the shell parse while still allowing
+                    // `EDITOR="code -w"`.
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("{editor} \"$1\""))
+                        .arg("sh")
+                        .arg(path)
+                        .status()?;
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(format!(
+                            "editor exited with {status}"
+                        )))
+                    }
+                },
+                || crate::terminal::resume(mouse),
+            );
+            resumed = resume;
+            edited
         });
-        self.set_keyboard_enhanced(enhanced);
+        self.set_keyboard_enhanced(crate::terminal::keyboard_enhanced());
         if let Err(e) = result {
             self.notice(Notice::Error(format!("Editor failed: {e}")));
         }
-        vec![]
+        self.finish_editor(resumed)
+    }
+
+    /// Quits with an error when the terminal could not be restored after the editor, since
+    /// drawing on a terminal in an unknown mode would garble the screen.
+    fn finish_editor(&mut self, resumed: std::io::Result<()>) -> Vec<Effect> {
+        match resumed {
+            Ok(()) => vec![],
+            Err(e) => {
+                self.fatal = Some(format!(
+                    "could not restore the terminal after the editor: {e}"
+                ));
+                vec![Effect::Quit]
+            }
+        }
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
@@ -773,6 +861,178 @@ mod tests {
             "{placeholder}"
         );
         assert!(!placeholder.contains("Shift+Enter"), "{placeholder}");
+    }
+
+    #[test]
+    fn modifier_enter_without_enhancement_names_alt_enter_to_send() {
+        let mut t = tui();
+        t.core.prefs.send_shortcut = scuttle_core::density::SendShortcut::ModifierEnter;
+        t.set_keyboard_enhanced(false);
+        assert_eq!(
+            t.composer.widget().placeholder_text(),
+            "Message the agent. Alt+Enter to send, Enter for a new line, /help for commands."
+        );
+        t.set_keyboard_enhanced(true);
+        assert!(
+            t.composer
+                .widget()
+                .placeholder_text()
+                .contains("Ctrl+Enter to send")
+        );
+    }
+
+    #[test]
+    fn loaded_prefs_update_the_placeholder() {
+        let mut t = tui();
+        t.set_keyboard_enhanced(false);
+        let prefs = scuttle_core::density::DisplayPrefs {
+            send_shortcut: scuttle_core::density::SendShortcut::ModifierEnter,
+            ..Default::default()
+        };
+        t.update(Msg::PrefsLoaded(prefs));
+        assert!(
+            t.composer
+                .widget()
+                .placeholder_text()
+                .contains("Alt+Enter to send")
+        );
+        // The Tui passes the enhancement state on, so Alt+Enter now sends.
+        for c in "hi".chars() {
+            t.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        t.core.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        let effects = t.handle(key(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(matches!(effects.as_slice(), [Effect::CreateChat { text, .. }] if text == "hi"));
+    }
+
+    #[test]
+    fn ctrl_c_closes_the_help_box_and_a_second_press_quits() {
+        let mut t = tui();
+        t.apply_ui_effect(&Effect::ShowHelp);
+        assert!(
+            t.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        assert!(!t.show_help);
+        assert_eq!(
+            t.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![Effect::Quit]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_closes_a_picker_and_a_second_press_quits() {
+        let mut t = tui();
+        t.core.update(Msg::ModelsLoaded(vec![]));
+        t.apply_ui_effect(&Effect::ShowPicker(scuttle_core::app::Picker::Model));
+        assert!(t.picker.is_some());
+        assert!(
+            t.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        assert!(t.picker.is_none());
+        assert_eq!(
+            t.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![Effect::Quit]
+        );
+    }
+
+    fn tui_with_a_code_block() -> (Tui, u16) {
+        let mut t = tui();
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
+        t.core.update(Msg::ChatLoaded {
+            chat: Box::new(chat),
+            messages: serde_json::from_value(json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "```\necho hi\n```"}]}])).unwrap(),
+        });
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| t.draw(f)).unwrap();
+        let row = t
+            .row_of(|target| matches!(target, HitTarget::CopyCode(_)))
+            .expect("code block on screen");
+        (t, row)
+    }
+
+    fn click(t: &mut Tui, row: u16) {
+        t.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn clicks_are_ignored_while_an_overlay_is_showing() {
+        let (mut t, row) = tui_with_a_code_block();
+        t.apply_ui_effect(&Effect::ShowHelp);
+        click(&mut t, row);
+        assert_eq!(t.last_copied, None, "help box");
+        t.show_help = false;
+        t.core.update(Msg::ModelsLoaded(vec![]));
+        t.apply_ui_effect(&Effect::ShowPicker(scuttle_core::app::Picker::Model));
+        click(&mut t, row);
+        assert_eq!(t.last_copied, None, "picker");
+        t.picker = None;
+        t.composer.set_text("/co");
+        click(&mut t, row);
+        assert_eq!(t.last_copied, None, "slash menu");
+        t.composer.set_text("");
+        click(&mut t, row);
+        assert!(t.last_copied.is_some());
+    }
+
+    #[test]
+    fn the_editor_file_is_private_new_and_removed_afterwards() {
+        let mut t = tui();
+        t.composer.set_text("draft");
+        let mut seen = None;
+        t.edit_with(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path)?.permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            assert_eq!(std::fs::read_to_string(path)?, "draft");
+            seen = Some(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!seen.unwrap().exists());
+    }
+
+    #[test]
+    fn the_editor_round_trip_resumes_even_when_leaving_fails() {
+        let mut ran = false;
+        let mut resumed = false;
+        let (edited, resume) = editor_round_trip(
+            || Err(std::io::Error::other("leave failed")),
+            || {
+                ran = true;
+                Ok(())
+            },
+            || {
+                resumed = true;
+                Ok(())
+            },
+        );
+        assert!(edited.is_err());
+        assert!(resume.is_ok());
+        assert!(!ran, "the editor must not run on a half-restored terminal");
+        assert!(resumed);
+    }
+
+    #[test]
+    fn a_failed_resume_quits_with_an_error() {
+        let mut t = tui();
+        let effects = t.finish_editor(Err(std::io::Error::other("tty gone")));
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(t.take_fatal().unwrap().contains("tty gone"));
+        assert!(t.finish_editor(Ok(())).is_empty());
+        assert_eq!(t.take_fatal(), None);
     }
 
     #[test]

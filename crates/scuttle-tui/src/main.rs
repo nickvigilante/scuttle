@@ -11,6 +11,7 @@ mod theme;
 mod transcript_view;
 mod wrap;
 
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use futures::StreamExt;
@@ -49,6 +50,18 @@ fn update_queued(
         effects.extend(tui.update(msg));
     }
     effects
+}
+
+/// Unwraps one item from the terminal event stream, or says why the loop must stop: `None`
+/// when the input ended, or the error text when reading it failed.
+fn next_input(
+    item: Option<std::io::Result<crossterm::event::Event>>,
+) -> ControlFlow<Option<String>, crossterm::event::Event> {
+    match item {
+        Some(Ok(event)) => ControlFlow::Continue(event),
+        Some(Err(e)) => ControlFlow::Break(Some(e.to_string())),
+        None => ControlFlow::Break(None),
+    }
 }
 
 #[tokio::main]
@@ -137,6 +150,7 @@ async fn main() -> ExitCode {
     tui.set_keyboard_enhanced(terminal::keyboard_enhanced());
     let mut events = crossterm::event::EventStream::new();
     let mut pending = first;
+    let mut failure = None;
     let code = 'main: loop {
         for effect in std::mem::take(&mut pending) {
             if effect == Effect::Quit {
@@ -154,14 +168,27 @@ async fn main() -> ExitCode {
         }
         let deadline = tui.notice_deadline();
         tokio::select! {
-            Some(Ok(ev)) = events.next() => pending = tui.handle(ev),
+            item = events.next() => match next_input(item) {
+                ControlFlow::Continue(ev) => pending = tui.handle(ev),
+                ControlFlow::Break(None) => break ExitCode::SUCCESS,
+                ControlFlow::Break(Some(e)) => {
+                    failure = Some(format!("could not read terminal input: {e}"));
+                    break ExitCode::FAILURE;
+                }
+            },
             Some(msg) = rx.recv() => pending = update_queued(&mut tui, msg, &mut rx),
             () = sleep_until(deadline) => {}
             else => break ExitCode::SUCCESS,
         }
     };
     let _ = terminal::leave();
-    code
+    match failure.or_else(|| tui.take_fatal()) {
+        Some(e) => {
+            eprintln!("scuttle: {e}");
+            ExitCode::FAILURE
+        }
+        None => code,
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +207,20 @@ mod tests {
                 show: true,
             },
         )
+    }
+
+    #[test]
+    fn ended_or_failed_input_stops_the_loop() {
+        let event = crossterm::event::Event::FocusGained;
+        assert_eq!(
+            next_input(Some(Ok(event.clone()))),
+            ControlFlow::Continue(event)
+        );
+        assert_eq!(next_input(None), ControlFlow::Break(None));
+        assert_eq!(
+            next_input(Some(Err(std::io::Error::other("tty closed")))),
+            ControlFlow::Break(Some("tty closed".into()))
+        );
     }
 
     #[test]

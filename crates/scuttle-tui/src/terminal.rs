@@ -38,16 +38,24 @@ pub fn resume(mouse: bool) -> std::io::Result<()> {
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     // Only push flags the terminal understands, so `leave` never pops a stack it did not push.
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
-        && execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .is_ok()
+    let skip_query = std::env::var_os("SCUTTLE_NO_TERMINAL_QUERY").is_some();
+    if enhancement_supported(skip_query, || {
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+    }) && execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
     {
         ENHANCED.store(true, Ordering::SeqCst);
     }
     set_mouse(mouse)
+}
+
+/// Whether to push keyboard enhancement flags. `skip_query` (from `SCUTTLE_NO_TERMINAL_QUERY`)
+/// treats the terminal as unsupported without sending the probe.
+fn enhancement_supported(skip_query: bool, probe: impl FnOnce() -> bool) -> bool {
+    !skip_query && probe()
 }
 
 /// Whether the terminal reports Shift+Enter distinctly, because enhancement flags were pushed.
@@ -79,4 +87,16 @@ pub fn leave() -> std::io::Result<()> {
     );
     let _ = disable_raw_mode();
     out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enhancement_supported;
+
+    #[test]
+    fn skipping_terminal_queries_skips_the_enhancement_probe() {
+        assert!(!enhancement_supported(true, || panic!("probed")));
+        assert!(enhancement_supported(false, || true));
+        assert!(!enhancement_supported(false, || false));
+    }
 }
