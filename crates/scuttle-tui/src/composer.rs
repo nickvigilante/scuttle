@@ -34,7 +34,7 @@ fn normalize_line_endings(text: &str) -> String {
 fn is_alt_reserved(c: char) -> bool {
     matches!(
         c,
-        'h' | 'd' | 'w' | 'b' | 'f' | 'n' | 'p' | 'e' | 'a' | 'v' | '<' | '>' | '[' | ']'
+        'h' | 'd' | 'f' | 'b' | 'n' | 'p' | 'v' | '<' | '>' | '[' | ']'
     )
 }
 
@@ -340,11 +340,31 @@ mod tests {
     fn alt_reserved_emacs_keys_still_move_instead_of_inserting() {
         let mut c = Composer::new(10);
         type_str(&mut c, "ab");
+        assert_eq!(c.widget().cursor(), (0, 2));
         c.handle_key(
             key(KeyCode::Char('b'), KeyModifiers::ALT),
             SendShortcut::Enter,
         );
         assert_eq!(c.text(), "ab");
+        assert_eq!(c.widget().cursor(), (0, 0));
+    }
+
+    #[test]
+    fn alt_characters_outside_the_widgets_reserved_set_insert_directly() {
+        let mut c = Composer::new(10);
+        c.handle_key(
+            key(KeyCode::Char('w'), KeyModifiers::ALT),
+            SendShortcut::Enter,
+        );
+        c.handle_key(
+            key(KeyCode::Char('e'), KeyModifiers::ALT),
+            SendShortcut::Enter,
+        );
+        c.handle_key(
+            key(KeyCode::Char('a'), KeyModifiers::ALT),
+            SendShortcut::Enter,
+        );
+        assert_eq!(c.text(), "wea");
     }
 
     #[test]
