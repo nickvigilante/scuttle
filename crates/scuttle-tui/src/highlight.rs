@@ -1,6 +1,6 @@
 //! Syntax highlighting, loaded lazily on a background thread so startup is not delayed.
 
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -14,19 +14,20 @@ struct Assets {
 }
 
 static ASSETS: OnceLock<Assets> = OnceLock::new();
+static START: Once = Once::new();
 
-/// Starts loading syntaxes and the theme; safe to call more than once.
+/// Starts loading syntaxes and the theme; safe to call more than once. A concurrent call from
+/// another thread waits for `Once` rather than racing a second loader thread into existence.
 pub fn warm() {
-    if ASSETS.get().is_some() {
-        return;
-    }
-    std::thread::spawn(|| {
-        let syntaxes = two_face::syntax::extra_newlines();
-        let themes = two_face::theme::extra();
-        let theme = themes
-            .get(two_face::theme::EmbeddedThemeName::Base16OceanDark)
-            .clone();
-        let _ = ASSETS.set(Assets { syntaxes, theme });
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            let syntaxes = two_face::syntax::extra_newlines();
+            let themes = two_face::theme::extra();
+            let theme = themes
+                .get(two_face::theme::EmbeddedThemeName::Base16OceanDark)
+                .clone();
+            let _ = ASSETS.set(Assets { syntaxes, theme });
+        });
     });
 }
 

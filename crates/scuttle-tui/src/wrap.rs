@@ -1,16 +1,31 @@
 //! Wraps styled lines to a width, counting display columns so wide characters never overflow.
+//!
+//! Wrapping operates on extended grapheme clusters, not codepoints, so a base character
+//! plus its combining marks, or a multi-codepoint ZWJ emoji sequence, is never split across
+//! two lines. Tabs are expanded to four columns before measuring, since a bare `'\t'` has no
+//! meaningful display width on its own.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Wraps at spaces where possible, and splits words longer than the width.
 pub fn wrap_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let width = width.max(2) as usize;
-    let cells: Vec<(char, Style)> = line
+    let cells: Vec<(String, Style)> = line
         .spans
         .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .flat_map(|s| {
+            let style = s.style;
+            let expanded = s.content.replace('\t', "    ");
+            expanded
+                .graphemes(true)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(move |g| (g, style))
+        })
         .collect();
     if cells.is_empty() {
         return vec![Line::default().style(line.style)];
@@ -22,11 +37,11 @@ pub fn wrap_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
         let mut end = start;
         let mut last_space = None;
         while end < cells.len() {
-            let w = cells[end].0.width().unwrap_or(0);
+            let w = cells[end].0.width();
             if used + w > width {
                 break;
             }
-            if cells[end].0 == ' ' {
+            if cells[end].0 == " " {
                 last_space = Some(end);
             }
             used += w;
@@ -50,12 +65,12 @@ pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     lines.iter().flat_map(|l| wrap_line(l, width)).collect()
 }
 
-fn to_line(cells: &[(char, Style)], line_style: Style) -> Line<'static> {
+fn to_line(cells: &[(String, Style)], line_style: Style) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (c, style) in cells {
+    for (g, style) in cells {
         match spans.last_mut() {
-            Some(last) if last.style == *style => last.content.to_mut().push(*c),
-            _ => spans.push(Span::styled(c.to_string(), *style)),
+            Some(last) if last.style == *style => last.content.to_mut().push_str(g),
+            _ => spans.push(Span::styled(g.clone(), *style)),
         }
     }
     Line::from(spans).style(line_style)
@@ -66,7 +81,21 @@ mod tests {
     use super::*;
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
+    use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
+
+    /// Byte offsets that fall on an extended-grapheme-cluster boundary in `s`, including 0 and
+    /// `s.len()`. A wrap that never splits a cluster only ever cuts at one of these offsets.
+    fn cluster_boundaries(s: &str) -> std::collections::BTreeSet<usize> {
+        let mut boundaries = std::collections::BTreeSet::new();
+        let mut pos = 0;
+        boundaries.insert(pos);
+        for g in s.graphemes(true) {
+            pos += g.len();
+            boundaries.insert(pos);
+        }
+        boundaries
+    }
 
     fn width(line: &Line) -> usize {
         line.spans.iter().map(|s| s.content.width()).sum()
@@ -109,5 +138,61 @@ mod tests {
         let out = wrap_line(&Line::from("abcdefghij"), 4);
         assert_eq!(out.len(), 3);
         assert_eq!(wrap_line(&Line::from(""), 10).len(), 1);
+    }
+
+    #[test]
+    fn never_splits_grapheme_clusters() {
+        let family = "👨‍👩‍👧‍👦".repeat(5);
+        let accented = "e\u{301}".repeat(5);
+        for input in [family, accented] {
+            let boundaries = cluster_boundaries(&input);
+            for w in 2u16..=6 {
+                let out = wrap_line(&Line::from(input.clone()), w);
+                let joined: String = out
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect();
+                assert_eq!(joined, input, "width {w}");
+                let mut pos = 0;
+                for l in &out {
+                    assert!(width(l) <= w as usize, "width {w}: {:?}", l);
+                    let text: String = l
+                        .spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>();
+                    if let Some(c) = text.chars().next() {
+                        assert_ne!(
+                            c, '\u{301}',
+                            "line starts with a combining mark at width {w}"
+                        );
+                        assert_ne!(c, '\u{200D}', "line starts with a ZWJ at width {w}");
+                    }
+                    pos += text.len();
+                    assert!(
+                        boundaries.contains(&pos),
+                        "line boundary at byte {pos} splits a grapheme cluster at width {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_count_as_four_columns() {
+        let out = wrap_line(&Line::from("\t"), 10);
+        assert_eq!(out.len(), 1);
+        let text: String = out[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "    ");
+        assert_eq!(width(&out[0]), 4);
     }
 }

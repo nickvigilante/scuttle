@@ -24,8 +24,12 @@ struct Builder {
     current: Vec<Span<'static>>,
     styles: Vec<Style>,
     list_depth: usize,
+    /// Per open list, `Some(next number)` for an ordered list or `None` for an unordered one.
+    list_counters: Vec<Option<u64>>,
     quote_depth: usize,
     code: Option<(String, String)>,
+    /// Whether the next `TableCell` is the first one in its row (no leading separator).
+    first_cell: bool,
 }
 
 impl Builder {
@@ -62,11 +66,20 @@ impl Builder {
             return;
         };
         let start = self.out.lines.len();
-        let lines = highlight::highlight(&code, &lang).unwrap_or_else(|| {
+        let mut lines = highlight::highlight(&code, &lang).unwrap_or_else(|| {
             code.lines()
                 .map(|l| Line::from(Span::styled(l.to_owned(), Style::new().fg(Color::Gray))))
                 .collect()
         });
+        if self.quote_depth > 0 {
+            let marker = "│ ".repeat(self.quote_depth);
+            for line in &mut lines {
+                line.spans.insert(
+                    0,
+                    Span::styled(marker.clone(), Style::new().fg(Color::DarkGray)),
+                );
+            }
+        }
         self.out.lines.extend(lines);
         let end = self.out.lines.len();
         self.out.code_blocks.push(CodeBlock { start, end, code });
@@ -79,8 +92,10 @@ pub fn render(text: &str) -> Rendered {
         current: Vec::new(),
         styles: Vec::new(),
         list_depth: 0,
+        list_counters: Vec::new(),
         quote_depth: 0,
         code: None,
+        first_cell: true,
     };
     for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES) {
         if let Some((_, code)) = b.code.as_mut() {
@@ -132,25 +147,51 @@ pub fn render(text: &str) -> Rendered {
                 b.flush();
                 b.quote_depth -= 1;
             }
-            Event::Start(Tag::List(_)) => {
+            Event::Start(Tag::List(start)) => {
                 b.flush();
                 b.list_depth += 1;
+                b.list_counters.push(start);
             }
             Event::End(TagEnd::List(_)) => {
                 b.flush();
                 b.list_depth -= 1;
+                b.list_counters.pop();
                 if b.list_depth == 0 {
                     b.blank();
                 }
             }
             Event::Start(Tag::Item) => {
                 b.flush();
-                b.current.push(Span::raw(format!(
-                    "{}• ",
-                    "  ".repeat(b.list_depth.saturating_sub(1))
-                )));
+                let indent = "  ".repeat(b.list_depth.saturating_sub(1));
+                let marker = if let Some(Some(n)) = b.list_counters.last_mut() {
+                    let marker = format!("{n}. ");
+                    *n += 1;
+                    marker
+                } else {
+                    "• ".to_owned()
+                };
+                b.current.push(Span::raw(format!("{indent}{marker}")));
             }
             Event::End(TagEnd::Item) => b.flush(),
+            Event::Start(Tag::Table(_)) => b.flush(),
+            Event::End(TagEnd::Table) => b.blank(),
+            Event::Start(Tag::TableHead) => {
+                b.first_cell = true;
+                b.styles.push(Style::new().add_modifier(Modifier::BOLD));
+            }
+            Event::End(TagEnd::TableHead) => {
+                b.styles.pop();
+                b.flush();
+            }
+            Event::Start(Tag::TableRow) => b.first_cell = true,
+            Event::End(TagEnd::TableRow) => b.flush(),
+            Event::Start(Tag::TableCell) => {
+                if b.first_cell {
+                    b.first_cell = false;
+                } else {
+                    b.current.push(Span::raw(" │ "));
+                }
+            }
             Event::Start(Tag::CodeBlock(kind)) => {
                 b.flush();
                 let lang = match kind {
@@ -231,5 +272,36 @@ mod tests {
         let r = render("```\npartial");
         assert_eq!(r.code_blocks.len(), 1);
         assert_eq!(r.code_blocks[0].code.trim_end(), "partial");
+    }
+
+    #[test]
+    fn renders_tables_as_rows() {
+        let r = render("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let text = plain(&r);
+        assert!(text.iter().any(|l| l == "a │ b"));
+        assert!(text.iter().any(|l| l == "1 │ 2"));
+        let header_idx = text.iter().position(|l| l == "a │ b").unwrap();
+        assert!(
+            r.lines[header_idx].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn code_inside_blockquote_keeps_the_marker() {
+        let r = render("> ```\n> fn main() {}\n> ```\n");
+        let text = plain(&r);
+        assert!(text.iter().any(|l| l == "│ fn main() {}"));
+    }
+
+    #[test]
+    fn numbers_ordered_lists() {
+        let r = render("1. one\n2. two\n3. three\n");
+        let text = plain(&r);
+        assert!(text.iter().any(|l| l == "1. one"));
+        assert!(text.iter().any(|l| l == "2. two"));
+        assert!(text.iter().any(|l| l == "3. three"));
     }
 }

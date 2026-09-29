@@ -23,6 +23,7 @@ syntect = "5.3"
 terminal-colorsaurus = "1.0"
 tokio.workspace = true
 two-face = "0.5"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 uuid.workspace = true
 
