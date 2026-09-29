@@ -17,11 +17,29 @@ struct Session {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Kept alive so the pty's master side stays open for the life of the session.
     _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// The output-reading thread, joined (with a bound) on drop so it never outlives the test.
+    reader: Option<std::thread::JoinHandle<()>>,
     home: std::path::PathBuf,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Kill and reap the child first: closing the slave side makes the reader thread's
+        // next read return EOF, so it always exits instead of blocking on the pty forever.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            // `JoinHandle::join` has no timeout, so bound the wait from the outside: a helper
+            // thread does the (now-fast) join and reports back over a channel. If the reader
+            // were somehow still stuck, `recv_timeout` gives up without hanging test cleanup;
+            // the helper thread finishes on its own once the reader eventually does.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = reader.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
         let _ = std::fs::remove_dir_all(&self.home);
     }
 }
@@ -56,7 +74,7 @@ fn spawn(name: &str, envs: &[(&str, String)]) -> Session {
     let writer = pair.master.take_writer().unwrap();
     let output = Arc::new(Mutex::new(Vec::new()));
     let sink = output.clone();
-    std::thread::spawn(move || {
+    let reader_handle = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
@@ -70,6 +88,7 @@ fn spawn(name: &str, envs: &[(&str, String)]) -> Session {
         writer,
         child,
         _master: pair.master,
+        reader: Some(reader_handle),
         home,
     }
 }
@@ -173,11 +192,16 @@ async fn welcome_screen_then_quit() {
     );
     s.wait_for("scuttle");
     s.wait_for("/help");
+    // Snapshot the live, alternate-screen UI before quitting: after exit the terminal has
+    // switched back to the primary grid, so checking `screen()` then would be vacuous.
+    let live_screen = s.screen();
+    assert!(!live_screen.contains("test-token-not-real"));
     s.writer.write_all(b"\x03").unwrap();
     s.wait_for("Ctrl+C again");
     s.writer.write_all(b"\x03").unwrap();
     assert_eq!(s.exit_code(), 0);
     assert!(!s.screen().contains("test-token-not-real"));
+    assert!(!String::from_utf8_lossy(&s.raw()).contains("test-token-not-real"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -194,7 +218,11 @@ async fn exit_restores_terminal_modes() {
     s.writer.write_all(b"/quit\r").unwrap();
     assert_eq!(s.exit_code(), 0);
     let raw = String::from_utf8_lossy(&s.raw()).to_string();
-    let tail = &raw[raw.rfind("\x1b[?1049h").unwrap_or(0)..];
+    assert!(!raw.contains("test-token-not-real"));
+    let enter_at = raw
+        .rfind("\x1b[?1049h")
+        .expect("scuttle must enter the alternate screen before exiting");
+    let tail = &raw[enter_at..];
     assert!(tail.contains("\x1b[?1049l"), "alternate screen left");
     assert!(
         tail.contains("\x1b[?1000l") || tail.contains("\x1b[?1006l"),
