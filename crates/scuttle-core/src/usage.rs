@@ -16,21 +16,28 @@ pub fn context_usage<'a>(
 ) -> Option<ContextUsage> {
     for m in messages.rev() {
         for part in m.content.iter().rev() {
+            let is_boundary_type = matches!(
+                part.type_.as_ref().map(|t| t.as_str()),
+                Some("tool-call") | Some("tool-result")
+            );
             let is_result = part.type_.as_ref().map(|t| t.as_str()) == Some("tool-result");
             let is_call = part.type_.as_ref().map(|t| t.as_str()) == Some("tool-call");
-            match part.tool_name.as_deref() {
-                Some("chat_cleared") => return None,
-                Some("chat_summarized") if is_call => return None,
-                Some("chat_summarized") if is_result => {
-                    if part.is_error == Some(true) {
-                        return None;
+
+            if is_boundary_type {
+                match part.tool_name.as_deref() {
+                    Some("chat_cleared") => return None,
+                    Some("chat_summarized") if is_call => return None,
+                    Some("chat_summarized") if is_result => {
+                        if part.is_error == Some(true) {
+                            return None;
+                        }
+                        let result = part.result.as_ref()?;
+                        let used = result["estimated_context_tokens"].as_i64()?;
+                        let limit = result["context_limit_tokens"].as_i64();
+                        return Some(ContextUsage { used, limit });
                     }
-                    let result = part.result.as_ref()?;
-                    let used = result["estimated_context_tokens"].as_i64()?;
-                    let limit = result["context_limit_tokens"].as_i64();
-                    return Some(ContextUsage { used, limit });
+                    _ => {}
                 }
-                _ => {}
             }
         }
         if let Some(u) = m.usage.as_ref() {
@@ -54,7 +61,8 @@ pub fn context_usage<'a>(
 }
 
 pub fn format_tokens(n: i64) -> String {
-    match n.abs() {
+    let abs_n = n.unsigned_abs();
+    match abs_n {
         abs_n if abs_n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
         abs_n if abs_n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
         _ => n.to_string(),
@@ -152,5 +160,7 @@ mod tests {
     fn format_tokens_handles_negative_numbers() {
         assert_eq!(format_tokens(-5), "-5");
         assert_eq!(format_tokens(-1_200), "-1.2k");
+        let result = format_tokens(i64::MIN);
+        assert!(result.starts_with('-'));
     }
 }
