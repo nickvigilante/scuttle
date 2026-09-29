@@ -181,15 +181,14 @@ There are no sidebars or panels.
 
 ### Welcome screen and the Codernaut
 
-A blank chat shows a small welcome block centered in the empty transcript: a Codernaut rendered in terminal characters, the deployment URL, the signed-in user, and two or three hints such as `/chats` and `/help`.
+A blank chat shows a small welcome block centered in the empty transcript: the Codernaut, Coder's astronaut mascot, rendered in terminal characters, plus the deployment URL, the signed-in user, and two or three hints such as `/chats` and `/help`.
 The block disappears as soon as the first message is sent, so it never costs transcript space in a real conversation.
 
-The artwork is derived from the web UI's `CodernautsSVG` (`site/src/modules/dashboard/Navbar/UserDropdown/UserDropdownContent.tsx:27`) and drawn with half-block or braille characters, with a plain ASCII fallback for terminals without Unicode support.
+The artwork is based on the Codernaut figure used on Coder's community website, sourced from official brand artwork rather than redrawn from memory.
+It is drawn with half-block or braille characters, with a plain ASCII fallback for terminals without Unicode support.
 It uses the active theme's palette, so it follows light, dark, and the colorblind-friendly Coder themes.
 A local config key hides it for users who prefer a bare screen.
-
-The web UI's Codernaut opens a lunar-lander game, and deployments can disable it with the `codernauts_enabled` appearance setting (`GET /api/v2/appearance`).
-A terminal version of that game is a post-v1 idea; if it is built, it respects `codernauts_enabled` exactly as the web UI does.
+The mascot is decoration only; scuttle has no games or interactive easter eggs.
 
 ### Transcript rendering
 
@@ -508,7 +507,7 @@ Each milestone ends with the author using the result daily before starting the n
 1. **Ctrl+R for `/chats`:** it matches shell history search, but Claude Code uses a different binding. Confirm the default.
 1. **Local mock provider for end-to-end tests:** choose between a small custom OpenAI-compatible server and an existing mock, and confirm a Docker `coderd` can be configured to use it.
 1. **Diff viewing:** the old TUI had a diff drawer. Decide after M2 whether a `/diff` view is wanted.
-1. **Codernaut artwork:** the mascot is Coder brand material. Using it in an unofficial tool, even on a personal account, is a question for Coder alongside the repo naming question.
+1. **Codernaut artwork:** the mascot is Coder brand material. Where to get the source artwork, and whether an unofficial tool may use it at all, are questions for Coder alongside the repo naming question.
 
 ## References
 
