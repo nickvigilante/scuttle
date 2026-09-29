@@ -153,8 +153,9 @@ Durable tool calls replace their live counterparts, keyed by `tool_call_id`, so 
 
 ### Reconnect
 
-The Go SDK reports an abnormal close as a synthetic `error` event, and `coder-sdk` does the same.
-On any disconnect or `seq` gap, clear `live`, keep `messages`, and reconnect with exponential backoff (starting at 500 ms, capped at 10 s, with jitter), passing the highest durable message ID as `after_id`.
+`coder-sdk` yields one `Err(Error::StreamClosed)` on an abnormal close and simply ends the stream on a normal close, which the server also sends when it tears a subscription down.
+The stream ending for any reason means the subscription is gone.
+On any end of stream or `seq` gap, clear `live`, keep `messages`, and reconnect with exponential backoff (starting at 500 ms, capped at 10 s, with jitter), passing the highest durable message ID as `after_id`.
 The status line shows "reconnecting" while this happens.
 
 ### The chat list
@@ -357,7 +358,7 @@ Changing the Coder theme from scuttle is a server write and shows the web UI con
 - `CODER_URL` and `CODER_SESSION_TOKEN` override the stored values.
 - scuttle never writes a credential. When the token is missing or rejected with `401`, it tells the user to run `coder login`.
 - The token is held as `secrecy::SecretString` and exposed only when building a request, and the header value is marked sensitive.
-- WebSockets authenticate with the same `Coder-Session-Token` header as REST requests, using `reqwest-websocket` on the same `reqwest::Client`.
+- WebSockets authenticate with the same `Coder-Session-Token` header as REST requests, using `reqwest-websocket` on a second `reqwest::Client` restricted to HTTP/1.1, because over TLS an HTTP/2-capable client negotiates h2 and the upgrade fails. Both clients share one builder so their settings cannot drift.
 
 ### Provider API keys
 
@@ -501,7 +502,7 @@ Each milestone ends with the author using the result daily before starting the n
 
 ## Open questions
 
-1. **Session storage format:** the `coder` CLI's keyring service name, account, and stored value format (the Go keyring library base64-encodes values on macOS with a `go-keyring-base64:` prefix), and the Linux file location, must be confirmed from `cli/sessionstore` before M0 ends.
+1. **Session storage format (resolved in M0):** on macOS the `coder` CLI shells out to `/usr/bin/security` with service `coder-v2-credentials` and account `coder-login-credentials`, storing base64 of a JSON object keyed by the literal `host[:port]`; otherwise the token is in `<config dir>/session`. `coder-sdk` implements both.
 1. **`client_type`:** chats record `ui` or `api`. It is not yet known what the web UI does differently for each; M0 should find out before scuttle picks one.
 1. **Command and skill precedence:** matching the web UI means a skill named `compact` shadows `/compact`. Confirm this is the desired behavior in a terminal client.
 1. **Ctrl+R for `/chats`:** it matches shell history search, but Claude Code uses a different binding. Confirm the default.
