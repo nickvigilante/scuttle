@@ -3,8 +3,10 @@
 #![allow(dead_code)]
 
 mod composer;
+mod footer;
 mod highlight;
 mod markdown;
+mod picker;
 mod theme;
 mod transcript_view;
 mod wrap;
