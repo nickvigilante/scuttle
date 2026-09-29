@@ -57,6 +57,11 @@ impl Composer {
         &self.area
     }
 
+    /// Replaces the hint shown while the composer is empty.
+    pub fn set_placeholder(&mut self, text: &str) {
+        self.area.set_placeholder_text(text);
+    }
+
     pub fn text(&self) -> String {
         self.area.lines().join("\n")
     }
