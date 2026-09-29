@@ -32,7 +32,7 @@ pub struct Hit {
 pub struct View {
     pub lines: Vec<Line<'static>>,
     pub hits: Vec<Hit>,
-    /// Code blocks of the last assistant message, for `/copy <n>`.
+    /// Code blocks of the most recent assistant turn (durable or live) that had any.
     pub last_code_blocks: Vec<String>,
 }
 
@@ -56,6 +56,15 @@ enum Item<'a> {
         is_error: bool,
         done: bool,
     },
+}
+
+/// A tool's result, gathered from wherever Coder recorded it: a durable `tool-result` part
+/// (possibly in a later message with role "tool", since Coder stores a tool's result
+/// separately from its call) or a live `LiveBlock::ToolResult`.
+struct ToolResultInfo {
+    result: String,
+    is_error: bool,
+    done: bool,
 }
 
 struct Out<'t> {
@@ -121,8 +130,29 @@ fn args_summary(args: &serde_json::Value) -> String {
     }
 }
 
+/// Strips ANSI CSI escape sequences (`ESC '[' ...` up to a final byte in `0x40..=0x7E`) from
+/// tool output, since some tools (e.g. a colorized `ls`) include them in their result text and
+/// the transcript has no terminal emulator to interpret them.
+fn strip_ansi_csi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c2) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn result_text(result: Option<&serde_json::Value>, raw: &str) -> String {
-    match result {
+    let text = match result {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Object(map)) => map
             .values()
@@ -132,18 +162,80 @@ fn result_text(result: Option<&serde_json::Value>, raw: &str) -> String {
             .unwrap_or_else(|| serde_json::to_string_pretty(result.unwrap()).unwrap_or_default()),
         Some(other) => other.to_string(),
         None => raw.to_owned(),
-    }
+    };
+    strip_ansi_csi(&text)
 }
 
-fn items_for_message(m: &types::CodersdkChatMessage) -> Vec<Item<'_>> {
-    let user = m.role.as_ref().map(|r| r.as_str()) == Some("user");
-    let mut items = Vec::new();
+/// Collects every tool-result, and every id that has a matching tool-call, from durable
+/// messages and the live turn. Coder persists a tool's result in a separate message with role
+/// "tool" (see `coderd/x/chatd/message_conversion.go`), not alongside its call, so pairing a
+/// call with its result requires looking across the whole transcript rather than one message.
+fn collect_tool_results(
+    messages: &[&types::CodersdkChatMessage],
+    live: &[LiveBlock],
+) -> (BTreeMap<String, ToolResultInfo>, HashSet<String>) {
     let mut results = BTreeMap::new();
-    for p in &m.content {
-        if p.type_.as_ref().map(|t| t.as_str()) == Some("tool-result") {
-            results.insert(p.tool_call_id.clone().unwrap_or_default(), p);
+    let mut calls = HashSet::new();
+    for m in messages {
+        for p in &m.content {
+            match p.type_.as_ref().map(|t| t.as_str()) {
+                Some("tool-call") => {
+                    calls.insert(p.tool_call_id.clone().unwrap_or_default());
+                }
+                Some("tool-result") => {
+                    results.insert(
+                        p.tool_call_id.clone().unwrap_or_default(),
+                        ToolResultInfo {
+                            result: result_text(p.result.as_ref(), ""),
+                            is_error: p.is_error.unwrap_or(false),
+                            done: true,
+                        },
+                    );
+                }
+                _ => {}
+            }
         }
     }
+    for b in live {
+        match b {
+            LiveBlock::ToolCall { id, .. } => {
+                calls.insert(id.clone());
+            }
+            LiveBlock::ToolResult {
+                id,
+                result,
+                result_raw,
+                is_error,
+                done,
+                ..
+            } => {
+                results.insert(
+                    id.clone(),
+                    ToolResultInfo {
+                        result: result_text(result.as_ref(), result_raw),
+                        is_error: *is_error,
+                        done: *done,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    (results, calls)
+}
+
+fn items_for_message<'a>(
+    m: &'a types::CodersdkChatMessage,
+    results: &BTreeMap<String, ToolResultInfo>,
+) -> Vec<Item<'a>> {
+    let role = m.role.as_ref().map(|r| r.as_str());
+    // A "tool" message carries only tool-result parts, already folded into `results`; it adds
+    // no lines of its own.
+    if role == Some("tool") {
+        return Vec::new();
+    }
+    let user = role == Some("user");
+    let mut items = Vec::new();
     for p in &m.content {
         match p.type_.as_ref().map(|t| t.as_str()).unwrap_or_default() {
             "text" if user => items.push(Item::UserText(p.text.as_deref().unwrap_or_default())),
@@ -155,11 +247,9 @@ fn items_for_message(m: &types::CodersdkChatMessage) -> Vec<Item<'_>> {
                 items.push(Item::Tool {
                     name: p.tool_name.as_deref().unwrap_or("tool"),
                     args: p.args.as_ref().map(args_summary).unwrap_or_default(),
-                    result: result
-                        .map(|r| result_text(r.result.as_ref(), ""))
-                        .unwrap_or_default(),
-                    is_error: result.and_then(|r| r.is_error).unwrap_or(false),
-                    done: result.is_some(),
+                    result: result.map(|r| r.result.clone()).unwrap_or_default(),
+                    is_error: result.map(|r| r.is_error).unwrap_or(false),
+                    done: result.map(|r| r.done).unwrap_or(false),
                 });
             }
             _ => {}
@@ -168,7 +258,11 @@ fn items_for_message(m: &types::CodersdkChatMessage) -> Vec<Item<'_>> {
     items
 }
 
-fn items_for_live(blocks: &[LiveBlock]) -> Vec<Item<'_>> {
+fn items_for_live<'a>(
+    blocks: &'a [LiveBlock],
+    results: &BTreeMap<String, ToolResultInfo>,
+    calls: &HashSet<String>,
+) -> Vec<Item<'a>> {
     let mut items = Vec::new();
     for b in blocks {
         match b {
@@ -180,29 +274,35 @@ fn items_for_live(blocks: &[LiveBlock]) -> Vec<Item<'_>> {
                 args,
                 args_raw,
             } => {
-                let result = blocks.iter().find_map(|r| match r {
-                    LiveBlock::ToolResult {
-                        id: rid,
-                        result,
-                        result_raw,
-                        is_error,
-                        done,
-                        ..
-                    } if rid == id => {
-                        Some((result_text(result.as_ref(), result_raw), *is_error, *done))
-                    }
-                    _ => None,
-                });
-                let (result, is_error, done) = result.unwrap_or_default();
+                let result = results.get(id);
                 items.push(Item::Tool {
                     name,
                     args: args
                         .as_ref()
                         .map(args_summary)
                         .unwrap_or_else(|| args_raw.clone()),
-                    result,
-                    is_error,
-                    done,
+                    result: result.map(|r| r.result.clone()).unwrap_or_default(),
+                    is_error: result.map(|r| r.is_error).unwrap_or(false),
+                    done: result.map(|r| r.done).unwrap_or(false),
+                });
+            }
+            // A result whose call never showed up live or durably (e.g. the call was in an
+            // earlier, already-flushed generation) still gets its own tool line.
+            LiveBlock::ToolResult {
+                id,
+                name,
+                result,
+                result_raw,
+                is_error,
+                done,
+                ..
+            } if !calls.contains(id) => {
+                items.push(Item::Tool {
+                    name,
+                    args: String::new(),
+                    result: result_text(result.as_ref(), result_raw),
+                    is_error: *is_error,
+                    done: *done,
                 });
             }
             _ => {}
@@ -211,6 +311,9 @@ fn items_for_live(blocks: &[LiveBlock]) -> Vec<Item<'_>> {
     items
 }
 
+/// Renders `items` into `out`, returning the code blocks of any assistant text among them.
+/// `live` selects `markdown::render` (uncached, since live text keeps changing) over
+/// `markdown::render_cached` (for durable, unchanging text).
 fn render_items(
     out: &mut Out,
     owner: Option<i64>,
@@ -218,9 +321,10 @@ fn render_items(
     app: &App,
     overrides: &BTreeMap<String, Density>,
     toggles: &HashSet<BlockId>,
-    last_assistant: bool,
-) {
+    live: bool,
+) -> Vec<String> {
     let width = out.width as usize;
+    let mut code_blocks = Vec::new();
     for (index, item) in items.into_iter().enumerate() {
         let id: BlockId = (owner, index);
         match item {
@@ -239,7 +343,11 @@ fn render_items(
             }
             Item::AssistantText(text) => {
                 out.gap();
-                let rendered = markdown::render_cached(text);
+                let rendered = if live {
+                    markdown::render(text)
+                } else {
+                    markdown::render_cached(text)
+                };
                 let base = out.view.lines.len();
                 for block in &rendered.code_blocks {
                     let start = base + wrap_lines(&rendered.lines[..block.start], out.width).len();
@@ -249,14 +357,11 @@ fn render_items(
                         target: HitTarget::CopyCode(block.code.clone()),
                     });
                 }
-                if last_assistant {
-                    out.view
-                        .last_code_blocks
-                        .extend(rendered.code_blocks.iter().map(|b| b.code.clone()));
-                }
+                code_blocks.extend(rendered.code_blocks.iter().map(|b| b.code.clone()));
                 out.push(rendered.lines);
             }
             Item::Reasoning(text) => {
+                out.gap();
                 let mut density = density_for(BlockKind::Reasoning, &app.prefs, overrides);
                 if toggles.contains(&id) {
                     density = if density == Density::Expanded {
@@ -297,6 +402,7 @@ fn render_items(
                     out.hidden += 1;
                     continue;
                 }
+                out.gap();
                 let marker = match (done, is_error) {
                     (false, _) => Span::styled("◌ ", out.theme.warn),
                     (true, true) => Span::styled("✗ ", out.theme.error),
@@ -333,7 +439,6 @@ fn render_items(
                 if density != Density::Expanded {
                     wrapped.truncate(2);
                 }
-                out.flush_hidden();
                 let start = out.view.lines.len();
                 out.view.lines.extend(wrapped);
                 out.view.hits.push(Hit {
@@ -343,6 +448,7 @@ fn render_items(
             }
         }
     }
+    code_blocks
 }
 
 fn welcome_lines(w: &Welcome, theme: &Theme) -> Vec<Line<'static>> {
@@ -400,31 +506,34 @@ pub fn build(
         }
         return out.view;
     }
-    let last_assistant = messages
-        .iter()
-        .rposition(|m| m.role.as_ref().map(|r| r.as_str()) == Some("assistant"));
-    for (i, m) in messages.iter().enumerate() {
-        let is_last = Some(i) == last_assistant && app.transcript.live.is_empty();
-        render_items(
+    let (results, calls) = collect_tool_results(&messages, &app.transcript.live.blocks);
+    for m in &messages {
+        let code = render_items(
             &mut out,
             m.id,
-            items_for_message(m),
+            items_for_message(m, &results),
             app,
             overrides,
             toggles,
-            is_last,
+            false,
         );
+        if !code.is_empty() {
+            out.view.last_code_blocks = code;
+        }
     }
     if !app.transcript.live.is_empty() {
-        render_items(
+        let code = render_items(
             &mut out,
             None,
-            items_for_live(&app.transcript.live.blocks),
+            items_for_live(&app.transcript.live.blocks, &results, &calls),
             app,
             overrides,
             toggles,
             true,
         );
+        if !code.is_empty() {
+            out.view.last_code_blocks = code;
+        }
     }
     for queued in &app.transcript.queued {
         let text = queued
@@ -667,5 +776,102 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("1 hidden tool call"))
         );
+    }
+
+    #[test]
+    fn results_in_a_separate_tool_message_complete_the_call() {
+        // Coder stores a tool's result in a later message with role "tool", not alongside its
+        // call (coderd/x/chatd/message_conversion.go; codersdk.ChatMessageRoleTool = "tool").
+        let app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}}
+            ]},
+            {"id": 2, "role": "tool", "content": [
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "done"}}
+            ]}
+        ]));
+        let view = build(
+            &app,
+            &Default::default(),
+            &Default::default(),
+            &welcome(),
+            &Theme::terminal(true),
+            60,
+        );
+        let lines = texts(&view);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains('⏺') && l.contains("execute"))
+        );
+        assert!(lines.iter().any(|l| l.contains('⎿') && l.contains("done")));
+        assert!(!lines.iter().any(|l| l.contains('◌')));
+        // The role "tool" message adds no lines of its own: only the call's own summary shows.
+        assert_eq!(lines.iter().filter(|l| !l.trim().is_empty()).count(), 2);
+    }
+
+    #[test]
+    fn live_result_for_a_durable_call_is_shown() {
+        let mut app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}}
+            ]}
+        ]));
+        // The result streamed in live and hasn't become a durable "tool" message yet.
+        app.transcript.live.blocks.push(LiveBlock::ToolResult {
+            id: "a".into(),
+            name: "execute".into(),
+            result_raw: String::new(),
+            result: Some(json!({"output": "done"})),
+            reasoning: String::new(),
+            is_error: false,
+            done: true,
+        });
+        let view = build(
+            &app,
+            &Default::default(),
+            &Default::default(),
+            &welcome(),
+            &Theme::terminal(true),
+            60,
+        );
+        let lines = texts(&view);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains('⏺') && l.contains("execute"))
+        );
+        assert!(lines.iter().any(|l| l.contains('⎿') && l.contains("done")));
+        assert!(!lines.iter().any(|l| l.contains('◌')));
+    }
+
+    #[test]
+    fn code_block_hits_cover_exactly_the_code_lines() {
+        let text = "This paragraph is long enough that it definitely wraps across several lines once rendered at a width of only twenty columns, well before the fenced code block that follows it.\n\n```txt\nfoo\nbar\n```";
+        let app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [{"type": "text", "text": text}]}
+        ]));
+        let view = build(
+            &app,
+            &Default::default(),
+            &Default::default(),
+            &welcome(),
+            &Theme::terminal(true),
+            20,
+        );
+        let hit = view
+            .hits
+            .iter()
+            .find(|h| matches!(h.target, HitTarget::CopyCode(_)))
+            .unwrap();
+        let lines = texts(&view);
+        let code_lines = &lines[hit.lines.clone()];
+        assert_eq!(code_lines, &["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn result_text_strips_ansi_csi_sequences() {
+        let colored = "\u{1b}[32mdone\u{1b}[0m";
+        assert_eq!(result_text(Some(&json!({"output": colored})), ""), "done");
     }
 }

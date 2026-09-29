@@ -15,7 +15,7 @@ use crate::highlight;
 const CACHE_LIMIT: usize = 512;
 
 thread_local! {
-    static CACHE: RefCell<HashMap<u64, Rendered>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<u64, (String, Rendered)>> = RefCell::new(HashMap::new());
 }
 
 fn cache_key(text: &str) -> u64 {
@@ -27,11 +27,15 @@ fn cache_key(text: &str) -> u64 {
 
 /// `render`, memoized by the text and whether syntax highlighting is ready, so re-rendering an
 /// unchanged message (every redraw, until the assets warm up flips highlighting on) doesn't
-/// redo the parse and highlight work.
+/// redo the parse and highlight work. The cached text is stored alongside its hash so a
+/// collision between two different texts is detected as a miss rather than returning the
+/// wrong `Rendered`.
 pub fn render_cached(text: &str) -> Rendered {
     let key = cache_key(text);
     CACHE.with(|cache| {
-        if let Some(hit) = cache.borrow().get(&key) {
+        if let Some((cached_text, hit)) = cache.borrow().get(&key)
+            && cached_text == text
+        {
             return hit.clone();
         }
         let rendered = render(text);
@@ -39,7 +43,7 @@ pub fn render_cached(text: &str) -> Rendered {
         if cache.len() >= CACHE_LIMIT {
             cache.clear();
         }
-        cache.insert(key, rendered.clone());
+        cache.insert(key, (text.to_owned(), rendered.clone()));
         rendered
     })
 }
