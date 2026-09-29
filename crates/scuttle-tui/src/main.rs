@@ -2,6 +2,7 @@
 // pieces exercised only by their own unit tests.
 #![allow(dead_code)]
 
+mod composer;
 mod highlight;
 mod markdown;
 mod theme;
