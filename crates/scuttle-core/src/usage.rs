@@ -5,25 +5,30 @@ use coder_sdk::types;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextUsage {
     pub used: i64,
-    pub limit: i64,
+    pub limit: Option<i64>,
 }
 
-/// Walks messages newest first: a `chat_cleared` result means no usage, a `chat_summarized`
-/// result supplies an estimate, otherwise the latest message with `usage` is used.
+/// Walks messages newest first: a `chat_cleared` tool result or in-flight boundary
+/// means no usage. A `chat_summarized` result supplies an estimate, otherwise the
+/// latest message with `usage` is used.
 pub fn context_usage<'a>(
     messages: impl DoubleEndedIterator<Item = &'a types::CodersdkChatMessage>,
 ) -> Option<ContextUsage> {
     for m in messages.rev() {
         for part in m.content.iter().rev() {
             let is_result = part.type_.as_ref().map(|t| t.as_str()) == Some("tool-result");
-            match (is_result, part.tool_name.as_deref()) {
-                (true, Some("chat_cleared")) => return None,
-                (true, Some("chat_summarized")) => {
+            let is_call = part.type_.as_ref().map(|t| t.as_str()) == Some("tool-call");
+            match part.tool_name.as_deref() {
+                Some("chat_cleared") => return None,
+                Some("chat_summarized") if is_call => return None,
+                Some("chat_summarized") if is_result => {
+                    if part.is_error == Some(true) {
+                        return None;
+                    }
                     let result = part.result.as_ref()?;
-                    return Some(ContextUsage {
-                        used: result["estimated_context_tokens"].as_i64()?,
-                        limit: result["context_limit_tokens"].as_i64()?,
-                    });
+                    let used = result["estimated_context_tokens"].as_i64()?;
+                    let limit = result["context_limit_tokens"].as_i64();
+                    return Some(ContextUsage { used, limit });
                 }
                 _ => {}
             }
@@ -41,7 +46,7 @@ pub fn context_usage<'a>(
             .sum();
             return Some(ContextUsage {
                 used,
-                limit: u.context_limit?,
+                limit: u.context_limit,
             });
         }
     }
@@ -49,10 +54,10 @@ pub fn context_usage<'a>(
 }
 
 pub fn format_tokens(n: i64) -> String {
-    match n {
-        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
-        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
-        n => n.to_string(),
+    match n.abs() {
+        abs_n if abs_n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        abs_n if abs_n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => n.to_string(),
     }
 }
 
@@ -76,7 +81,7 @@ mod tests {
             context_usage(m.iter()),
             Some(ContextUsage {
                 used: 160,
-                limit: 2000
+                limit: Some(2000)
             })
         );
     }
@@ -96,7 +101,7 @@ mod tests {
             context_usage(summarized.iter()),
             Some(ContextUsage {
                 used: 42,
-                limit: 1000
+                limit: Some(1000)
             })
         );
     }
@@ -106,5 +111,46 @@ mod tests {
         assert_eq!(format_tokens(950), "950");
         assert_eq!(format_tokens(12_345), "12.3k");
         assert_eq!(format_tokens(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn errored_summary_means_no_usage() {
+        let m = msgs(json!([
+            {"id": 1, "role": "assistant", "content": [], "usage": {"input_tokens": 10, "context_limit": 1000}},
+            {"id": 2, "role": "tool", "content": [{"type": "tool-result", "tool_name": "chat_summarized", "result": {"estimated_context_tokens": 42}, "is_error": true}]}
+        ]));
+        assert_eq!(context_usage(m.iter()), None);
+    }
+
+    #[test]
+    fn pending_boundary_means_no_usage() {
+        let m = msgs(json!([
+            {"id": 1, "role": "assistant", "content": [], "usage": {"input_tokens": 10, "context_limit": 1000}},
+            {"id": 2, "role": "tool", "content": [
+                {"type": "tool-call", "tool_name": "chat_cleared"},
+                {"type": "tool-call", "tool_name": "chat_summarized"}
+            ]}
+        ]));
+        assert_eq!(context_usage(m.iter()), None);
+    }
+
+    #[test]
+    fn missing_context_limit_keeps_the_usage() {
+        let m = msgs(json!([
+            {"id": 1, "role": "assistant", "content": [], "usage": {"input_tokens": 10}}
+        ]));
+        assert_eq!(
+            context_usage(m.iter()),
+            Some(ContextUsage {
+                used: 10,
+                limit: None
+            })
+        );
+    }
+
+    #[test]
+    fn format_tokens_handles_negative_numbers() {
+        assert_eq!(format_tokens(-5), "-5");
+        assert_eq!(format_tokens(-1_200), "-1.2k");
     }
 }
