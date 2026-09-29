@@ -81,17 +81,53 @@ fn looks_secret(key: &str) -> bool {
 }
 
 fn check_secrets(table: &toml::Table, path: &str) -> Result<(), ConfigError> {
+    check_secrets_impl(table, path, false)
+}
+
+fn check_secrets_impl(
+    table: &toml::Table,
+    path: &str,
+    skip_secret_check: bool,
+) -> Result<(), ConfigError> {
     for (key, value) in table {
         let full = if path.is_empty() {
             key.clone()
         } else {
             format!("{path}.{key}")
         };
-        if looks_secret(key) {
+
+        // Skip secret check if we're directly under the density table
+        if !skip_secret_check && looks_secret(key) {
             return Err(ConfigError::Secret(full));
         }
-        if let toml::Value::Table(inner) = value {
-            check_secrets(inner, &full)?;
+
+        match value {
+            toml::Value::Table(inner) => {
+                // Check if we're at the root level and this is the density table
+                let next_skip = path.is_empty() && key == "density";
+                check_secrets_impl(inner, &full, next_skip)?;
+            }
+            toml::Value::Array(arr) => {
+                check_array_secrets(arr, &full)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_array_secrets(arr: &[toml::Value], path: &str) -> Result<(), ConfigError> {
+    for (idx, value) in arr.iter().enumerate() {
+        match value {
+            toml::Value::Table(table) => {
+                let array_path = format!("{path}[{idx}]");
+                check_secrets_impl(table, &array_path, false)?;
+            }
+            toml::Value::Array(inner_arr) => {
+                let array_path = format!("{path}[{idx}]");
+                check_array_secrets(inner_arr, &array_path)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -213,5 +249,28 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("scuttle-missing-{}.toml", uuid::Uuid::new_v4()));
         assert_eq!(load(&path).unwrap(), LocalConfig::default());
+    }
+
+    #[test]
+    fn rejects_secrets_inside_arrays_of_tables() {
+        // Test array of tables: [[hack]] with api_key inside
+        match load_from_str("[[hack]]\napi_key = \"x\"\n") {
+            Err(ConfigError::Secret(key)) => assert!(key.contains("api_key")),
+            other => panic!("Expected Secret error, got {other:?}"),
+        }
+
+        // Test inline array: foo = [{ api_key = "x" }]
+        match load_from_str("foo = [{ api_key = \"x\" }]\n") {
+            Err(ConfigError::Secret(key)) => assert!(key.contains("api_key")),
+            other => panic!("Expected Secret error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn density_tool_names_are_not_treated_as_secrets() {
+        let cfg =
+            load_from_str("[density]\napi_key = \"hidden\"\nfetch_token = \"summary\"\n").unwrap();
+        assert_eq!(cfg.density.get("api_key"), Some(&Density::Hidden));
+        assert_eq!(cfg.density.get("fetch_token"), Some(&Density::Summary));
     }
 }
