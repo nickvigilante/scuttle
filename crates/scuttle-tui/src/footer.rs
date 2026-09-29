@@ -5,20 +5,24 @@ use ratatui::text::{Line, Span};
 use scuttle_core::app::{App, Connection, Notice};
 use scuttle_core::transcript::RetryInfo;
 use scuttle_core::usage::{context_usage, format_tokens};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+/// Cuts `text` to `width` columns on one line, at grapheme cluster boundaries measured the way
+/// `wrap.rs` measures them. Line breaks become spaces so a notice never spills over.
 fn fit(text: String, width: usize) -> String {
+    let text = text.replace(['\n', '\r'], " ");
     let mut used = 0;
     let mut out = String::new();
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+    for g in text.graphemes(true) {
+        let w = g.width();
         if used + w > width {
             break;
         }
         used += w;
-        out.push(c);
+        out.push_str(g);
     }
     out
 }
@@ -55,7 +59,7 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
     if let Some(u) = context_usage(app.transcript.messages()) {
         match u.limit {
             Some(limit) if limit > 0 => {
-                let pct = u.used * 100 / limit;
+                let pct = i128::from(u.used) * 100 / i128::from(limit);
                 parts.push(format!(
                     "{}/{} ({pct}%)",
                     format_tokens(u.used),
@@ -201,6 +205,38 @@ mod tests {
             t.contains("reconnecting (attempt 2): chat not found"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn notice_line_breaks_become_spaces() {
+        let app = App::new(BusyBehavior::Queue, true);
+        let notice = Notice::Error("first\nsecond\r\nthird".into());
+        let t = text(&footer_line(
+            &app,
+            Some(&notice),
+            &Theme::terminal(true),
+            80,
+        ));
+        assert_eq!(t, "first second  third");
+    }
+
+    #[test]
+    fn fit_never_splits_a_grapheme_cluster() {
+        // A ZWJ sequence is one two-column cluster, though its codepoints measure four.
+        assert_eq!(
+            fit("a\u{1F469}\u{200D}\u{1F4BB}b".into(), 3),
+            "a\u{1F469}\u{200D}\u{1F4BB}"
+        );
+        assert_eq!(fit("ae\u{301}x".into(), 2), "ae\u{301}");
+    }
+
+    #[test]
+    fn a_huge_token_count_does_not_overflow_the_percentage() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
+        app.update(Msg::ChatLoaded { chat: Box::new(chat), messages: serde_json::from_value(json!([{"id": 1, "role": "assistant", "content": [], "usage": {"input_tokens": 9_000_000_000_000_000_000_i64, "context_limit": 9_100_000_000_000_000_000_i64}}])).unwrap() });
+        let t = status_text(&app);
+        assert!(t.contains("(98%)"), "{t}");
     }
 
     #[test]

@@ -132,6 +132,26 @@ impl Session {
     }
 }
 
+/// A fake Coder that serves buildinfo but rejects the session token everywhere else.
+async fn fake_coder_rejecting_the_token() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/buildinfo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"version": "v2.37.3"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(serde_json::json!({"message": "You must be logged in."})),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
 async fn fake_coder() -> MockServer {
     let server = MockServer::start().await;
     let org = uuid::Uuid::new_v4();
@@ -229,4 +249,28 @@ async fn exit_restores_terminal_modes() {
         "mouse capture disabled"
     );
     assert!(tail.contains("\x1b[?2004l"), "bracketed paste disabled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_token_exits_before_the_full_screen_ui() {
+    let server = fake_coder_rejecting_the_token().await;
+    let mut s = spawn(
+        "rejected-token",
+        &[
+            ("CODER_URL", server.uri()),
+            ("CODER_SESSION_TOKEN", "test-token-not-real".into()),
+        ],
+    );
+    s.wait_for("the session token was rejected");
+    assert_eq!(s.exit_code(), 1);
+    let raw = String::from_utf8_lossy(&s.raw()).to_string();
+    assert!(
+        raw.contains(&format!("coder login {}", server.uri())),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("\x1b[?1049h"),
+        "the alternate screen was entered"
+    );
+    assert!(!raw.contains("test-token-not-real"));
 }

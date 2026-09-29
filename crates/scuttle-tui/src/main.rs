@@ -30,6 +30,15 @@ fn detect_dark() -> bool {
     )
 }
 
+/// The deployment URL as `scheme://host[:port]`, without any userinfo, path, or query.
+fn display_origin(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
 /// Waits until `deadline`, or forever when there is none.
 async fn sleep_until(deadline: Option<std::time::Instant>) {
     match deadline {
@@ -104,7 +113,7 @@ async fn main() -> ExitCode {
         .map(|t| t.lines().map(str::to_owned).collect())
         .unwrap_or_default();
     let welcome = transcript_view::Welcome {
-        url: session.url.to_string(),
+        url: display_origin(&session.url),
         user: String::new(),
         art,
         show: local.welcome.show,
@@ -121,16 +130,34 @@ async fn main() -> ExitCode {
         welcome,
     );
 
-    if let Ok(version) = client.server_version().await
-        && let Some(w) = scuttle_core::skew::skew_warning(&version, coder_sdk::GENERATED_FROM)
-    {
-        tui.core.notices.push(Notice::Info(w));
+    let rejected = || {
+        eprintln!(
+            "scuttle: the session token was rejected. Run `coder login {}`.",
+            display_origin(&session.url)
+        );
+        ExitCode::FAILURE
+    };
+    match client.server_version().await {
+        Ok(version) => {
+            if let Some(w) = scuttle_core::skew::skew_warning(&version, coder_sdk::GENERATED_FROM) {
+                tui.core.notices.push(Notice::Info(w));
+            }
+        }
+        Err(coder_sdk::Error::Unauthorized) => return rejected(),
+        Err(_) => {}
     }
     let first = match runtime.organization().await {
-        Ok(org) => tui.update(Msg::Started {
+        Ok(Some(org)) => tui.update(Msg::Started {
             org_id: org,
             open_chat,
         }),
+        Ok(None) => {
+            tui.core.notices.push(Notice::Error(
+                "Could not load your organization: you are not a member of any organization".into(),
+            ));
+            vec![]
+        }
+        Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(e) => {
             tui.core.notices.push(Notice::Error(format!(
                 "Could not load your organization: {e}"
@@ -207,6 +234,21 @@ mod tests {
                 show: true,
             },
         )
+    }
+
+    #[test]
+    fn the_displayed_url_drops_userinfo_path_and_query() {
+        let origin = |s: &str| display_origin(&s.parse().unwrap());
+        assert_eq!(
+            origin("https://user:hunter2@coder.example.com/some/path?q=1#f"),
+            "https://coder.example.com"
+        );
+        assert_eq!(origin("http://127.0.0.1:3000/"), "http://127.0.0.1:3000");
+        assert_eq!(
+            origin("https://coder.example.com:443"),
+            "https://coder.example.com"
+        );
+        assert_eq!(origin("https://[::1]:8443/x"), "https://[::1]:8443");
     }
 
     #[test]

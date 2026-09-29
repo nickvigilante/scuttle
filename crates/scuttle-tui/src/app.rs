@@ -1,6 +1,6 @@
 //! The TUI: owns UI state, turns terminal events into core messages, and draws.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,8 @@ pub struct Tui {
     active_notice: Option<(usize, Instant)>,
     /// How many of `core.notices` the footer has already considered.
     notices_seen: usize,
+    /// Indices into `core.notices` that arrived but were never active, oldest first.
+    unshown_notices: VecDeque<usize>,
     /// Set when the screen may hold foreign output, for example after the external editor.
     needs_full_redraw: bool,
     /// Whether keyboard enhancement flags are active, which decides the send and newline keys.
@@ -102,6 +104,7 @@ impl Tui {
             clipboard: None,
             active_notice: None,
             notices_seen: 0,
+            unshown_notices: VecDeque::new(),
             needs_full_redraw: false,
             keyboard_enhanced: true,
             fatal: None,
@@ -153,11 +156,13 @@ impl Tui {
         self.core.notices.push(n);
     }
 
-    /// Makes the newest notice pushed since the last call active, and expires an old one.
+    /// Makes the newest notice pushed since the last call active, and expires an old one. Once
+    /// no notice is active, the oldest notice that was never shown takes its turn.
     pub fn sync_notice(&mut self, now: Instant) {
         let count = self.core.notices.len();
         if count > self.notices_seen {
-            self.active_notice = Some((count - 1, now));
+            self.unshown_notices.extend(self.notices_seen..count);
+            self.active_notice = self.unshown_notices.pop_back().map(|i| (i, now));
         }
         self.notices_seen = count;
         if self
@@ -165,6 +170,9 @@ impl Tui {
             .is_some_and(|(_, since)| now.duration_since(since) >= NOTICE_TTL)
         {
             self.active_notice = None;
+        }
+        if self.active_notice.is_none() {
+            self.active_notice = self.unshown_notices.pop_front().map(|i| (i, now));
         }
     }
 
@@ -821,6 +829,27 @@ mod tests {
         t.core.notices.push(Notice::Info("third".into()));
         t.sync_notice(now);
         assert_eq!(t.active_notice(), Some(&Notice::Info("third".into())));
+    }
+
+    #[test]
+    fn notices_that_were_never_shown_take_turns() {
+        let mut t = tui();
+        let now = Instant::now();
+        t.core.notices.push(Notice::Info("version skew".into()));
+        t.core.notices.push(Notice::Error("no organization".into()));
+        t.sync_notice(now);
+        assert_eq!(
+            t.active_notice(),
+            Some(&Notice::Error("no organization".into()))
+        );
+        t.sync_notice(now + NOTICE_TTL);
+        assert_eq!(
+            t.active_notice(),
+            Some(&Notice::Info("version skew".into()))
+        );
+        assert_eq!(t.notice_deadline(), Some(now + NOTICE_TTL * 2));
+        t.sync_notice(now + NOTICE_TTL * 2);
+        assert_eq!(t.active_notice(), None);
     }
 
     #[test]

@@ -66,15 +66,13 @@ impl Runtime {
         }
     }
 
-    /// Resolves the user's first organization, the one new chats are created in.
-    pub async fn organization(&self) -> Result<Uuid, String> {
-        let orgs = match self.client.api().get_organizations_by_user("me").await {
-            Ok(r) => r.into_inner(),
-            Err(e) => return Err(err(e).await),
-        };
-        orgs.first()
-            .map(|o| o.id)
-            .ok_or_else(|| "you are not a member of any organization".into())
+    /// Resolves the user's first organization, the one new chats are created in, or `None`
+    /// when the user belongs to none.
+    pub async fn organization(&self) -> Result<Option<Uuid>, coder_sdk::Error> {
+        match self.client.api().get_organizations_by_user("me").await {
+            Ok(r) => Ok(r.into_inner().first().map(|o| o.id)),
+            Err(e) => Err(coder_sdk::Error::from_progenitor(e).await),
+        }
     }
 
     fn open_stream(&mut self, chat: Uuid, after_id: Option<i64>, delay: Duration) {

@@ -2717,6 +2717,7 @@ dependencies = [
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "url",
  "uuid",
  "vt100",
  "wiremock",
