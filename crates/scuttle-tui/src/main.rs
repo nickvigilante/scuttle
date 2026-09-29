@@ -4,6 +4,8 @@
 
 mod highlight;
 mod markdown;
+mod theme;
+mod transcript_view;
 mod wrap;
 
 fn main() {}

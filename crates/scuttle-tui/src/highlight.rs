@@ -31,6 +31,11 @@ pub fn warm() {
     });
 }
 
+/// Whether the syntax and theme assets have finished loading.
+pub fn is_ready() -> bool {
+    ASSETS.get().is_some()
+}
+
 /// Highlighted lines, or `None` if assets are still loading or the language is unknown.
 pub fn highlight(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
     let assets = ASSETS.get()?;

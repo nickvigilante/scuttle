@@ -1,0 +1,18 @@
+---
+source: crates/scuttle-tui/src/transcript_view.rs
+expression: "draw(&view, 60, 14).backend()"
+---
+"› list files                                                "
+"                                                            "
+"Here you go:                                                "
+"                                                            "
+"ls -la                                                      "
+"⏺ execute(ls -la)                                           "
+"  ⎿ total 0…                                                "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "

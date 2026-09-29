@@ -1,10 +1,48 @@
 //! Markdown to styled terminal lines, recording where code blocks are for copying.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::highlight;
+
+/// Cap on cached entries; the cache is cleared rather than evicted individually since
+/// rendering is cheap and a transcript's distinct messages rarely exceed this.
+const CACHE_LIMIT: usize = 512;
+
+thread_local! {
+    static CACHE: RefCell<HashMap<u64, Rendered>> = RefCell::new(HashMap::new());
+}
+
+fn cache_key(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    highlight::is_ready().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `render`, memoized by the text and whether syntax highlighting is ready, so re-rendering an
+/// unchanged message (every redraw, until the assets warm up flips highlighting on) doesn't
+/// redo the parse and highlight work.
+pub fn render_cached(text: &str) -> Rendered {
+    let key = cache_key(text);
+    CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let rendered = render(text);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, rendered.clone());
+        rendered
+    })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeBlock {
@@ -303,5 +341,16 @@ mod tests {
         assert!(text.iter().any(|l| l == "1. one"));
         assert!(text.iter().any(|l| l == "2. two"));
         assert!(text.iter().any(|l| l == "3. three"));
+    }
+
+    #[test]
+    fn render_cached_returns_the_same_lines_as_render() {
+        let text = "# Cached\n\nSome **bold** text.\n\n```rust\nfn f() {}\n```\n";
+        let direct = render(text);
+        let cached_first = render_cached(text);
+        let cached_second = render_cached(text);
+        assert_eq!(plain(&cached_first), plain(&direct));
+        assert_eq!(plain(&cached_second), plain(&direct));
+        assert_eq!(cached_first.code_blocks, direct.code_blocks);
     }
 }
