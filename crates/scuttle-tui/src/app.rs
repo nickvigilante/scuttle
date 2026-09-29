@@ -216,7 +216,15 @@ impl Tui {
                 };
                 self.notice(Notice::Info(note.into()));
             }
-            Effect::RestoreComposer(text) => self.composer.set_text(text),
+            Effect::RestoreComposer(text) => {
+                // Keep anything typed since the failed request, after the restored text.
+                let current = self.composer.text();
+                if current.trim().is_empty() {
+                    self.composer.set_text(text);
+                } else {
+                    self.composer.set_text(&format!("{text}\n\n{current}"));
+                }
+            }
             _ => return false,
         }
         true
@@ -653,6 +661,14 @@ mod tests {
         let mut t = tui();
         assert!(t.apply_ui_effect(&Effect::RestoreComposer("lost words".into())));
         assert_eq!(t.composer.text(), "lost words");
+    }
+
+    #[test]
+    fn restore_composer_keeps_what_was_typed_since() {
+        let mut t = tui();
+        t.composer.set_text("typed after");
+        t.apply_ui_effect(&Effect::RestoreComposer("failed send".into()));
+        assert_eq!(t.composer.text(), "failed send\n\ntyped after");
     }
 
     #[test]

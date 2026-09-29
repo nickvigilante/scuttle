@@ -37,6 +37,20 @@ async fn sleep_until(deadline: Option<std::time::Instant>) {
     }
 }
 
+/// Feeds `first`, then every message already queued behind it, to the UI, so a burst of stream
+/// deltas costs one draw instead of one per delta.
+fn update_queued(
+    tui: &mut app::Tui,
+    first: Msg,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+) -> Vec<Effect> {
+    let mut effects = tui.update(first);
+    while let Ok(msg) = rx.try_recv() {
+        effects.extend(tui.update(msg));
+    }
+    effects
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let open_chat = match std::env::args().nth(1).map(|a| a.parse::<uuid::Uuid>()) {
@@ -141,11 +155,46 @@ async fn main() -> ExitCode {
         let deadline = tui.notice_deadline();
         tokio::select! {
             Some(Ok(ev)) = events.next() => pending = tui.handle(ev),
-            Some(msg) = rx.recv() => pending = tui.update(msg),
+            Some(msg) = rx.recv() => pending = update_queued(&mut tui, msg, &mut rx),
             () = sleep_until(deadline) => {}
             else => break ExitCode::SUCCESS,
         }
     };
     let _ = terminal::leave();
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tui() -> app::Tui {
+        app::Tui::new(
+            config::LocalConfig::default(),
+            None,
+            theme::Theme::terminal(true),
+            transcript_view::Welcome {
+                url: "https://x".into(),
+                user: String::new(),
+                art: vec![],
+                show: true,
+            },
+        )
+    }
+
+    #[test]
+    fn every_queued_message_is_applied_before_the_next_draw() {
+        let mut t = tui();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for n in 0..3 {
+            tx.send(Msg::ModelsFailed {
+                message: format!("failure {n}"),
+            })
+            .unwrap();
+        }
+        let first = rx.try_recv().unwrap();
+        update_queued(&mut t, first, &mut rx);
+        assert_eq!(t.core.notices.len(), 3);
+        assert!(rx.try_recv().is_err());
+    }
 }

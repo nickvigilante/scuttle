@@ -1,7 +1,9 @@
 //! The one-line status footer: model, context, and status, or the given notice.
 
+use coder_sdk::ChatStatus;
 use ratatui::text::{Line, Span};
 use scuttle_core::app::{App, Connection, Notice};
+use scuttle_core::transcript::RetryInfo;
 use scuttle_core::usage::{context_usage, format_tokens};
 use unicode_width::UnicodeWidthChar;
 
@@ -17,6 +19,20 @@ fn fit(text: String, width: usize) -> String {
         }
         used += w;
         out.push(c);
+    }
+    out
+}
+
+/// "retrying (attempt N, in Xs): reason", leaving out whatever the server did not report.
+fn retry_status(retry: &RetryInfo) -> String {
+    let mut out = format!("retrying (attempt {}", retry.attempt);
+    if retry.delay_ms > 0 {
+        out.push_str(&format!(", in {:.1}s", retry.delay_ms as f64 / 1000.0));
+    }
+    out.push(')');
+    if !retry.error.is_empty() {
+        out.push_str(": ");
+        out.push_str(&retry.error);
     }
     out
 }
@@ -50,15 +66,18 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
         }
     }
     let status = match app.connection {
-        Connection::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
+        Connection::Reconnecting { attempt } => match app.last_stream_error.as_deref() {
+            Some(error) => format!("reconnecting (attempt {attempt}): {error}"),
+            None => format!("reconnecting (attempt {attempt})"),
+        },
         Connection::Connecting => "connecting".into(),
         Connection::Idle => "new chat".into(),
-        Connection::Live => app
-            .transcript
-            .status
-            .as_ref()
-            .map(|s| s.as_str().replace('_', " "))
-            .unwrap_or_else(|| "ready".into()),
+        Connection::Live => match (&app.transcript.retry, &app.transcript.status) {
+            (Some(retry), _) => retry_status(retry),
+            (None, Some(ChatStatus::RequiresAction)) => "action required".into(),
+            (None, Some(s)) => s.as_str().replace('_', " "),
+            (None, None) => "ready".into(),
+        },
     };
     parts.push(status);
     Line::from(Span::styled(fit(parts.join(" · "), width), theme.dim))
@@ -67,7 +86,7 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scuttle_core::app::App;
+    use scuttle_core::app::{App, Msg};
     use scuttle_core::config::BusyBehavior;
     use serde_json::json;
 
@@ -124,6 +143,64 @@ mod tests {
         let t = text(&footer_line(&app, None, &Theme::terminal(true), 80));
         assert!(t.contains("reconnecting"), "{t}");
         assert!(!t.contains("HTTP 409"), "{t}");
+    }
+
+    fn live_app(status: &str) -> App {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
+        app.update(Msg::ChatLoaded {
+            chat: Box::new(chat),
+            messages: vec![],
+        });
+        app.update(stream(
+            json!({"type": "status", "status": {"status": status}}),
+        ));
+        app
+    }
+
+    fn stream(v: serde_json::Value) -> Msg {
+        Msg::Stream(coder_sdk::StreamEvent {
+            kind: coder_sdk::StreamEventType::parse(v["type"].as_str().unwrap_or_default()),
+            event: serde_json::from_value(v.clone()).ok(),
+            raw: v,
+        })
+    }
+
+    fn status_text(app: &App) -> String {
+        text(&footer_line(app, None, &Theme::terminal(true), 120))
+    }
+
+    #[test]
+    fn a_provider_retry_shows_the_attempt_delay_and_reason() {
+        let mut app = live_app("running");
+        app.update(stream(json!({"type": "retry", "retry": {"attempt": 2, "delay_ms": 1500, "error": "rate limited"}})));
+        let t = status_text(&app);
+        assert!(
+            t.contains("retrying (attempt 2, in 1.5s): rate limited"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn requires_action_reads_action_required() {
+        let t = status_text(&live_app("requires_action"));
+        assert!(t.contains("action required"), "{t}");
+    }
+
+    #[test]
+    fn reconnecting_shows_the_last_stream_error() {
+        let mut app = live_app("waiting");
+        app.update(Msg::StreamEnded {
+            error: Some("HTTP 404".into()),
+        });
+        app.update(Msg::StreamEnded {
+            error: Some("chat not found".into()),
+        });
+        let t = status_text(&app);
+        assert!(
+            t.contains("reconnecting (attempt 2): chat not found"),
+            "{t}"
+        );
     }
 
     #[test]

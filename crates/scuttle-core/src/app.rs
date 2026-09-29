@@ -65,9 +65,19 @@ pub enum Msg {
         chat: Box<types::CodersdkChat>,
         messages: Vec<types::CodersdkChatMessage>,
     },
+    /// The runtime sends this when `Effect::LoadChat` fails to load the chat or its messages.
+    ChatLoadFailed {
+        chat_id: Uuid,
+        message: String,
+    },
     ChatCreated(Box<types::CodersdkChat>),
     /// The runtime sends this when `Effect::CreateChat` fails.
     CreateFailed {
+        message: String,
+    },
+    /// The runtime sends this when `Effect::SendMessage` fails, with the text it tried to send.
+    SendFailed {
+        text: String,
         message: String,
     },
     Stream(StreamEvent),
@@ -132,7 +142,7 @@ pub enum Effect {
     ShowHelp,
     Copy(CopyTarget),
     SetMouse(bool),
-    /// Puts text back in the composer after a failed chat creation.
+    /// Puts text back in the composer after a failed chat creation or send.
     RestoreComposer(String),
     Quit,
 }
@@ -159,8 +169,16 @@ pub struct App {
     pub busy: BusyBehavior,
     pub mouse: bool,
     pub models_state: ModelsState,
+    /// The error from the most recent `Msg::StreamEnded`, cleared once the stream is live again.
+    pub last_stream_error: Option<String>,
     /// The text of the message sent with the in-flight `Effect::CreateChat`, if any.
     creating: Option<String>,
+    /// The existing chat whose `Effect::LoadChat` is in flight, if any.
+    loading: Option<Uuid>,
+    /// The existing chat that was requested but failed to load. While set, a submit retries the
+    /// load instead of creating a new chat.
+    failed_load: Option<Uuid>,
+    /// Text submitted while a chat is being created or loaded, sent once it exists.
     pending_text: Option<String>,
     reconnect_attempt: u32,
 }
@@ -221,6 +239,7 @@ impl App {
                 ];
                 if let Some(id) = open_chat {
                     self.connection = Connection::Connecting;
+                    self.loading = Some(id);
                     effects.push(Effect::LoadChat(id));
                 }
                 effects
@@ -229,18 +248,37 @@ impl App {
                 let Some(id) = chat.id else {
                     self.error("The server returned a chat without an id.");
                     self.connection = Connection::Idle;
-                    return vec![];
+                    self.failed_load = self.loading.take().or(self.failed_load);
+                    return self.restore_pending();
                 };
+                self.loading = None;
+                self.failed_load = None;
                 self.selected_model = self.selected_model.or(chat.last_model_config_id);
                 self.selected_workspace = chat.workspace_id;
                 self.chat_id = Some(id);
                 self.chat = Some(chat);
                 self.transcript.load(messages);
                 self.connection = Connection::Connecting;
-                vec![Effect::OpenStream {
+                let mut effects = vec![Effect::OpenStream {
                     chat: id,
                     after_id: self.transcript.last_message_id(),
-                }]
+                }];
+                if let Some(text) = self.pending_text.take() {
+                    effects.push(Effect::SendMessage {
+                        chat: id,
+                        text,
+                        model: self.selected_model,
+                        busy: self.busy,
+                    });
+                }
+                effects
+            }
+            Msg::ChatLoadFailed { chat_id, message } => {
+                self.loading = None;
+                self.failed_load = Some(chat_id);
+                self.connection = Connection::Idle;
+                self.error(format!("Could not load chat {chat_id}: {message}"));
+                self.restore_pending()
             }
             Msg::ChatCreated(chat) => {
                 let Some(id) = chat.id else {
@@ -272,6 +310,10 @@ impl App {
                 effects
             }
             Msg::CreateFailed { message } => self.fail_create(message),
+            Msg::SendFailed { text, message } => {
+                self.error(format!("Could not send the message: {message}"));
+                vec![Effect::RestoreComposer(text)]
+            }
             Msg::Stream(ev) => match self.transcript.apply(&ev) {
                 Applied::Reconnect(_) => match self.chat_id {
                     Some(chat) => {
@@ -296,13 +338,15 @@ impl App {
                 _ => {
                     self.connection = Connection::Live;
                     self.reconnect_attempt = 0;
+                    self.last_stream_error = None;
                     vec![]
                 }
             },
-            Msg::StreamEnded { .. } => {
+            Msg::StreamEnded { error } => {
                 let Some(chat) = self.chat_id else {
                     return vec![];
                 };
+                self.last_stream_error = error;
                 self.reconnect_attempt += 1;
                 self.transcript.live.clear();
                 self.connection = Connection::Reconnecting {
@@ -373,6 +417,21 @@ impl App {
         }
     }
 
+    /// Puts text queued behind a chat load back in the composer once that load has failed.
+    fn restore_pending(&mut self) -> Vec<Effect> {
+        match self.pending_text.take() {
+            Some(text) => vec![Effect::RestoreComposer(text)],
+            None => vec![],
+        }
+    }
+
+    fn queue_pending(&mut self, text: String) {
+        self.pending_text = Some(match self.pending_text.take() {
+            Some(prev) => format!("{prev}\n\n{text}"),
+            None => text,
+        });
+    }
+
     fn submit(&mut self, text: String) -> Vec<Effect> {
         let text = text.trim().to_owned();
         if text.is_empty() {
@@ -396,12 +455,21 @@ impl App {
             }];
         }
         if self.creating.is_some() {
-            self.pending_text = Some(match self.pending_text.take() {
-                Some(prev) => format!("{prev}\n\n{text}"),
-                None => text,
-            });
+            self.queue_pending(text);
             self.info("Waiting for the chat to be created; your message will follow.");
             return vec![];
+        }
+        if self.loading.is_some() {
+            self.queue_pending(text);
+            self.info("Waiting for the chat to load; your message will follow.");
+            return vec![];
+        }
+        if let Some(id) = self.failed_load.take() {
+            self.queue_pending(text);
+            self.loading = Some(id);
+            self.connection = Connection::Connecting;
+            self.info("Retrying the chat load.");
+            return vec![Effect::LoadChat(id)];
         }
         let Some(org) = self.org_id else {
             self.error("Not connected to Coder yet.");
@@ -1042,6 +1110,139 @@ mod tests {
     fn refresh_changes_nothing() {
         let mut app = App::new(BusyBehavior::Queue, true);
         assert!(app.update(Msg::Refresh).is_empty());
+    }
+
+    #[test]
+    fn a_failed_chat_load_goes_idle_and_the_next_submit_retries_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = Uuid::new_v4();
+        let requested = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: org,
+            open_chat: Some(requested),
+        });
+        let effects = app.update(Msg::ChatLoadFailed {
+            chat_id: requested,
+            message: "HTTP 404".into(),
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.connection, Connection::Idle);
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(format!(
+                "Could not load chat {requested}: HTTP 404"
+            )))
+        );
+        let effects = app.update(Msg::Submit("reply".into()));
+        assert_eq!(effects, vec![Effect::LoadChat(requested)]);
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info("Retrying the chat load.".into()))
+        );
+        assert_eq!(app.connection, Connection::Connecting);
+        let effects = app.update(Msg::ChatLoaded {
+            chat: chat(requested),
+            messages: vec![message(4)],
+        });
+        assert_eq!(
+            effects,
+            vec![
+                Effect::OpenStream {
+                    chat: requested,
+                    after_id: Some(4)
+                },
+                Effect::SendMessage {
+                    chat: requested,
+                    text: "reply".into(),
+                    model: None,
+                    busy: BusyBehavior::Queue
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn submit_while_the_requested_chat_loads_waits_for_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let requested = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: Uuid::new_v4(),
+            open_chat: Some(requested),
+        });
+        assert!(app.update(Msg::Submit("early".into())).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("load")));
+        let effects = app.update(Msg::ChatLoaded {
+            chat: chat(requested),
+            messages: vec![],
+        });
+        assert!(effects.contains(&Effect::SendMessage {
+            chat: requested,
+            text: "early".into(),
+            model: None,
+            busy: BusyBehavior::Queue
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CreateChat { .. }))
+        );
+    }
+
+    #[test]
+    fn a_failed_retry_puts_the_waiting_text_back() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let requested = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: Uuid::new_v4(),
+            open_chat: Some(requested),
+        });
+        app.update(Msg::ChatLoadFailed {
+            chat_id: requested,
+            message: "timeout".into(),
+        });
+        app.update(Msg::Submit("reply".into()));
+        let effects = app.update(Msg::ChatLoadFailed {
+            chat_id: requested,
+            message: "timeout".into(),
+        });
+        assert_eq!(effects, vec![Effect::RestoreComposer("reply".into())]);
+        assert_eq!(
+            app.update(Msg::Submit("again".into())),
+            vec![Effect::LoadChat(requested)]
+        );
+    }
+
+    #[test]
+    fn a_failed_send_restores_the_text() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let effects = app.update(Msg::SendFailed {
+            text: "hello".into(),
+            message: "HTTP 409".into(),
+        });
+        assert_eq!(effects, vec![Effect::RestoreComposer("hello".into())]);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("send") && m.contains("HTTP 409"))
+        );
+    }
+
+    #[test]
+    fn the_last_stream_error_is_kept_until_the_stream_is_live() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        app.update(Msg::StreamEnded {
+            error: Some("HTTP 404".into()),
+        });
+        assert_eq!(app.last_stream_error.as_deref(), Some("HTTP 404"));
+        app.update(ev(
+            json!({"type": "status", "status": {"status": "waiting"}}),
+        ));
+        assert_eq!(app.last_stream_error, None);
     }
 
     #[test]

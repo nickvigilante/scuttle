@@ -143,8 +143,8 @@ impl Runtime {
                 let chat = match client.api().get_chat_by_id(&id).await {
                     Ok(c) => c.into_inner(),
                     Err(e) => {
-                        return Msg::ApiFailed {
-                            action: "load the chat",
+                        return Msg::ChatLoadFailed {
+                            chat_id: id,
                             message: err(e).await,
                         };
                     }
@@ -156,9 +156,9 @@ impl Runtime {
                 {
                     Ok(m) => m.into_inner().messages,
                     Err(e) => {
-                        return Msg::ApiFailed {
-                            action: "load messages",
-                            message: err(e).await,
+                        return Msg::ChatLoadFailed {
+                            chat_id: id,
+                            message: format!("could not load its messages: {}", err(e).await),
                         };
                     }
                 };
@@ -201,8 +201,8 @@ impl Runtime {
                 };
                 match client.api().send_chat_message(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
-                    Err(e) => Msg::ApiFailed {
-                        action: "send the message",
+                    Err(e) => Msg::SendFailed {
+                        text,
                         message: err(e).await,
                     },
                 }
@@ -453,6 +453,80 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn load_chat_errors_send_chat_load_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(api_error(404, "chat not found"))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let id = Uuid::new_v4();
+        rt.run(Effect::LoadChat(id));
+        match next(&mut rx).await {
+            Msg::ChatLoadFailed { chat_id, message } => {
+                assert_eq!(chat_id, id);
+                assert!(message.contains("chat not found"), "{message}");
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("expected ChatLoadFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_messages_errors_send_chat_load_failed() {
+        let server = MockServer::start().await;
+        let id = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v2/chats/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": id, "children": [], "files": [], "mcp_server_ids": [],
+                "inline_mcp_servers": [], "labels": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v2/chats/{id}/messages")))
+            .respond_with(api_error(500, "messages unavailable"))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::LoadChat(id));
+        match next(&mut rx).await {
+            Msg::ChatLoadFailed { chat_id, message } => {
+                assert_eq!(chat_id, id);
+                assert!(message.contains("messages unavailable"), "{message}");
+            }
+            other => panic!("expected ChatLoadFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_errors_send_send_failed_with_the_text() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/chats/{chat}/messages")))
+            .respond_with(api_error(409, "the chat cannot accept messages"))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "keep this".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+        });
+        match next(&mut rx).await {
+            Msg::SendFailed { text, message } => {
+                assert_eq!(text, "keep this");
+                assert!(message.contains("cannot accept"), "{message}");
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
