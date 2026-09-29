@@ -27,6 +27,17 @@ fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Characters that `ratatui_textarea::TextArea::input` binds to emacs-style editing and
+/// cursor movement when Alt is held without Ctrl. Everything else typed with Alt (or
+/// AltGr, which several European layouts report as Ctrl+Alt) is inserted literally
+/// instead of being swallowed by the widget.
+fn is_alt_reserved(c: char) -> bool {
+    matches!(
+        c,
+        'h' | 'd' | 'w' | 'b' | 'f' | 'n' | 'p' | 'e' | 'a' | 'v' | '<' | '>' | '[' | ']'
+    )
+}
+
 impl Composer {
     pub fn new(max_lines: u16) -> Composer {
         let mut area = TextArea::default();
@@ -148,6 +159,13 @@ impl Composer {
             {
                 self.recall(false)
             }
+            // AltGr on several European layouts reports as Ctrl+Alt; treat it as a literal
+            // character rather than the widget's few Ctrl+Alt navigation bindings.
+            KeyCode::Char(c) if ctrl && alt => self.area.insert_char(c),
+            // TextArea::input only inserts a Char when Alt is not held, and otherwise
+            // treats Alt+<letter> as an emacs-style editing or movement shortcut. Insert
+            // directly unless `c` is one of those reserved shortcut keys.
+            KeyCode::Char(c) if alt && !ctrl && !is_alt_reserved(c) => self.area.insert_char(c),
             _ => {
                 self.area.input(key);
             }
@@ -291,5 +309,61 @@ mod tests {
         let mut c = Composer::new(10);
         c.paste("a\r\nb\rc");
         assert_eq!(c.text(), "a\nb\nc");
+        c.set_text("a\r\nb\rc");
+        assert_eq!(c.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn alt_and_altgr_characters_insert_directly() {
+        let mut c = Composer::new(10);
+        c.handle_key(
+            key(KeyCode::Char('s'), KeyModifiers::ALT),
+            SendShortcut::Enter,
+        );
+        assert_eq!(c.text(), "s");
+    }
+
+    #[test]
+    fn ctrl_alt_characters_insert_directly() {
+        let mut c = Composer::new(10);
+        c.handle_key(
+            key(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            SendShortcut::Enter,
+        );
+        assert_eq!(c.text(), "@");
+    }
+
+    #[test]
+    fn alt_reserved_emacs_keys_still_move_instead_of_inserting() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "ab");
+        c.handle_key(
+            key(KeyCode::Char('b'), KeyModifiers::ALT),
+            SendShortcut::Enter,
+        );
+        assert_eq!(c.text(), "ab");
+    }
+
+    #[test]
+    fn history_recall_handles_multi_line_entries() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "l1");
+        c.handle_key(
+            key(KeyCode::Enter, KeyModifiers::SHIFT),
+            SendShortcut::Enter,
+        );
+        type_str(&mut c, "l2");
+        c.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), SendShortcut::Enter);
+        type_str(&mut c, "x");
+        c.handle_key(key(KeyCode::Up, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(c.text(), "l1\nl2");
+        c.handle_key(key(KeyCode::Up, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(c.text(), "l1\nl2");
+        c.handle_key(key(KeyCode::Down, KeyModifiers::NONE), SendShortcut::Enter);
+        c.handle_key(key(KeyCode::Down, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(c.text(), "x");
     }
 }
