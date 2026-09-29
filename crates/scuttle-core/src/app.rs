@@ -40,6 +40,14 @@ pub enum Picker {
     Workspace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelsState {
+    #[default]
+    Loading,
+    Loaded,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyTarget {
     LastMessage,
@@ -68,6 +76,10 @@ pub enum Msg {
     },
     PrefsLoaded(DisplayPrefs),
     ModelsLoaded(Vec<types::CodersdkChatModel>),
+    /// The runtime sends this when `Effect::FetchModels` fails.
+    ModelsFailed {
+        message: String,
+    },
     WorkspacesLoaded(Vec<WorkspaceRef>),
     ModelChosen(Uuid),
     WorkspaceChosen(Option<Uuid>),
@@ -146,7 +158,7 @@ pub struct App {
     pub connection: Connection,
     pub busy: BusyBehavior,
     pub mouse: bool,
-    pub models_loaded: bool,
+    pub models_state: ModelsState,
     /// The text of the message sent with the in-flight `Effect::CreateChat`, if any.
     creating: Option<String>,
     pending_text: Option<String>,
@@ -243,18 +255,18 @@ impl App {
                     chat: id,
                     after_id: None,
                 }];
+                if workspace_mismatch {
+                    effects.push(Effect::SetWorkspace {
+                        chat: id,
+                        workspace: self.selected_workspace,
+                    });
+                }
                 if let Some(text) = self.pending_text.take() {
                     effects.push(Effect::SendMessage {
                         chat: id,
                         text,
                         model: self.selected_model,
                         busy: self.busy,
-                    });
-                }
-                if workspace_mismatch {
-                    effects.push(Effect::SetWorkspace {
-                        chat: id,
-                        workspace: self.selected_workspace,
                     });
                 }
                 effects
@@ -264,6 +276,7 @@ impl App {
                 Applied::Reconnect(_) => match self.chat_id {
                     Some(chat) => {
                         self.reconnect_attempt += 1;
+                        self.transcript.live.clear();
                         self.connection = Connection::Reconnecting {
                             attempt: self.reconnect_attempt,
                         };
@@ -310,7 +323,12 @@ impl App {
                     .into_iter()
                     .filter(|m| m.enabled != Some(false))
                     .collect();
-                self.models_loaded = true;
+                self.models_state = ModelsState::Loaded;
+                vec![]
+            }
+            Msg::ModelsFailed { message } => {
+                self.models_state = ModelsState::Failed;
+                self.error(format!("Could not load models: {message}"));
                 vec![]
             }
             Msg::WorkspacesLoaded(workspaces) => {
@@ -348,7 +366,11 @@ impl App {
             None => in_flight,
         };
         self.error(format!("Could not create the chat: {message}"));
-        vec![Effect::RestoreComposer(restored)]
+        if restored.is_empty() {
+            vec![]
+        } else {
+            vec![Effect::RestoreComposer(restored)]
+        }
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
@@ -407,9 +429,18 @@ impl App {
 
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         match cmd {
-            Command::Model(_) if !self.models_loaded => {
+            Command::Model(_) if self.models_state == ModelsState::Loading => {
                 self.info("Models are still loading.");
                 vec![]
+            }
+            Command::Model(_) if self.models_state == ModelsState::Failed => {
+                let Some(org) = self.org_id else {
+                    self.info("Models are still loading.");
+                    return vec![];
+                };
+                self.models_state = ModelsState::Loading;
+                self.info("Retrying the model list.");
+                vec![Effect::FetchModels(org)]
             }
             Command::Model(None) => vec![Effect::ShowPicker(Picker::Model)],
             Command::Model(Some(name)) => {
@@ -670,6 +701,38 @@ mod tests {
     }
 
     #[test]
+    fn set_workspace_precedes_the_queued_message() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("two".into()));
+        let ws = Uuid::new_v4();
+        app.update(Msg::WorkspaceChosen(Some(ws)));
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::ChatCreated(chat(id)));
+        let set_workspace = effects
+            .iter()
+            .position(|e| matches!(e, Effect::SetWorkspace { .. }))
+            .expect("SetWorkspace effect");
+        let send_message = effects
+            .iter()
+            .position(|e| matches!(e, Effect::SendMessage { .. }))
+            .expect("SendMessage effect");
+        assert!(set_workspace < send_message);
+    }
+
+    #[test]
+    fn stray_create_failure_does_not_clear_the_composer() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let effects = app.update(Msg::CreateFailed {
+            message: "HTTP 500".into(),
+        });
+        assert!(effects.is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Error(_))));
+    }
+
+    #[test]
     fn submit_with_a_chat_sends_with_the_configured_busy_behavior() {
         let mut app = App::new(BusyBehavior::Interrupt, true);
         started(&mut app);
@@ -805,6 +868,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_gap_clears_the_live_turn() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        let part = |seq| json!({"type": "message_part", "message_part": {"history_version": 1, "generation_attempt": 1, "seq": seq, "part": {"type": "text", "text": "x"}}});
+        app.update(ev(part(1)));
+        assert!(!app.transcript.live.is_empty());
+        app.update(ev(part(4)));
+        assert!(app.transcript.live.is_empty());
+    }
+
+    #[test]
     fn commands_need_a_chat_and_resolve_names() {
         let mut app = App::new(BusyBehavior::Queue, true);
         started(&mut app);
@@ -888,6 +967,20 @@ mod tests {
                 .is_empty()
         );
         assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still loading")));
+    }
+
+    #[test]
+    fn failed_model_load_retries_on_model_command() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        app.update(Msg::ModelsFailed {
+            message: "HTTP 500".into(),
+        });
+        assert_eq!(app.models_state, ModelsState::Failed);
+        let effects = app.update(Msg::Command(Command::Model(None)));
+        assert_eq!(effects, vec![Effect::FetchModels(org)]);
+        assert_eq!(app.models_state, ModelsState::Loading);
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("Retrying")));
     }
 
     #[test]
