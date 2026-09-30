@@ -225,5 +225,20 @@ mod tests {
                 );
             }
         }
+
+        let all: Vec<&str> = COMMANDS
+            .iter()
+            .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().copied()))
+            .collect();
+        let unique: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(
+            all.len(),
+            unique.len(),
+            "duplicate command name or alias: {:?}",
+            all.iter()
+                .copied()
+                .filter(|s| all.iter().filter(|o| *o == s).count() > 1)
+                .collect::<std::collections::HashSet<_>>()
+        );
     }
 }
