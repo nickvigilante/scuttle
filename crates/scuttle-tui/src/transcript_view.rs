@@ -76,6 +76,8 @@ enum Item<'a> {
 /// separately from its call) or a live `LiveBlock::ToolResult`.
 struct ToolResultInfo {
     result: String,
+    /// What the result names, for a call whose arguments say nothing.
+    summary: Option<String>,
     is_error: bool,
     done: bool,
 }
@@ -180,17 +182,59 @@ fn one_line(text: &str, max: usize) -> String {
     out
 }
 
-fn args_summary(args: &serde_json::Value) -> String {
+/// The call's arguments on one line: the first non-empty string among them, else all of them
+/// as JSON. `None` when they say nothing, such as `{}` or only empty values, so the summary can
+/// fall back to the result.
+fn args_summary(args: &serde_json::Value) -> Option<String> {
     match args {
         serde_json::Value::Object(map) => map
             .values()
             .filter_map(|v| v.as_str())
-            .next()
+            .find(|s| !s.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| args.to_string()),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+            .or_else(|| {
+                map.values()
+                    .any(|v| !is_empty_value(v))
+                    .then(|| args.to_string())
+            }),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
     }
+}
+
+/// Whether `v` holds nothing worth showing: null, an empty string or array, or an object of
+/// such values.
+fn is_empty_value(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(m) => m.values().all(is_empty_value),
+        _ => false,
+    }
+}
+
+/// Result fields that name what a tool acted on, for a call whose arguments say nothing.
+/// `start_workspace` and `stop_workspace` take only optional `parameters` and report the
+/// workspace as `workspace_name` (`coderd/x/chatd/chattool/startworkspace.go:37-38, 238-261`).
+const RESULT_NAME_FIELDS: &[&str] = &["workspace_name"];
+
+/// The first non-empty `RESULT_NAME_FIELDS` value of a result object, parsing a result that
+/// arrived as a JSON string first.
+fn result_summary(result: Option<&serde_json::Value>) -> Option<String> {
+    let parsed;
+    let value = match result? {
+        serde_json::Value::String(s) => {
+            parsed = serde_json::from_str::<serde_json::Value>(s).ok()?;
+            &parsed
+        }
+        other => other,
+    };
+    let map = value.as_object()?;
+    RESULT_NAME_FIELDS
+        .iter()
+        .find_map(|k| map.get(*k)?.as_str().filter(|s| !s.trim().is_empty()))
+        .map(str::to_owned)
 }
 
 /// Strips ANSI CSI escape sequences (`ESC '[' ...` up to a final byte in `0x40..=0x7E`) from
@@ -250,6 +294,7 @@ fn collect_tool_results(
                         p.tool_call_id.clone().unwrap_or_default(),
                         ToolResultInfo {
                             result: result_text(p.result.as_ref(), ""),
+                            summary: result_summary(p.result.as_ref()),
                             is_error: p.is_error.unwrap_or(false),
                             done: true,
                         },
@@ -276,6 +321,7 @@ fn collect_tool_results(
                     id.clone(),
                     ToolResultInfo {
                         result: result_text(result.as_ref(), result_raw),
+                        summary: result_summary(result.as_ref()),
                         is_error: *is_error,
                         done: *done,
                     },
@@ -309,7 +355,12 @@ fn items_for_message<'a>(
                 let result = results.get(&id);
                 items.push(Item::Tool {
                     name: p.tool_name.as_deref().unwrap_or("tool"),
-                    args: p.args.as_ref().map(args_summary).unwrap_or_default(),
+                    args: p
+                        .args
+                        .as_ref()
+                        .and_then(args_summary)
+                        .or_else(|| result.and_then(|r| r.summary.clone()))
+                        .unwrap_or_default(),
                     result: result.map(|r| r.result.clone()).unwrap_or_default(),
                     is_error: result.map(|r| r.is_error).unwrap_or(false),
                     done: result.map(|r| r.done).unwrap_or(false),
@@ -340,10 +391,12 @@ fn items_for_live<'a>(
                 let result = results.get(id);
                 items.push(Item::Tool {
                     name,
-                    args: args
-                        .as_ref()
-                        .map(args_summary)
-                        .unwrap_or_else(|| args_raw.clone()),
+                    args: match args {
+                        Some(args) => args_summary(args),
+                        None => Some(args_raw.clone()).filter(|raw| !raw.is_empty()),
+                    }
+                    .or_else(|| result.and_then(|r| r.summary.clone()))
+                    .unwrap_or_default(),
                     result: result.map(|r| r.result.clone()).unwrap_or_default(),
                     is_error: result.map(|r| r.is_error).unwrap_or(false),
                     done: result.map(|r| r.done).unwrap_or(false),
@@ -362,7 +415,7 @@ fn items_for_live<'a>(
             } if !calls.contains(id) => {
                 items.push(Item::Tool {
                     name,
-                    args: String::new(),
+                    args: result_summary(result.as_ref()).unwrap_or_default(),
                     result: result_text(result.as_ref(), result_raw),
                     is_error: *is_error,
                     done: *done,
@@ -1183,5 +1236,86 @@ mod tests {
             let view = build_at(&app, width);
             assert_eq!(view.lines.len(), view.meta.len(), "width {width}");
         }
+    }
+
+    #[test]
+    fn arguments_that_say_nothing_have_no_summary() {
+        assert_eq!(args_summary(&json!({})), None);
+        assert_eq!(args_summary(&json!({"parameters": {}})), None);
+        assert_eq!(args_summary(&json!({"path": "", "tags": []})), None);
+        assert_eq!(args_summary(&serde_json::Value::Null), None);
+        assert_eq!(
+            args_summary(&json!({"command": "ls -la"})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            args_summary(&json!({"count": 5})).as_deref(),
+            Some(r#"{"count":5}"#)
+        );
+        assert_eq!(
+            result_summary(Some(&json!({"started": true, "workspace_name": "dev"}))).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            result_summary(Some(&json!(r#"{"workspace_name":"dev"}"#))).as_deref(),
+            Some("dev"),
+            "a result stored as a JSON string"
+        );
+        assert_eq!(result_summary(Some(&json!({"output": "ok"}))), None);
+        assert_eq!(result_summary(None), None);
+    }
+
+    #[test]
+    fn a_call_without_useful_arguments_is_named_from_its_result() {
+        let app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "start_workspace", "args": {}},
+                {"type": "tool-call", "tool_call_id": "b", "tool_name": "stop_workspace", "args": {"parameters": {}}},
+                {"type": "tool-call", "tool_call_id": "c", "tool_name": "start_workspace", "args": {}}
+            ]},
+            {"id": 2, "role": "tool", "content": [
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "start_workspace", "result": {"started": true, "workspace_name": "dev"}},
+                {"type": "tool-result", "tool_call_id": "b", "tool_name": "stop_workspace", "result": {"stopped": true, "workspace_name": "dev"}}
+            ]}
+        ]));
+        let lines = texts(&build_at(&app, 60));
+        assert!(
+            lines.iter().any(|l| l.contains("start_workspace(dev)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("stop_workspace(dev)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("start_workspace()")),
+            "a call without a result yet shows empty parentheses: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("{}")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_live_call_without_useful_arguments_is_named_from_its_live_result() {
+        let mut app = app_with(json!([]));
+        app.transcript.live.blocks.push(LiveBlock::ToolCall {
+            id: "a".into(),
+            name: "start_workspace".into(),
+            args_raw: "{}".into(),
+            args: Some(json!({})),
+        });
+        app.transcript.live.blocks.push(LiveBlock::ToolResult {
+            id: "a".into(),
+            name: "start_workspace".into(),
+            result_raw: String::new(),
+            result: Some(json!({"started": true, "workspace_name": "dev"})),
+            reasoning: String::new(),
+            is_error: false,
+            done: true,
+        });
+        let lines = texts(&build_at(&app, 60));
+        assert!(
+            lines.iter().any(|l| l.contains("start_workspace(dev)")),
+            "{lines:?}"
+        );
     }
 }
