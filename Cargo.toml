@@ -5,9 +5,10 @@ members = ["crates/scuttle-core", "crates/scuttle-tui"]
 [workspace.package]
 edition = "2024"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
-coder-sdk = { git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs", rev = "2cdac1eb4d7c2cccb78e541769d694d545a96d98" }
+coder-sdk = { git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs", rev = "1ade5ab7162058578c18ad0c75fc44c948f4939d" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
