@@ -549,9 +549,24 @@ impl App {
             }
             Msg::ForChat { chat, msg } => {
                 if self.chat_id == Some(chat) {
-                    self.update(*msg)
-                } else {
-                    vec![]
+                    return self.update(*msg);
+                }
+                // A chat left with /new: report its failures, but leave the wait and plan mode
+                // of the chat now open alone.
+                match *msg {
+                    Msg::SendFailed { text, message, .. } => {
+                        self.error(format!(
+                            "Could not send the message to the previous chat: {message}"
+                        ));
+                        vec![Effect::RestoreComposer(text)]
+                    }
+                    Msg::ApiFailed { action, message } => {
+                        self.error(format!(
+                            "In the previous chat, could not {action}: {message}"
+                        ));
+                        vec![]
+                    }
+                    _ => vec![],
                 }
             }
             Msg::ChatLoaded { chat, messages } => {
@@ -2857,6 +2872,69 @@ mod tests {
         assert!(
             matches!(effects.as_slice(), [Effect::CreateChat { org: o, .. }] if *o == org),
             "{effects:?}"
+        );
+    }
+
+    /// Opens a chat, then starts a new one, and returns the old chat's id.
+    fn left_a_chat(app: &mut App) -> Uuid {
+        started(app);
+        let old = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(old),
+            messages: vec![],
+        });
+        app.update(Msg::Command(Command::New));
+        old
+    }
+
+    #[test]
+    fn a_late_send_failure_from_the_previous_chat_restores_its_text_only() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let old = left_a_chat(&mut app);
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::Submit("new question".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        let effects = app.update(Msg::ForChat {
+            chat: old,
+            msg: Box::new(Msg::SendFailed {
+                text: "old question".into(),
+                message: "busy".into(),
+                plan_mode: Some(true),
+            }),
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::RestoreComposer("old question".into())]
+        );
+        assert!(
+            app.plan_mode,
+            "the old chat's plan mode change is not taken back here"
+        );
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("previous chat") && m.contains("busy") && !m.contains("Plan mode")),
+            "{:?}",
+            app.notices.last()
+        );
+    }
+
+    #[test]
+    fn a_late_api_failure_from_the_previous_chat_says_so() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let old = left_a_chat(&mut app);
+        let effects = app.update(Msg::ForChat {
+            chat: old,
+            msg: Box::new(Msg::ApiFailed {
+                action: "compact the chat",
+                message: "gone".into(),
+            }),
+        });
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "In the previous chat, could not compact the chat: gone".into()
+            ))
         );
     }
 }

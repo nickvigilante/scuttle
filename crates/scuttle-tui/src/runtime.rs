@@ -232,40 +232,56 @@ impl Runtime {
                     plan_mode: plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
-                match client.api().send_chat_message(&chat, &body).await {
+                let msg = match client.api().send_chat_message(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::SendFailed {
                         text,
                         message: err(e).await,
                         plan_mode,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Interrupt(chat) => self.spawn(Box::pin(async move {
-                match client.api().interrupt_chat(&chat).await {
+                let msg = match client.api().interrupt_chat(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "interrupt",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Compact(chat) => self.spawn(Box::pin(async move {
-                match client.api().compact_chat(&chat).await {
+                let msg = match client.api().compact_chat(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "compact the chat",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Clear(chat) => self.spawn(Box::pin(async move {
-                match client.api().clear_chat_context(&chat).await {
+                let msg = match client.api().clear_chat_context(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "clear the context",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::SetWorkspace { chat, workspace } => self.spawn(Box::pin(async move {
@@ -274,12 +290,16 @@ impl Runtime {
                     workspace_id: Some(workspace.unwrap_or(Uuid::nil())),
                     ..Default::default()
                 };
-                match client.api().update_chat(&chat, &body).await {
+                let msg = match client.api().update_chat(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "change the workspace",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::SetPlanMode { chat, on } => self.spawn(Box::pin(async move {
@@ -585,7 +605,7 @@ mod tests {
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::Compact(Uuid::new_v4()));
         assert!(matches!(
-            next(&mut rx).await,
+            untag(next(&mut rx).await),
             Msg::ApiFailed {
                 action: "compact the chat",
                 ..
@@ -658,7 +678,7 @@ mod tests {
             busy: scuttle_core::config::BusyBehavior::Queue,
             turn: TurnOptions::default(),
         });
-        match next(&mut rx).await {
+        match untag(next(&mut rx).await) {
             Msg::SendFailed {
                 text,
                 message,
@@ -708,7 +728,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
         rt.run(Effect::CreateChat {
             org: Uuid::new_v4(),
             text: "hi".into(),
@@ -805,7 +825,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
     }
 
     #[tokio::test]
@@ -823,7 +843,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        match next(&mut rx).await {
+        match untag(next(&mut rx).await) {
             Msg::SendFailed {
                 text, plan_mode, ..
             } => {
@@ -989,6 +1009,30 @@ mod tests {
                 );
             }
             other => panic!("expected a tagged plan mode result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_request_failures_are_tagged_with_their_chat() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::Interrupt(chat));
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(
+                    matches!(
+                        *msg,
+                        Msg::ApiFailed {
+                            action: "interrupt",
+                            ..
+                        }
+                    ),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged interrupt failure, got {other:?}"),
         }
     }
 }
