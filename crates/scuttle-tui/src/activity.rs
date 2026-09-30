@@ -18,6 +18,7 @@ pub fn spinner_frame(elapsed: Duration) -> &'static str {
     FRAMES[(step % FRAMES.len() as u128) as usize]
 }
 
+/// The text after the spinner, naming what the agent is doing.
 pub fn label(activity: &Activity) -> String {
     match activity {
         Activity::Waiting => "Waiting for the agent…".into(),
@@ -30,6 +31,7 @@ pub fn label(activity: &Activity) -> String {
     }
 }
 
+/// The whole activity row: the spinner frame for `elapsed`, then the label.
 pub fn activity_line(activity: &Activity, elapsed: Duration, theme: &Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{} ", spinner_frame(elapsed)), theme.accent),

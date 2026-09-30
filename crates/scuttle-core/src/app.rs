@@ -238,6 +238,9 @@ pub struct App {
     /// Set by a submit that sends or queues a message, and cleared once the chat reports a
     /// status other than `waiting`, an error, or a failed send.
     awaiting_reply: bool,
+    /// The id of the echoed user message the wait is for, once the stream has sent it; an
+    /// assistant message with a higher id is the reply.
+    sent_id: Option<i64>,
     reconnect_attempt: u32,
 }
 
@@ -297,15 +300,40 @@ impl App {
         }
     }
 
+    /// Starts waiting for the agent to pick up a message that was just sent or queued.
+    fn start_wait(&mut self) {
+        self.awaiting_reply = true;
+        self.sent_id = None;
+    }
+
     /// Whether `ev`, already applied, means the agent picked up the sent message or gave up.
-    /// A `waiting` status does not count: a snapshot or the end of an earlier turn can report
-    /// it before the new message starts.
-    fn ends_wait(&self, ev: &StreamEvent) -> bool {
+    /// A `waiting` or `interrupting` status does not count: a snapshot, the end of an earlier
+    /// turn, or a busy interrupt can report it before the new message starts. The reply itself
+    /// ends the wait whatever the status order, which covers a turn that ran while the stream
+    /// was down. Records the echo of the sent message on the way.
+    fn ends_wait(&mut self, ev: &StreamEvent) -> bool {
         match ev.kind {
-            StreamEventType::Status => {
-                !matches!(self.transcript.status, None | Some(ChatStatus::Waiting))
-            }
+            StreamEventType::Status => matches!(
+                self.transcript.status,
+                Some(ChatStatus::Running | ChatStatus::RequiresAction | ChatStatus::Error)
+            ),
             StreamEventType::Error => true,
+            StreamEventType::Message => {
+                let Some(m) = ev.event.as_ref().and_then(|e| e.message.as_ref()) else {
+                    return false;
+                };
+                let (Some(id), Some(role)) = (m.id, m.role.as_ref()) else {
+                    return false;
+                };
+                match (role.as_str(), self.sent_id) {
+                    ("user", None) => {
+                        self.sent_id = Some(id);
+                        false
+                    }
+                    ("assistant", Some(sent)) => id > sent,
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -488,7 +516,7 @@ impl App {
                     self.connection = Connection::Live;
                     self.reconnect_attempt = 0;
                     self.last_stream_error = None;
-                    if self.ends_wait(&ev) {
+                    if self.awaiting_reply && self.ends_wait(&ev) {
                         self.awaiting_reply = false;
                     }
                     vec![]
@@ -603,7 +631,7 @@ impl App {
             };
         }
         if let Some(chat) = self.chat_id {
-            self.awaiting_reply = true;
+            self.start_wait();
             return vec![Effect::SendMessage {
                 chat,
                 text,
@@ -613,19 +641,19 @@ impl App {
         }
         if self.creating.is_some() {
             self.queue_pending(text);
-            self.awaiting_reply = true;
+            self.start_wait();
             self.info("Waiting for the chat to be created; your message will follow.");
             return vec![];
         }
         if self.loading.is_some() {
             self.queue_pending(text);
-            self.awaiting_reply = true;
+            self.start_wait();
             self.info("Waiting for the chat to load; your message will follow.");
             return vec![];
         }
         if let Some(id) = self.failed_load.take() {
             self.queue_pending(text);
-            self.awaiting_reply = true;
+            self.start_wait();
             self.loading = Some(id);
             self.connection = Connection::Connecting;
             self.info("Retrying the chat load.");
@@ -641,7 +669,7 @@ impl App {
             return vec![Effect::RestoreComposer(text)];
         }
         self.creating = Some(text.clone());
-        self.awaiting_reply = true;
+        self.start_wait();
         vec![Effect::CreateChat {
             org,
             text,
@@ -1663,7 +1691,104 @@ mod tests {
             chat: chat(Uuid::new_v4()),
             messages: vec![],
         });
+        app.update(Msg::Submit("hi".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
         app.update(status("requires_action"));
+        assert_eq!(app.activity(), None, "requires_action ends the wait");
+    }
+
+    fn user_message(id: i64) -> Msg {
+        ev(
+            json!({"type": "message", "message": {"id": id, "role": "user", "content": [{"type": "text", "text": "hi"}]}}),
+        )
+    }
+
+    fn assistant_message(id: i64) -> Msg {
+        ev(
+            json!({"type": "message", "message": {"id": id, "role": "assistant", "content": [{"type": "text", "text": "Done"}]}}),
+        )
+    }
+
+    #[test]
+    fn the_reply_ends_the_wait_without_a_running_status() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        app.update(Msg::Submit("hi".into()));
+        app.update(user_message(1));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Waiting),
+            "the echo of our own message"
+        );
+        app.update(assistant_message(2));
+        assert_eq!(app.activity(), None);
+    }
+
+    #[test]
+    fn a_reply_from_the_earlier_turn_does_not_end_a_queued_wait() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![message(1)],
+        });
+        app.update(status("running"));
+        app.update(Msg::Submit("next".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        app.update(assistant_message(2));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Waiting),
+            "the earlier turn replied before our message was echoed"
+        );
+        app.update(status("waiting"));
+        app.update(user_message(3));
+        app.update(assistant_message(2));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Waiting),
+            "an older assistant message is not the reply"
+        );
+        app.update(assistant_message(4));
+        assert_eq!(app.activity(), None);
+    }
+
+    #[test]
+    fn an_interrupting_hand_off_keeps_the_activity_row() {
+        let mut app = App::new(BusyBehavior::Interrupt, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        app.update(status("running"));
+        app.update(Msg::Submit("stop and do this".into()));
+        assert!(app.activity().is_some());
+        for s in ["interrupting", "waiting", "running"] {
+            app.update(status(s));
+            assert!(app.activity().is_some(), "no activity after {s}");
+        }
+        assert_eq!(app.activity(), Some(Activity::Working));
+    }
+
+    #[test]
+    fn a_failed_load_stops_the_wait() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let id = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: Uuid::new_v4(),
+            open_chat: Some(id),
+        });
+        app.update(Msg::Submit("hi".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        app.update(Msg::ChatLoadFailed {
+            chat_id: id,
+            message: "HTTP 404".into(),
+        });
         assert_eq!(app.activity(), None);
     }
 }
