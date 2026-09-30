@@ -65,6 +65,29 @@ pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     lines.iter().flat_map(|l| wrap_line(l, width)).collect()
 }
 
+/// Wraps each line, pairing every row with whether it continues the row before it, so a
+/// selection can rejoin a soft-wrapped line without inserting a line break.
+pub fn wrap_rows(lines: &[Line<'static>], width: u16) -> Vec<(Line<'static>, bool)> {
+    lines
+        .iter()
+        .flat_map(|l| {
+            wrap_line(l, width)
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| (row, i > 0))
+        })
+        .collect()
+}
+
+/// The display columns `text` takes, measured the way `wrap_line` measures it: tabs as four
+/// columns, then one width per grapheme cluster.
+pub fn cells_width(text: &str) -> usize {
+    text.replace('\t', "    ")
+        .graphemes(true)
+        .map(|g| g.width())
+        .sum()
+}
+
 fn to_line(cells: &[(String, Style)], line_style: Style) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (g, style) in cells {
@@ -194,5 +217,15 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "    ");
         assert_eq!(width(&out[0]), 4);
+    }
+    #[test]
+    fn wrap_rows_marks_continuations() {
+        let lines = vec![
+            Line::from("one two three four five six"),
+            Line::from("short"),
+        ];
+        let rows = wrap_rows(&lines, 10);
+        let marks: Vec<bool> = rows.iter().map(|(_, c)| *c).collect();
+        assert_eq!(marks, vec![false, true, true, true, false]);
     }
 }

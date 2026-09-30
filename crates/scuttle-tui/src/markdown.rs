@@ -1,14 +1,17 @@
-//! Markdown to styled terminal lines, recording where code blocks are for copying.
+//! Markdown to styled terminal lines, recording where code blocks and links are for copying
+//! and clicking.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::highlight;
+use crate::wrap::cells_width;
 
 /// Cap on cached entries; the cache is cleared rather than evicted individually since
 /// rendering is cheap and a transcript's distinct messages rarely exceed this.
@@ -55,10 +58,19 @@ pub struct CodeBlock {
     pub code: String,
 }
 
+/// Link text on rendered line `line`, at display columns `cols` of that line before wrapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub line: usize,
+    pub cols: Range<usize>,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub code_blocks: Vec<CodeBlock>,
+    pub links: Vec<Link>,
 }
 
 struct Builder {
@@ -72,6 +84,10 @@ struct Builder {
     code: Option<(String, String)>,
     /// Whether the next `TableCell` is the first one in its row (no leading separator).
     first_cell: bool,
+    /// The open link's URL and the index in `current` where its text starts on this line.
+    link: Option<(String, usize)>,
+    /// Links on the current line, as span index ranges into `current`, placed by `flush`.
+    line_links: Vec<(usize, usize, String)>,
 }
 
 impl Builder {
@@ -82,7 +98,16 @@ impl Builder {
     }
 
     fn flush(&mut self) {
+        // A link still open at a line break goes on from the start of the next line.
+        if let Some((url, start)) = self.link.as_mut() {
+            if self.current.len() > *start {
+                self.line_links
+                    .push((*start, self.current.len(), url.clone()));
+            }
+            *start = 0;
+        }
         if self.current.is_empty() {
+            self.line_links.clear();
             return;
         }
         let mut spans = Vec::new();
@@ -92,7 +117,20 @@ impl Builder {
                 Style::new().fg(Color::DarkGray),
             ));
         }
+        let offset = spans.len();
         spans.append(&mut self.current);
+        let line = self.out.lines.len();
+        let width =
+            |spans: &[Span]| -> usize { spans.iter().map(|s| cells_width(&s.content)).sum() };
+        for (start, end, url) in self.line_links.drain(..) {
+            let from = width(&spans[..offset + start]);
+            let to = from + width(&spans[offset + start..offset + end]);
+            self.out.links.push(Link {
+                line,
+                cols: from..to,
+                url,
+            });
+        }
         self.out.lines.push(Line::from(spans));
     }
 
@@ -138,6 +176,8 @@ pub fn render(text: &str) -> Rendered {
         quote_depth: 0,
         code: None,
         first_cell: true,
+        link: None,
+        line_links: Vec::new(),
     };
     for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES) {
         if let Some((_, code)) = b.code.as_mut() {
@@ -244,9 +284,26 @@ pub fn render(text: &str) -> Rendered {
                 };
                 b.code = Some((lang, String::new()));
             }
-            Event::Code(c) => b
-                .current
-                .push(Span::styled(c.to_string(), Style::new().fg(Color::Yellow))),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                b.styles
+                    .push(Style::new().add_modifier(Modifier::UNDERLINED));
+                b.link = Some((dest_url.to_string(), b.current.len()));
+            }
+            Event::End(TagEnd::Link) => {
+                b.styles.pop();
+                if let Some((url, start)) = b.link.take()
+                    && b.current.len() > start
+                {
+                    b.line_links.push((start, b.current.len(), url));
+                }
+            }
+            Event::Code(c) => {
+                let mut style = Style::new().fg(Color::Yellow);
+                if b.link.is_some() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                b.current.push(Span::styled(c.to_string(), style));
+            }
             Event::Text(t) => {
                 let style = b.style();
                 b.current.push(Span::styled(t.to_string(), style));
@@ -356,5 +413,61 @@ mod tests {
         assert_eq!(plain(&cached_first), plain(&direct));
         assert_eq!(plain(&cached_second), plain(&direct));
         assert_eq!(cached_first.code_blocks, direct.code_blocks);
+    }
+
+    #[test]
+    fn links_are_underlined_and_located() {
+        let r = render(
+            "See [the docs](https://coder.com/docs) now.\n\n> quoted [x](https://x.example)\n",
+        );
+        let text = plain(&r);
+        assert_eq!(text[0], "See the docs now.");
+        assert_eq!(
+            r.links[0],
+            Link {
+                line: 0,
+                cols: 4..12,
+                url: "https://coder.com/docs".into()
+            }
+        );
+        let docs = r.lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "the docs")
+            .unwrap();
+        assert!(docs.style.add_modifier.contains(Modifier::UNDERLINED));
+        let quoted = text.iter().position(|l| l.contains("quoted")).unwrap();
+        assert_eq!(
+            r.links[1],
+            Link {
+                line: quoted,
+                cols: 9..10,
+                url: "https://x.example".into()
+            },
+            "columns count the quote marker"
+        );
+    }
+
+    #[test]
+    fn a_link_split_by_a_hard_break_is_located_on_both_lines() {
+        let r = render("[one  \ntwo](https://coder.com)\n");
+        assert_eq!(plain(&r), ["one", "two"]);
+        let lines: Vec<(usize, std::ops::Range<usize>)> =
+            r.links.iter().map(|l| (l.line, l.cols.clone())).collect();
+        assert_eq!(lines, [(0, 0..3), (1, 0..3)]);
+    }
+
+    #[test]
+    fn code_is_never_a_link() {
+        let r = render("```\n[the docs](https://coder.com/docs)\n```\n");
+        assert!(r.links.is_empty());
+        let r = render("[`code`](https://coder.com)");
+        assert_eq!(r.links.len(), 1, "inline code inside a link is part of it");
+        assert!(
+            r.lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 }

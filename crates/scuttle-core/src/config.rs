@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use uuid::Uuid;
 
 use crate::density::Density;
 
@@ -48,6 +49,10 @@ pub struct LocalConfig {
     pub composer_max_lines: u16,
     pub welcome: WelcomeConfig,
     pub density: BTreeMap<String, Density>,
+    /// The organization new chats go to, saved by `/organization`. An ID, not a secret.
+    /// A value that is not a valid ID is ignored, so startup falls back to the default.
+    #[serde(deserialize_with = "lenient_uuid")]
+    pub organization: Option<Uuid>,
 }
 
 impl Default for LocalConfig {
@@ -58,8 +63,15 @@ impl Default for LocalConfig {
             composer_max_lines: 10,
             welcome: WelcomeConfig::default(),
             density: BTreeMap::new(),
+            organization: None,
         }
     }
+}
+
+/// Reads an optional string and keeps it only when it parses as a UUID.
+fn lenient_uuid<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+    let text = Option::<String>::deserialize(d)?;
+    Ok(text.and_then(|t| Uuid::parse_str(t.trim()).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -157,8 +169,9 @@ pub fn load(path: &Path) -> Result<LocalConfig, ConfigError> {
     }
 }
 
-/// Sets `mouse` in the file, creating it if needed and preserving comments and formatting.
-pub fn set_mouse(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+/// Sets one top-level key in the file, creating it if needed and preserving comments and
+/// formatting.
+fn set_value(path: &Path, key: &str, value: toml_edit::Item) -> Result<(), ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -167,16 +180,52 @@ pub fn set_mouse(path: &Path, enabled: bool) -> Result<(), ConfigError> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .map_err(|e: toml_edit::TomlError| ConfigError::Parse(e.to_string()))?;
-    doc["mouse"] = toml_edit::value(enabled);
+    doc[key] = value;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ConfigError::Io(e.to_string()))?;
     }
     std::fs::write(path, doc.to_string()).map_err(|e| ConfigError::Io(e.to_string()))
 }
 
+/// Sets `mouse` in the file.
+pub fn set_mouse(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+    set_value(path, "mouse", toml_edit::value(enabled))
+}
+
+/// Saves the organization new chats go to.
+pub fn set_organization(path: &Path, id: Uuid) -> Result<(), ConfigError> {
+    set_value(path, "organization", toml_edit::value(id.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_saved_organization() {
+        let id = uuid::Uuid::new_v4();
+        let cfg = load_from_str(&format!("organization = \"{id}\"\n")).unwrap();
+        assert_eq!(cfg.organization, Some(id));
+        assert_eq!(LocalConfig::default().organization, None);
+    }
+
+    #[test]
+    fn a_malformed_saved_organization_is_ignored() {
+        let cfg = load_from_str(
+            "organization = \"nope\"\nmouse = false\nbusy_behavior = \"interrupt\"\ncomposer_max_lines = 6\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.organization, None);
+        assert!(!cfg.mouse);
+        assert_eq!(cfg.busy_behavior, BusyBehavior::Interrupt);
+        assert_eq!(cfg.composer_max_lines, 6);
+        assert_eq!(
+            load_from_str("organization = \"nope\"")
+                .unwrap()
+                .organization,
+            None
+        );
+    }
 
     #[test]
     fn defaults_apply_to_an_empty_file() {
@@ -241,6 +290,66 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"));
         assert!(load(&path).unwrap().mouse);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn set_organization_saves_the_id_and_keeps_comments() {
+        let dir = std::env::temp_dir().join(format!("scuttle-org-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("scuttle/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# keep me\nmouse = false\n").unwrap();
+        let id = uuid::Uuid::new_v4();
+        set_organization(&path, id).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        assert!(text.contains(&format!("organization = \"{id}\"")), "{text}");
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.organization, Some(id));
+        assert!(!cfg.mouse);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn set_organization_leaves_every_other_line_of_a_commented_config_alone() {
+        let dir = std::env::temp_dir().join(format!("scuttle-org-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "\
+# scuttle config
+mouse = false # no capture
+busy_behavior = \"interrupt\"
+
+# How the welcome screen looks.
+[welcome]
+show = false
+art_file = \"/tmp/art.txt\" # my art
+
+[density]
+# Tool output I never read.
+read_file = \"hidden\"
+";
+        std::fs::write(&path, original).unwrap();
+        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        set_organization(&path, first).unwrap();
+        set_organization(&path, second).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in original.lines() {
+            assert!(text.contains(line), "lost {line:?} in:\n{text}");
+        }
+        assert_eq!(
+            text.matches("organization =").count(),
+            1,
+            "a second save replaces the first:\n{text}"
+        );
+        assert!(!text.contains(&first.to_string()), "{text}");
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.organization, Some(second));
+        assert!(!cfg.mouse);
+        assert_eq!(cfg.busy_behavior, BusyBehavior::Interrupt);
+        assert!(!cfg.welcome.show);
+        assert_eq!(cfg.welcome.art_file, Some(PathBuf::from("/tmp/art.txt")));
+        assert_eq!(cfg.density.get("read_file"), Some(&Density::Hidden));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,5 +1,6 @@
 //! Executes API effects with coder-sdk and reports results back as `Msg`s.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -8,11 +9,13 @@ use std::time::Duration;
 
 use coder_sdk::{Client, types};
 use futures::StreamExt;
-use scuttle_core::app::{Effect, Msg, WorkspaceRef};
+use scuttle_core::app::{Effect, Msg, OrgRef, WorkspaceRef};
 use scuttle_core::density::DisplayPrefs;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use crate::links;
 
 pub struct Runtime {
     client: Client,
@@ -22,20 +25,26 @@ pub struct Runtime {
     stream_generation: Arc<AtomicU64>,
 }
 
-/// A stream task's sender, silenced once a newer stream replaces it.
+/// A stream task's sender, silenced once a newer stream replaces it or the stream closes.
 struct StreamSender {
     tx: UnboundedSender<Msg>,
     generation: Arc<AtomicU64>,
     mine: u64,
+    /// The chat this stream belongs to. Every message is tagged with it, because one already
+    /// in the channel when the stream is replaced still arrives.
+    chat: Uuid,
 }
 
 impl StreamSender {
-    /// Sends `msg` if this stream is still the current one. Returns whether it was current.
+    /// Sends `msg` for this stream's chat if the stream is still current. Returns whether it was.
     fn send(&self, msg: Msg) -> bool {
         if self.generation.load(Ordering::SeqCst) != self.mine {
             return false;
         }
-        let _ = self.tx.send(msg);
+        let _ = self.tx.send(Msg::ForChat {
+            chat: self.chat,
+            msg: Box::new(msg),
+        });
         true
     }
 }
@@ -45,6 +54,67 @@ fn text_part(text: &str) -> types::CodersdkChatInputPart {
         type_: Some(types::CodersdkChatInputPartType("text".into())),
         text: Some(text.to_owned()),
         ..Default::default()
+    }
+}
+
+/// The wire value of a plan mode switch: `"plan"` turns it on and `""` clears it.
+fn plan_mode_value(on: bool) -> types::CodersdkChatPlanMode {
+    types::CodersdkChatPlanMode(if on { "plan" } else { "" }.into())
+}
+
+/// The web UI page for `chat`, on the deployment's origin without any userinfo, path, or query.
+pub fn chat_web_url(base: &url::Url, chat: Uuid) -> url::Url {
+    let mut url = base.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path(&format!("/agents/{chat}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+/// Whether scuttle runs over SSH, where a browser would open on the wrong machine.
+fn over_ssh(is_set: impl Fn(&str) -> bool) -> bool {
+    is_set("SSH_CONNECTION") || is_set("SSH_TTY")
+}
+
+/// Opens `url` with the system browser. Every standard stream is closed, because the opener's
+/// output would land on top of the full-screen UI.
+///
+/// `cfg!(test)` only holds for unit tests in this crate; `tests/pty.rs` spawns the real
+/// `scuttle` binary, so it sets `SCUTTLE_NO_BROWSER` to keep those tests from launching one too.
+async fn open_in_browser(url: &str) -> Result<(), String> {
+    if cfg!(test) || std::env::var_os("SCUTTLE_NO_BROWSER").is_some() {
+        return Err("not opened".into());
+    }
+    if over_ssh(|k| std::env::var_os(k).is_some()) {
+        return Err("over SSH, so open it on your own machine".into());
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = tokio::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
+}
+
+/// Opens a link from the transcript. Only web links open, and in normalized form.
+async fn open_link(url: &str) -> Result<(), String> {
+    match links::web_link(url) {
+        Some(parsed) => open_in_browser(parsed.as_str()).await,
+        None => Err("only http and https links open in a browser".into()),
     }
 }
 
@@ -66,12 +136,67 @@ impl Runtime {
         }
     }
 
-    /// Resolves the user's first organization, the one new chats are created in, or `None`
-    /// when the user belongs to none.
-    pub async fn organization(&self) -> Result<Option<Uuid>, coder_sdk::Error> {
-        match self.client.api().get_organizations_by_user("me").await {
-            Ok(r) => Ok(r.into_inner().first().map(|o| o.id)),
-            Err(e) => Err(coder_sdk::Error::from_progenitor(e).await),
+    /// The user's organizations, in the server's order, which is not stable; pick one with
+    /// `scuttle_core::app::pick_organization`. With two or more, each is marked with whether
+    /// the user may create chats there, which costs those users one extra round trip at
+    /// startup, since the pick needs the answer before the first frame.
+    pub async fn organizations(&self) -> Result<Vec<OrgRef>, coder_sdk::Error> {
+        let mut orgs: Vec<OrgRef> = match self.client.api().get_organizations_by_user("me").await {
+            Ok(r) => r
+                .into_inner()
+                .into_iter()
+                .map(|o| OrgRef {
+                    id: o.id,
+                    name: o.name.unwrap_or_default(),
+                    display_name: o.display_name.unwrap_or_default(),
+                    is_default: o.is_default,
+                    can_create_chats: true,
+                })
+                .collect(),
+            Err(e) => return Err(coder_sdk::Error::from_progenitor(e).await),
+        };
+        // With one organization there is nothing to choose between, so skip the request.
+        if orgs.len() > 1 {
+            let denied = self.chat_denied(&orgs).await;
+            for org in &mut orgs {
+                org.can_create_chats = !denied.contains(&org.id);
+            }
+        }
+        Ok(orgs)
+    }
+
+    /// The organizations where the server says the user may not create chats, from one
+    /// `POST /authcheck` with a check per organization: the check the web UI's
+    /// `permittedOrganizations` runs (`site/src/api/queries/organizations.ts:308-326`, called
+    /// from `AgentCreateForm.tsx:236-243`). Empty when the check fails, so it hides nothing.
+    async fn chat_denied(&self, orgs: &[OrgRef]) -> HashSet<Uuid> {
+        let checks = orgs
+            .iter()
+            .map(|o| {
+                (
+                    o.id.to_string(),
+                    types::CodersdkAuthorizationCheck {
+                        action: Some(types::CodersdkRbacAction("create".into())),
+                        object: Some(types::CodersdkAuthorizationObject {
+                            organization_id: Some(o.id.to_string()),
+                            owner_id: Some("me".into()),
+                            resource_type: Some(types::CodersdkRbacResource("chat".into())),
+                            ..Default::default()
+                        }),
+                    },
+                )
+            })
+            .collect();
+        let body = types::CodersdkAuthorizationRequest { checks };
+        match self.client.api().check_authorization(&body).await {
+            Ok(r) => r
+                .into_inner()
+                .0
+                .into_iter()
+                .filter(|(_, allowed)| !allowed)
+                .filter_map(|(id, _)| id.parse().ok())
+                .collect(),
+            Err(_) => HashSet::new(),
         }
     }
 
@@ -86,6 +211,7 @@ impl Runtime {
             tx: self.tx.clone(),
             generation: self.stream_generation.clone(),
             mine,
+            chat,
         };
         self.stream = Some(tokio::spawn(async move {
             if !delay.is_zero() {
@@ -137,6 +263,13 @@ impl Runtime {
                 after_id,
                 delay,
             } => self.open_stream(chat, after_id, delay),
+            Effect::CloseStream => {
+                // The bump silences a task that is mid-send; the core drops what is queued.
+                self.stream_generation.fetch_add(1, Ordering::SeqCst);
+                if let Some(old) = self.stream.take() {
+                    old.abort();
+                }
+            }
             Effect::LoadChat(id) => self.spawn(Box::pin(async move {
                 let chat = match client.api().get_chat_by_id(&id).await {
                     Ok(c) => c.into_inner(),
@@ -170,12 +303,15 @@ impl Runtime {
                 text,
                 model,
                 workspace,
+                turn,
             } => self.spawn(Box::pin(async move {
                 let body = types::CodersdkCreateChatRequest {
                     organization_id: Some(org),
                     content: vec![text_part(&text)],
                     model_config_id: model,
                     workspace_id: workspace,
+                    reasoning_effort: turn.effort,
+                    plan_mode: turn.plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
                 match client.api().create_chat(&body).await {
@@ -190,46 +326,67 @@ impl Runtime {
                 text,
                 model,
                 busy,
+                turn,
             } => self.spawn(Box::pin(async move {
+                let plan_mode = turn.plan_mode;
                 let body = types::CodersdkCreateChatMessageRequest {
                     content: vec![text_part(&text)],
                     model_config_id: model,
                     busy_behavior: Some(types::CodersdkChatBusyBehavior(busy.as_str().into())),
+                    reasoning_effort: turn.effort,
+                    plan_mode: plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
-                match client.api().send_chat_message(&chat, &body).await {
+                let msg = match client.api().send_chat_message(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::SendFailed {
                         text,
                         message: err(e).await,
+                        plan_mode,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Interrupt(chat) => self.spawn(Box::pin(async move {
-                match client.api().interrupt_chat(&chat).await {
+                let msg = match client.api().interrupt_chat(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "interrupt",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Compact(chat) => self.spawn(Box::pin(async move {
-                match client.api().compact_chat(&chat).await {
+                let msg = match client.api().compact_chat(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "compact the chat",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::Clear(chat) => self.spawn(Box::pin(async move {
-                match client.api().clear_chat_context(&chat).await {
+                let msg = match client.api().clear_chat_context(&chat).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "clear the context",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::SetWorkspace { chat, workspace } => self.spawn(Box::pin(async move {
@@ -238,13 +395,49 @@ impl Runtime {
                     workspace_id: Some(workspace.unwrap_or(Uuid::nil())),
                     ..Default::default()
                 };
-                match client.api().update_chat(&chat, &body).await {
+                let msg = match client.api().update_chat(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "change the workspace",
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
+            })),
+            Effect::SetPlanMode { chat, on } => self.spawn(Box::pin(async move {
+                let body = types::CodersdkUpdateChatRequest {
+                    plan_mode: Some(plan_mode_value(on)),
+                    ..Default::default()
+                };
+                let msg = match client.api().update_chat(&chat, &body).await {
+                    Ok(_) => Msg::Refresh,
+                    Err(e) => Msg::PlanModeFailed {
+                        on,
+                        message: err(e).await,
+                    },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
+                }
+            })),
+            Effect::OpenWeb(chat) => {
+                let url = chat_web_url(client.base_url(), chat).to_string();
+                self.spawn(Box::pin(async move {
+                    let outcome = open_in_browser(&url).await;
+                    Msg::WebOpened { url, outcome }
+                }));
+            }
+            Effect::OpenLink(url) => self.spawn(Box::pin(async move {
+                // Report a web link in the normalized form the opener gets, so the notice names
+                // the real destination, such as the punycode form of a lookalike host. Any other
+                // text never reaches the opener and is copied as written.
+                let url = links::web_link(&url).map_or(url, |u| u.to_string());
+                let outcome = open_link(&url).await;
+                Msg::LinkOpened { url, outcome }
             })),
             Effect::FetchPrefs => self.spawn(Box::pin(async move {
                 match client.api().get_user_preference_settings("me").await {
@@ -256,7 +449,7 @@ impl Runtime {
                 }
             })),
             Effect::FetchModels(org) => self.spawn(Box::pin(async move {
-                match client
+                let msg = match client
                     .api()
                     .list_ai_models_and_provider_descriptors_in_an_organization(&org.to_string())
                     .await
@@ -265,12 +458,17 @@ impl Runtime {
                     Err(e) => Msg::ModelsFailed {
                         message: err(e).await,
                     },
+                };
+                Msg::ForOrg {
+                    org,
+                    msg: Box::new(msg),
                 }
             })),
-            Effect::FetchWorkspaces => self.spawn(Box::pin(async move {
-                match client
+            Effect::FetchWorkspaces(org) => self.spawn(Box::pin(async move {
+                let query = format!("owner:me organization:{org}");
+                let msg = match client
                     .api()
-                    .list_workspaces(Some(100), None, Some("owner:me"))
+                    .list_workspaces(Some(100), None, Some(query.as_str()))
                     .await
                 {
                     Ok(r) => Msg::WorkspacesLoaded(
@@ -289,13 +487,21 @@ impl Runtime {
                         action: "load workspaces",
                         message: err(e).await,
                     },
+                };
+                Msg::ForOrg {
+                    org,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::ShowPicker(_)
             | Effect::ShowHelp
             | Effect::Copy(_)
+            | Effect::CopyWebUrl(_)
+            | Effect::CopyLink(_)
             | Effect::SetMouse(_)
+            | Effect::SaveOrganization(_)
             | Effect::RestoreComposer(_)
+            | Effect::ClearView
             | Effect::Quit => {}
         }
     }
@@ -305,6 +511,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use futures::SinkExt;
+    use scuttle_core::app::TurnOptions;
     use secrecy::SecretString;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -335,8 +542,111 @@ mod tests {
             .expect("the channel is open")
     }
 
+    /// The message inside a `Msg::ForChat`, or the message itself.
+    fn untag(msg: Msg) -> Msg {
+        match msg {
+            Msg::ForChat { msg, .. } => *msg,
+            other => other,
+        }
+    }
+
     fn api_error(status: u16, message: &str) -> ResponseTemplate {
         ResponseTemplate::new(status).set_body_json(serde_json::json!({ "message": message }))
+    }
+
+    #[tokio::test]
+    async fn open_web_reports_the_chat_url() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::OpenWeb(chat));
+        match next(&mut rx).await {
+            Msg::WebOpened { url, outcome } => {
+                assert_eq!(url, format!("{}/agents/{chat}", server.uri()));
+                assert!(outcome.is_err(), "tests never launch a browser");
+            }
+            other => panic!("expected WebOpened, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_link_reports_the_link() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::OpenLink("https://coder.com/docs".into()));
+        match next(&mut rx).await {
+            Msg::LinkOpened { url, outcome } => {
+                assert_eq!(url, "https://coder.com/docs");
+                assert_eq!(
+                    outcome,
+                    Err("not opened".into()),
+                    "tests never launch a browser"
+                );
+            }
+            other => panic!("expected LinkOpened, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opened_link_names_its_real_destination() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        // The first letter is Cyrillic, so the browser goes to the punycode host.
+        rt.run(Effect::OpenLink("https://\u{430}pple.com".into()));
+        let url = match next(&mut rx).await {
+            Msg::LinkOpened { url, .. } => url,
+            other => panic!("expected LinkOpened, got {other:?}"),
+        };
+        let mut app = scuttle_core::app::App::new(scuttle_core::config::BusyBehavior::Queue, true);
+        app.update(Msg::LinkOpened {
+            url,
+            outcome: Ok(()),
+        });
+        assert_eq!(
+            app.notices.last(),
+            Some(&scuttle_core::app::Notice::Info(
+                "Opened https://xn--pple-43d.com/".into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_web_links_reach_the_browser() {
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "-a Calculator",
+            "docs/setup.md",
+        ] {
+            assert_eq!(
+                open_link(url).await,
+                Err("only http and https links open in a browser".into()),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            open_link("https://coder.com").await,
+            Err("not opened".into()),
+            "a web link gets as far as the opener"
+        );
+    }
+
+    #[test]
+    fn the_web_url_keeps_only_the_origin() {
+        let base: url::Url = "https://user:pw@coder.example.com:8443/coder/?q=1#f"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            chat_web_url(&base, Uuid::nil()).as_str(),
+            "https://coder.example.com:8443/agents/00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn ssh_sessions_are_detected() {
+        assert!(over_ssh(|k| k == "SSH_CONNECTION"));
+        assert!(over_ssh(|k| k == "SSH_TTY"));
+        assert!(!over_ssh(|_| false));
     }
 
     #[tokio::test]
@@ -347,7 +657,7 @@ mod tests {
             chat: Uuid::new_v4(),
             after_id: None,
         });
-        match next(&mut rx).await {
+        match untag(next(&mut rx).await) {
             Msg::StreamEnded { error: Some(e) } => assert!(!e.contains(TOKEN), "{e}"),
             other => panic!("expected StreamEnded with an error, got {other:?}"),
         }
@@ -363,7 +673,7 @@ mod tests {
             delay: Duration::from_millis(1),
         });
         assert!(matches!(
-            next(&mut rx).await,
+            untag(next(&mut rx).await),
             Msg::StreamEnded { error: Some(_) }
         ));
     }
@@ -382,6 +692,7 @@ mod tests {
             text: "hello".into(),
             model: None,
             workspace: None,
+            turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
             Msg::CreateFailed { message } => {
@@ -415,6 +726,7 @@ mod tests {
             text: "hello".into(),
             model: None,
             workspace: None,
+            turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
             Msg::ChatCreated(chat) => assert_eq!(chat.id, Some(id)),
@@ -434,8 +746,181 @@ mod tests {
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::FetchModels(org));
         match next(&mut rx).await {
-            Msg::ModelsFailed { message } => assert!(message.contains("not allowed"), "{message}"),
-            other => panic!("expected ModelsFailed, got {other:?}"),
+            Msg::ForOrg { org: tagged, msg } => {
+                assert_eq!(tagged, org);
+                assert!(
+                    matches!(*msg, Msg::ModelsFailed { ref message } if message.contains("not allowed")),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged ModelsFailed, got {other:?}"),
+        }
+    }
+
+    fn org_json(id: Uuid, name: &str, is_default: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name.to_lowercase(), "display_name": name, "description": "",
+            "icon": "", "is_default": is_default, "default_org_member_roles": [],
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn the_default_organization_wins_over_list_order() {
+        let server = MockServer::start().await;
+        let (product, coder) = (Uuid::new_v4(), Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(product, "Product", false),
+                org_json(coder, "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        let labels: Vec<&str> = orgs.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, ["Product", "Coder"]);
+        assert_eq!(
+            scuttle_core::app::pick_organization(None, &orgs),
+            Some(coder)
+        );
+    }
+
+    #[tokio::test]
+    async fn organizations_where_chats_are_not_allowed_are_marked() {
+        let server = MockServer::start().await;
+        let (product, coder) = (Uuid::new_v4(), Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(product, "Product", false),
+                org_json(coder, "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        let mut checks = serde_json::Map::new();
+        checks.insert(
+            product.to_string(),
+            serde_json::json!({"action": "create", "object": {"resource_type": "chat", "owner_id": "me", "organization_id": product.to_string()}}),
+        );
+        let mut answers = serde_json::Map::new();
+        answers.insert(product.to_string(), false.into());
+        answers.insert(coder.to_string(), true.into());
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "checks": checks }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answers))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        let allowed: Vec<(&str, bool)> = orgs
+            .iter()
+            .map(|o| (o.label(), o.can_create_chats))
+            .collect();
+        assert_eq!(allowed, [("Product", false), ("Coder", true)]);
+        assert_eq!(
+            scuttle_core::app::pick_organization(Some(product), &orgs),
+            Some(coder)
+        );
+        assert_no_token_in_authcheck_bodies(&server).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_permission_check_hides_no_organization() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(Uuid::new_v4(), "Product", false),
+                org_json(Uuid::new_v4(), "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .respond_with(api_error(500, "authorizer is down"))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        assert!(orgs.iter().all(|o| o.can_create_chats), "{orgs:?}");
+        assert_no_token_in_authcheck_bodies(&server).await;
+    }
+
+    #[tokio::test]
+    async fn one_organization_skips_the_permission_check() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([org_json(
+                    Uuid::new_v4(),
+                    "Coder",
+                    true
+                )])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        assert!(orgs[0].can_create_chats);
+    }
+
+    /// Asserts that at least one `POST /authcheck` arrived and that none of their bodies carry
+    /// the session token, which belongs only in the auth header.
+    async fn assert_no_token_in_authcheck_bodies(server: &MockServer) {
+        let checks: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/v2/authcheck")
+            .collect();
+        assert!(!checks.is_empty(), "the permission check was sent");
+        for r in checks {
+            assert!(
+                !String::from_utf8_lossy(&r.body).contains(TOKEN),
+                "the session token is never in the request body"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspaces_are_listed_for_one_organization() {
+        let server = MockServer::start().await;
+        let org = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path("/api/v2/workspaces"))
+            .and(wiremock::matchers::query_param(
+                "q",
+                format!("owner:me organization:{org}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workspaces": [{"id": Uuid::new_v4(), "name": "dev"}], "count": 1
+            })))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::FetchWorkspaces(org));
+        match next(&mut rx).await {
+            Msg::ForOrg { org: tagged, msg } => {
+                assert_eq!(tagged, org);
+                assert!(
+                    matches!(*msg, Msg::WorkspacesLoaded(ref w) if w.len() == 1 && w[0].name == "dev"),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged workspace list, got {other:?}"),
         }
     }
 
@@ -445,7 +930,7 @@ mod tests {
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::Compact(Uuid::new_v4()));
         assert!(matches!(
-            next(&mut rx).await,
+            untag(next(&mut rx).await),
             Msg::ApiFailed {
                 action: "compact the chat",
                 ..
@@ -516,12 +1001,179 @@ mod tests {
             text: "keep this".into(),
             model: None,
             busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions::default(),
         });
-        match next(&mut rx).await {
-            Msg::SendFailed { text, message } => {
+        match untag(next(&mut rx).await) {
+            Msg::SendFailed {
+                text,
+                message,
+                plan_mode,
+            } => {
+                assert_eq!(plan_mode, None);
                 assert_eq!(text, "keep this");
                 assert!(message.contains("cannot accept"), "{message}");
                 assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_and_new_chats_carry_the_chosen_effort() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/chats/{chat}/messages")))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"reasoning_effort": "high"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let created = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/chats"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"reasoning_effort": "low"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": created, "children": [], "files": [], "mcp_server_ids": [],
+                "inline_mcp_servers": [], "labels": {}
+            })))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "hi".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
+        rt.run(Effect::CreateChat {
+            org: Uuid::new_v4(),
+            text: "hi".into(),
+            model: None,
+            workspace: None,
+            turn: TurnOptions {
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::ChatCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn set_plan_mode_patches_the_chat() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        for value in ["plan", ""] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v2/chats/{chat}")))
+                .and(wiremock::matchers::body_partial_json(
+                    serde_json::json!({"plan_mode": value}),
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+        }
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SetPlanMode { chat, on: true });
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
+        rt.run(Effect::SetPlanMode { chat, on: false });
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
+    }
+
+    #[tokio::test]
+    async fn a_failed_plan_mode_update_says_which_way() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SetPlanMode {
+            chat: Uuid::new_v4(),
+            on: true,
+        });
+        match untag(next(&mut rx).await) {
+            Msg::PlanModeFailed { on, message } => {
+                assert!(on);
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("expected PlanModeFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_rides_on_new_chats_and_messages() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/chats"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"plan_mode": "plan"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": chat, "children": [], "files": [], "mcp_server_ids": [],
+                "inline_mcp_servers": [], "labels": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/chats/{chat}/messages")))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"plan_mode": ""}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::CreateChat {
+            org: Uuid::new_v4(),
+            text: "plan this".into(),
+            model: None,
+            workspace: None,
+            turn: TurnOptions {
+                plan_mode: Some(true),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::ChatCreated(_)));
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "now build it".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                plan_mode: Some(false),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_echoes_the_plan_mode_it_carried() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "plan it".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                plan_mode: Some(true),
+                ..Default::default()
+            },
+        });
+        match untag(next(&mut rx).await) {
+            Msg::SendFailed {
+                text, plan_mode, ..
+            } => {
+                assert_eq!(text, "plan it");
+                assert_eq!(plan_mode, Some(true));
             }
             other => panic!("expected SendFailed, got {other:?}"),
         }
@@ -532,6 +1184,7 @@ mod tests {
         let server = MockServer::start().await;
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::ShowHelp);
+        rt.run(Effect::ClearView);
         rt.run(Effect::Quit);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
@@ -545,11 +1198,12 @@ mod tests {
             tx,
             generation: generation.clone(),
             mine: 1,
+            chat: Uuid::new_v4(),
         };
         assert!(old.send(Msg::StreamEnded { error: None }));
         generation.store(2, Ordering::SeqCst);
         assert!(!old.send(Msg::StreamEnded { error: None }));
-        assert!(matches!(rx.try_recv(), Ok(Msg::StreamEnded { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Msg::ForChat { .. })));
         assert!(rx.try_recv().is_err());
     }
 
@@ -585,7 +1239,10 @@ mod tests {
 
     fn conn_of(msg: &Msg) -> Option<u64> {
         match msg {
-            Msg::Stream(ev) => ev.raw["conn"].as_u64(),
+            Msg::ForChat { msg, .. } => match msg.as_ref() {
+                Msg::Stream(ev) => ev.raw["conn"].as_u64(),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -618,6 +1275,89 @@ mod tests {
         for _ in 0..10 {
             let msg = next(&mut rx).await;
             assert_eq!(conn_of(&msg), Some(2), "{msg:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_messages_are_tagged_with_their_chat() {
+        let url = serve_tagged_streams().await;
+        let (mut rt, mut rx) = runtime(&url);
+        let chat = Uuid::new_v4();
+        rt.run(Effect::OpenStream {
+            chat,
+            after_id: None,
+        });
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(matches!(*msg, Msg::Stream(_)), "{msg:?}");
+            }
+            other => panic!("expected a tagged stream event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_the_stream_stops_it() {
+        let url = serve_tagged_streams().await;
+        let (mut rt, mut rx) = runtime(&url);
+        rt.run(Effect::OpenStream {
+            chat: Uuid::new_v4(),
+            after_id: None,
+        });
+        next(&mut rx).await;
+        rt.run(Effect::CloseStream);
+        // Whatever was queued before the close may still arrive; after that, silence. The
+        // server sends every 10 ms, so a stream that kept going would fill all 50 turns.
+        for _ in 0..50 {
+            if tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("the stream kept sending after CloseStream");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_results_are_tagged_with_their_chat() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::SetPlanMode { chat, on: true });
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(
+                    matches!(*msg, Msg::PlanModeFailed { on: true, .. }),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged plan mode result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_request_failures_are_tagged_with_their_chat() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::Interrupt(chat));
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(
+                    matches!(
+                        *msg,
+                        Msg::ApiFailed {
+                            action: "interrupt",
+                            ..
+                        }
+                    ),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged interrupt failure, got {other:?}"),
         }
     }
 }

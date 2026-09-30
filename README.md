@@ -14,3 +14,5 @@ scuttle reuses the session the `coder` CLI stored at `coder login`, so log in wi
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+scuttle depends on [unofficial-coder-sdk-rs](https://github.com/nickvigilante/unofficial-coder-sdk-rs), which is licensed under the AGPL-3.0, so a built `scuttle` binary includes AGPL-3.0 code.

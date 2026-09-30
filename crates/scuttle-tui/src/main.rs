@@ -1,11 +1,15 @@
+mod activity;
 mod app;
 mod clipboard;
 mod composer;
 mod footer;
+mod help;
 mod highlight;
+mod links;
 mod markdown;
 mod picker;
 mod runtime;
+mod selection;
 mod terminal;
 mod theme;
 mod transcript_view;
@@ -17,7 +21,7 @@ use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use futures::StreamExt;
-use scuttle_core::app::{Effect, Msg, Notice};
+use scuttle_core::app::{Effect, Msg, Notice, OrgRef};
 use scuttle_core::config;
 
 fn detect_dark() -> bool {
@@ -49,6 +53,17 @@ async fn sleep_until(deadline: Option<std::time::Instant>) {
     }
 }
 
+/// The earlier of two optional deadlines.
+fn earliest(
+    a: Option<std::time::Instant>,
+    b: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Feeds `first`, then every message already queued behind it, to the UI, so a burst of stream
 /// deltas costs one draw instead of one per delta.
 fn update_queued(
@@ -72,6 +87,34 @@ fn next_input(
         Some(Ok(event)) => ControlFlow::Continue(event),
         Some(Err(e)) => ControlFlow::Break(Some(e.to_string())),
         None => ControlFlow::Break(None),
+    }
+}
+
+/// Starts the app from the startup organization lookup, picking the organization new chats
+/// use.
+fn startup(
+    tui: &mut app::Tui,
+    organizations: Result<Vec<OrgRef>, String>,
+    saved: Option<uuid::Uuid>,
+    open_chat: Option<uuid::Uuid>,
+) -> Vec<Effect> {
+    let organizations = match organizations {
+        Ok(organizations) => organizations,
+        Err(message) => return tui.update(Msg::OrganizationsFailed { message, open_chat }),
+    };
+    match scuttle_core::app::pick_organization(saved, &organizations) {
+        Some(org) => {
+            let mut effects = tui.update(Msg::OrganizationsLoaded(organizations));
+            effects.extend(tui.update(Msg::Started {
+                org_id: org,
+                open_chat,
+            }));
+            effects
+        }
+        None => tui.update(Msg::OrganizationsFailed {
+            message: "you are not a member of any organization".into(),
+            open_chat,
+        }),
     }
 }
 
@@ -139,7 +182,9 @@ async fn main() -> ExitCode {
         );
         ExitCode::FAILURE
     };
-    match client.server_version().await {
+    // Both answers are needed before the first frame, so wait for them together.
+    let (version, organizations) = tokio::join!(client.server_version(), runtime.organizations());
+    match version {
         Ok(version) => {
             if let Some(w) = scuttle_core::skew::skew_warning(&version, coder_sdk::GENERATED_FROM) {
                 tui.core.notices.push(Notice::Info(w));
@@ -148,25 +193,12 @@ async fn main() -> ExitCode {
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(_) => {}
     }
-    let first = match runtime.organization().await {
-        Ok(Some(org)) => tui.update(Msg::Started {
-            org_id: org,
-            open_chat,
-        }),
-        Ok(None) => {
-            tui.core.notices.push(Notice::Error(
-                "Could not load your organization: you are not a member of any organization".into(),
-            ));
-            vec![]
-        }
+    let organizations = match organizations {
+        Ok(organizations) => Ok(organizations),
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
-        Err(e) => {
-            tui.core.notices.push(Notice::Error(format!(
-                "Could not load your organization: {e}"
-            )));
-            vec![]
-        }
+        Err(e) => Err(e.to_string()),
     };
+    let first = startup(&mut tui, organizations, local.organization, open_chat);
 
     let mut term = match terminal::enter(local.mouse) {
         Ok(t) => t,
@@ -195,7 +227,13 @@ async fn main() -> ExitCode {
         if term.draw(|f| tui.draw(f)).is_err() {
             break ExitCode::FAILURE;
         }
-        let deadline = tui.notice_deadline();
+        let deadline = earliest(
+            tui.notice_deadline(),
+            tui.animation_deadline(std::time::Instant::now()),
+        );
+        // Each iteration handles at most one terminal event before the next draw: the composer
+        // learns its wrap width only when it renders, so a second key must not arrive before
+        // that. Channel messages may be drained in a batch, and a timer wakeup handles no input.
         tokio::select! {
             item = events.next() => match next_input(item) {
                 ControlFlow::Continue(ev) => pending = tui.handle(ev),
@@ -206,7 +244,7 @@ async fn main() -> ExitCode {
                 }
             },
             Some(msg) = rx.recv() => pending = update_queued(&mut tui, msg, &mut rx),
-            () = sleep_until(deadline) => {}
+            () = sleep_until(deadline) => tui.tick(),
             else => break ExitCode::SUCCESS,
         }
     };
@@ -281,5 +319,73 @@ mod tests {
         update_queued(&mut t, first, &mut rx);
         assert_eq!(t.core.notices.len(), 3);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn earliest_picks_the_sooner_deadline() {
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
+        assert_eq!(earliest(Some(later), Some(now)), Some(now));
+        assert_eq!(earliest(None, Some(later)), Some(later));
+        assert_eq!(earliest(Some(now), None), Some(now));
+        assert_eq!(earliest(None, None), None);
+    }
+
+    fn org(name: &str) -> OrgRef {
+        OrgRef {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            display_name: String::new(),
+            is_default: true,
+            can_create_chats: true,
+        }
+    }
+
+    #[test]
+    fn a_failed_organization_load_with_a_chat_id_still_loads_the_chat() {
+        let mut t = tui();
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Err("HTTP 500".into()), None, Some(id));
+        assert!(effects.contains(&Effect::LoadChat(id)), "{effects:?}");
+        assert_eq!(
+            t.core.notices.last(),
+            Some(&Notice::Error(
+                "Could not load your organization: HTTP 500".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn no_organization_with_a_chat_id_still_loads_the_chat() {
+        let mut t = tui();
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Ok(vec![]), None, Some(id));
+        assert!(effects.contains(&Effect::LoadChat(id)), "{effects:?}");
+        assert!(
+            matches!(t.core.notices.last(), Some(Notice::Error(m)) if m.contains("not a member of any organization"))
+        );
+    }
+
+    #[test]
+    fn a_failed_organization_load_on_a_blank_chat_only_explains() {
+        let mut t = tui();
+        assert!(startup(&mut t, Err("HTTP 500".into()), None, None).is_empty());
+        assert!(
+            matches!(t.core.notices.last(), Some(Notice::Error(m)) if m.starts_with("Could not load your organization"))
+        );
+    }
+
+    #[test]
+    fn a_loaded_organization_starts_the_app_in_it() {
+        let mut t = tui();
+        let coder = org("coder");
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Ok(vec![coder.clone()]), None, Some(id));
+        assert!(
+            effects.contains(&Effect::FetchModels(coder.id)),
+            "{effects:?}"
+        );
+        assert!(effects.contains(&Effect::LoadChat(id)));
+        assert_eq!(t.core.org_id, Some(coder.id));
     }
 }
