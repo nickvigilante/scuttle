@@ -114,6 +114,8 @@ pub struct Tui {
     reuse_view: bool,
     /// The transcript width `view` was built for.
     view_width: u16,
+    /// The transcript's `history_resets` count when `view` was built.
+    view_resets: u64,
     /// How many times `draw_at` rebuilt the transcript lines; tests check timer frames reuse them.
     view_builds: usize,
     /// The highlighted text, kept after release until the next press or key.
@@ -156,6 +158,7 @@ impl Tui {
             epoch: Instant::now(),
             reuse_view: false,
             view_width: 0,
+            view_resets: 0,
             view_builds: 0,
             selection: None,
             drag: None,
@@ -727,7 +730,11 @@ impl Tui {
         ])
         .areas(outer);
         self.area = transcript;
-        let reuse = std::mem::take(&mut self.reuse_view) && self.view_width == transcript.width;
+        // Lines drawn at another width or before a history reset may now hold other text, so
+        // a selection or held drag over them no longer means what it did.
+        let resets = self.core.transcript.history_resets();
+        let stale = self.view_width != transcript.width || self.view_resets != resets;
+        let reuse = std::mem::take(&mut self.reuse_view) && !stale;
         if !reuse {
             self.view = transcript_view::build(
                 &self.core,
@@ -738,7 +745,12 @@ impl Tui {
                 transcript.width,
             );
             self.view_width = transcript.width;
+            self.view_resets = resets;
             self.view_builds += 1;
+        }
+        if stale {
+            self.selection = None;
+            self.end_drag();
         }
         self.scroll_from_bottom = self.scroll_from_bottom.min(self.max_scroll());
         let top = self.top_line();
@@ -2061,5 +2073,47 @@ mod tests {
         assert_eq!(t.scroll_from_bottom, 0);
         let shown = screen(&mut t, 40, 24);
         assert!(!shown.contains("row 26"), "{shown}");
+    }
+
+    #[test]
+    fn a_resize_drops_the_selection_and_ends_a_held_drag() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        screen(&mut t, 40, 24);
+        assert!(t.selection.is_some(), "a redraw at the same width keeps it");
+        assert!(t.drag.is_some());
+        screen(&mut t, 50, 24);
+        assert!(t.selection.is_none());
+        assert!(t.drag.is_none());
+    }
+
+    #[test]
+    fn a_history_reset_drops_the_selection_and_ends_a_held_drag() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        t.update(stream(json!({"type": "history_reset"})));
+        t.update(stream(
+            json!({"type": "message", "message": {"id": 1, "role": "assistant", "content": [{"type": "text", "text": "replaced"}]}}),
+        ));
+        screen(&mut t, 40, 24);
+        assert!(
+            t.selection.is_some(),
+            "the replacement is buffered, so nothing changed yet"
+        );
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "waiting"}}),
+        ));
+        let shown = screen(&mut t, 40, 24);
+        assert!(shown.contains("replaced"), "{shown}");
+        assert!(t.selection.is_none());
+        assert!(t.drag.is_none());
     }
 }

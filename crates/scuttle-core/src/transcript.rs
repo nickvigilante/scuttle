@@ -26,11 +26,19 @@ pub struct Transcript {
     pub queued: Vec<types::CodersdkChatQueuedMessage>,
     pub action_required: Vec<String>,
     pending_history: Option<Vec<types::CodersdkChatMessage>>,
+    /// How many times a `history_reset` replaced the messages.
+    resets: u64,
 }
 
 impl Transcript {
     pub fn messages(&self) -> impl DoubleEndedIterator<Item = &types::CodersdkChatMessage> {
         self.messages.values()
+    }
+
+    /// Counts the times a `history_reset` replaced the messages, so a view can tell that
+    /// lines it drew earlier may now hold different text.
+    pub fn history_resets(&self) -> u64 {
+        self.resets
     }
 
     pub fn last_message_id(&self) -> Option<i64> {
@@ -54,6 +62,7 @@ impl Transcript {
             return;
         };
         self.messages.clear();
+        self.resets += 1;
         for m in buffer {
             self.upsert(m);
         }
@@ -252,10 +261,12 @@ mod tests {
             vec![1, 2, 3, 4],
             "buffered until the next non-message event"
         );
+        assert_eq!(t.history_resets(), 0);
         t.apply(&ev(
             json!({"type": "status", "status": {"status": "running"}}),
         ));
         assert_eq!(ids(&t), vec![3]);
+        assert_eq!(t.history_resets(), 1);
         let edited = t.messages().last().unwrap();
         assert_eq!(edited.content[0].text.as_deref(), Some("edited"));
     }
