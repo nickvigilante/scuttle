@@ -5,6 +5,8 @@ pub enum Command {
     Model(Option<String>),
     Effort(Option<String>),
     Workspace(Option<String>),
+    /// `None` toggles; `Some` turns plan mode on or off.
+    PlanMode(Option<bool>),
     Compact,
     Clear,
     Copy(Option<usize>),
@@ -35,6 +37,11 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "/workspace",
         usage: "/workspace [name|none]",
         description: "Attach or detach a workspace",
+    },
+    CommandInfo {
+        name: "/plan-mode",
+        usage: "/plan-mode [on|off]",
+        description: "Toggle plan mode, or turn it on or off",
     },
     CommandInfo {
         name: "/compact",
@@ -81,6 +88,12 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "model" => Ok(Command::Model(arg.map(str::to_owned))),
         "effort" => Ok(Command::Effort(arg.map(str::to_owned))),
         "workspace" => Ok(Command::Workspace(arg.map(str::to_owned))),
+        "plan-mode" => match arg {
+            None => Ok(Command::PlanMode(None)),
+            Some(a) if a.eq_ignore_ascii_case("on") => Ok(Command::PlanMode(Some(true))),
+            Some(a) if a.eq_ignore_ascii_case("off") => Ok(Command::PlanMode(Some(false))),
+            Some(other) => Err(format!("/plan-mode takes on or off, got {other:?}")),
+        },
         "compact" => Ok(Command::Compact),
         "clear" => Ok(Command::Clear),
         "copy" => match arg {
@@ -116,6 +129,14 @@ mod tests {
         );
         assert_eq!(parse("/effort"), Ok(Command::Effort(None)));
         assert!(completions("/e").iter().any(|c| c.name == "/effort"));
+    }
+
+    #[test]
+    fn parses_plan_mode() {
+        assert_eq!(parse("/plan-mode"), Ok(Command::PlanMode(None)));
+        assert_eq!(parse("/plan-mode on"), Ok(Command::PlanMode(Some(true))));
+        assert_eq!(parse("/plan-mode OFF"), Ok(Command::PlanMode(Some(false))));
+        assert!(parse("/plan-mode maybe").unwrap_err().contains("on or off"));
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
             _ => parts.push(format_tokens(u.used)),
         }
     }
+    if app.plan_mode {
+        parts.push("plan mode".into());
+    }
     let status = match app.connection {
         Connection::Reconnecting { attempt } => match app.last_stream_error.as_deref() {
             Some(error) => format!("reconnecting (attempt {attempt}): {error}"),
@@ -262,5 +265,16 @@ mod tests {
         ));
         assert!(t.contains("12.0k"), "{t}");
         assert!(!t.contains("12.0k/"), "{t}");
+    }
+
+    #[test]
+    fn plan_mode_shows_in_the_footer() {
+        let mut app = live_app("waiting");
+        assert!(!status_text(&app).contains("plan mode"));
+        app.update(Msg::Command(scuttle_core::commands::Command::PlanMode(
+            Some(true),
+        )));
+        let t = status_text(&app);
+        assert!(t.contains("plan mode · waiting"), "{t}");
     }
 }

@@ -48,6 +48,11 @@ fn text_part(text: &str) -> types::CodersdkChatInputPart {
     }
 }
 
+/// The wire value of a plan mode switch: `"plan"` turns it on and `""` clears it.
+fn plan_mode_value(on: bool) -> types::CodersdkChatPlanMode {
+    types::CodersdkChatPlanMode(if on { "plan" } else { "" }.into())
+}
+
 /// The user-facing text of a generated-client error. Never includes the session token,
 /// which only travels in a request header.
 async fn err<E: serde::Serialize + std::fmt::Debug>(e: progenitor_client::Error<E>) -> String {
@@ -187,6 +192,7 @@ impl Runtime {
                     model_config_id: model,
                     workspace_id: workspace,
                     reasoning_effort: turn.effort,
+                    plan_mode: turn.plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
                 match client.api().create_chat(&body).await {
@@ -208,6 +214,7 @@ impl Runtime {
                     model_config_id: model,
                     busy_behavior: Some(types::CodersdkChatBusyBehavior(busy.as_str().into())),
                     reasoning_effort: turn.effort,
+                    plan_mode: turn.plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
                 match client.api().send_chat_message(&chat, &body).await {
@@ -255,6 +262,19 @@ impl Runtime {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::ApiFailed {
                         action: "change the workspace",
+                        message: err(e).await,
+                    },
+                }
+            })),
+            Effect::SetPlanMode { chat, on } => self.spawn(Box::pin(async move {
+                let body = types::CodersdkUpdateChatRequest {
+                    plan_mode: Some(plan_mode_value(on)),
+                    ..Default::default()
+                };
+                match client.api().update_chat(&chat, &body).await {
+                    Ok(_) => Msg::Refresh,
+                    Err(e) => Msg::PlanModeFailed {
+                        on,
                         message: err(e).await,
                     },
                 }
@@ -650,6 +670,7 @@ mod tests {
             busy: scuttle_core::config::BusyBehavior::Queue,
             turn: TurnOptions {
                 effort: Some("high".into()),
+                ..Default::default()
             },
         });
         assert!(matches!(next(&mut rx).await, Msg::Refresh));
@@ -660,9 +681,96 @@ mod tests {
             workspace: None,
             turn: TurnOptions {
                 effort: Some("low".into()),
+                ..Default::default()
             },
         });
         assert!(matches!(next(&mut rx).await, Msg::ChatCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn set_plan_mode_patches_the_chat() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        for value in ["plan", ""] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v2/chats/{chat}")))
+                .and(wiremock::matchers::body_partial_json(
+                    serde_json::json!({"plan_mode": value}),
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+        }
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SetPlanMode { chat, on: true });
+        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        rt.run(Effect::SetPlanMode { chat, on: false });
+        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+    }
+
+    #[tokio::test]
+    async fn a_failed_plan_mode_update_says_which_way() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SetPlanMode {
+            chat: Uuid::new_v4(),
+            on: true,
+        });
+        match next(&mut rx).await {
+            Msg::PlanModeFailed { on, message } => {
+                assert!(on);
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("expected PlanModeFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_rides_on_new_chats_and_messages() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/chats"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"plan_mode": "plan"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": chat, "children": [], "files": [], "mcp_server_ids": [],
+                "inline_mcp_servers": [], "labels": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/chats/{chat}/messages")))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"plan_mode": ""}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::CreateChat {
+            org: Uuid::new_v4(),
+            text: "plan this".into(),
+            model: None,
+            workspace: None,
+            turn: TurnOptions {
+                plan_mode: Some(true),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::ChatCreated(_)));
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "now build it".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                plan_mode: Some(false),
+                ..Default::default()
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::Refresh));
     }
 
     #[tokio::test]

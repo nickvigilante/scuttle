@@ -90,6 +90,9 @@ pub enum CopyTarget {
 pub struct TurnOptions {
     /// The reasoning effort chosen with `/effort`; `None` leaves the server's default.
     pub effort: Option<String>,
+    /// Switches the chat's plan mode with this request: `Some(true)` on, `Some(false)` off,
+    /// `None` no change.
+    pub plan_mode: Option<bool>,
 }
 
 /// What the agent is doing, for the animated activity line.
@@ -159,6 +162,11 @@ pub enum Msg {
         action: &'static str,
         message: String,
     },
+    /// The runtime sends this when `Effect::SetPlanMode` fails, with the state it asked for.
+    PlanModeFailed {
+        on: bool,
+        message: String,
+    },
     Submit(String),
     Command(Command),
     Interrupt,
@@ -199,6 +207,10 @@ pub enum Effect {
         chat: Uuid,
         workspace: Option<Uuid>,
     },
+    SetPlanMode {
+        chat: Uuid,
+        on: bool,
+    },
     FetchPrefs,
     FetchModels(Uuid),
     FetchWorkspaces(Uuid),
@@ -217,6 +229,11 @@ pub fn backoff(attempt: u32) -> Duration {
     Duration::from_millis((500u64 << exp).min(10_000))
 }
 
+/// Whether the server reports plan mode on for `chat`.
+fn is_plan(chat: &types::CodersdkChat) -> bool {
+    chat.plan_mode.as_ref().is_some_and(|p| p.0 == "plan")
+}
+
 #[derive(Debug, Default)]
 pub struct App {
     pub org_id: Option<Uuid>,
@@ -233,6 +250,8 @@ pub struct App {
     pub selected_workspace: Option<Uuid>,
     /// The reasoning effort chosen with `/effort`, sent only while the current model offers it.
     pub selected_effort: Option<String>,
+    /// Whether plan mode is on for the chat, or for the chat the next message creates.
+    pub plan_mode: bool,
     pub notices: Vec<Notice>,
     pub connection: Connection,
     pub busy: BusyBehavior,
@@ -249,6 +268,9 @@ pub struct App {
     failed_load: Option<Uuid>,
     /// Text submitted while a chat is being created or loaded, sent once it exists.
     pending_text: Option<String>,
+    /// The queued message that carries a plan mode change to a new chat, with the state it
+    /// asks for, so a failed send can take the change back.
+    plan_carrier: Option<(String, bool)>,
     /// Set by a submit that sends or queues a message, and cleared once the chat reports a
     /// status other than `waiting`, an error, or a failed send.
     awaiting_reply: bool,
@@ -338,6 +360,7 @@ impl App {
     fn turn(&self) -> TurnOptions {
         TurnOptions {
             effort: self.effort(),
+            plan_mode: None,
         }
     }
 
@@ -491,6 +514,7 @@ impl App {
                     .unwrap_or_default();
                 self.selected_model = self.selected_model.or(chat.last_model_config_id);
                 self.selected_workspace = chat.workspace_id;
+                self.plan_mode = is_plan(&chat);
                 self.chat_id = Some(id);
                 self.chat = Some(chat);
                 self.transcript.load(messages);
@@ -523,6 +547,7 @@ impl App {
                     return self.fail_create("the server returned a chat without an id".into());
                 };
                 let workspace_mismatch = self.selected_workspace != chat.workspace_id;
+                let plan_mismatch = is_plan(&chat) != self.plan_mode;
                 self.creating = None;
                 self.chat_id = Some(id);
                 self.chat = Some(chat);
@@ -537,21 +562,41 @@ impl App {
                         workspace: self.selected_workspace,
                     });
                 }
-                if let Some(text) = self.pending_text.take() {
-                    effects.push(Effect::SendMessage {
+                match self.pending_text.take() {
+                    // The queued message carries the plan mode change, so the two cannot race.
+                    Some(text) => {
+                        if plan_mismatch {
+                            self.plan_carrier = Some((text.clone(), self.plan_mode));
+                        }
+                        effects.push(Effect::SendMessage {
+                            chat: id,
+                            text,
+                            model: self.selected_model,
+                            busy: self.busy,
+                            turn: TurnOptions {
+                                plan_mode: plan_mismatch.then_some(self.plan_mode),
+                                ..self.turn()
+                            },
+                        });
+                    }
+                    None if plan_mismatch => effects.push(Effect::SetPlanMode {
                         chat: id,
-                        text,
-                        model: self.selected_model,
-                        busy: self.busy,
-                        turn: self.turn(),
-                    });
+                        on: self.plan_mode,
+                    }),
+                    None => {}
                 }
                 effects
             }
             Msg::CreateFailed { message } => self.fail_create(message),
             Msg::SendFailed { text, message } => {
                 self.awaiting_reply = false;
-                self.error(format!("Could not send the message: {message}"));
+                let mut error = format!("Could not send the message: {message}");
+                if let Some((_, on)) = self.plan_carrier.take_if(|(carried, _)| *carried == text) {
+                    self.revert_plan_mode(on);
+                    let state = if self.plan_mode { "on" } else { "off" };
+                    error.push_str(&format!(" Plan mode is still {state}."));
+                }
+                self.error(error);
                 vec![Effect::RestoreComposer(text)]
             }
             Msg::Stream(ev) => match self.transcript.apply(&ev) {
@@ -665,6 +710,12 @@ impl App {
                 self.error(format!("Could not {action}: {message}"));
                 vec![]
             }
+            Msg::PlanModeFailed { on, message } => {
+                self.revert_plan_mode(on);
+                let word = if on { "on" } else { "off" };
+                self.error(format!("Could not turn plan mode {word}: {message}"));
+                vec![]
+            }
             Msg::Submit(text) => self.submit(text),
             Msg::Command(cmd) => self.command(cmd),
             Msg::Interrupt => match self.chat_id {
@@ -770,7 +821,10 @@ impl App {
             text,
             model: self.selected_model,
             workspace: self.selected_workspace,
-            turn: self.turn(),
+            turn: TurnOptions {
+                plan_mode: self.plan_mode.then_some(true),
+                ..self.turn()
+            },
         }]
     }
 
@@ -796,6 +850,47 @@ impl App {
         match level {
             None => vec![Effect::ShowPicker(Picker::Effort)],
             Some(level) => self.update(Msg::EffortChosen(level)),
+        }
+    }
+
+    /// Takes back a plan mode change to `on` that did not reach the server, unless a later
+    /// change already replaced it.
+    fn revert_plan_mode(&mut self, on: bool) {
+        if self.plan_mode == on {
+            self.plan_mode = !on;
+        }
+    }
+
+    fn plan_mode_command(&mut self, wanted: Option<bool>) -> Vec<Effect> {
+        // Loading replaces `plan_mode` with the chat's own, which would drop this change.
+        if self.loading.is_some() || (self.chat_id.is_none() && self.failed_load.is_some()) {
+            self.info("Wait for the chat to load, then set plan mode.");
+            return vec![];
+        }
+        let on = wanted.unwrap_or(!self.plan_mode);
+        let word = if on { "on" } else { "off" };
+        if on == self.plan_mode {
+            self.info(format!("Plan mode is already {word}."));
+            return vec![];
+        }
+        self.plan_mode = on;
+        // This change supersedes whatever an earlier queued message carried.
+        self.plan_carrier = None;
+        match self.chat_id {
+            Some(chat) => {
+                self.info(format!("Plan mode {word}."));
+                vec![Effect::SetPlanMode { chat, on }]
+            }
+            None if self.creating.is_some() => {
+                self.info(format!(
+                    "Plan mode {word}; it applies once the chat is created."
+                ));
+                vec![]
+            }
+            None => {
+                self.info(format!("Plan mode {word} for the new chat."));
+                vec![]
+            }
         }
     }
 
@@ -836,6 +931,7 @@ impl App {
                 }
             }
             Command::Effort(level) => self.effort_command(level),
+            Command::PlanMode(wanted) => self.plan_mode_command(wanted),
             Command::Workspace(None) => vec![Effect::ShowPicker(Picker::Workspace)],
             Command::Workspace(Some(name)) if name == "none" => self.set_workspace(None),
             Command::Workspace(Some(name)) => match self
@@ -928,7 +1024,8 @@ mod tests {
                 model: None,
                 workspace: None,
                 turn: TurnOptions {
-                    effort: Some("high".into())
+                    effort: Some("high".into()),
+                    ..Default::default()
                 }
             }]
         );
@@ -2017,5 +2114,205 @@ mod tests {
             message: "HTTP 404".into(),
         });
         assert_eq!(app.activity(), None);
+    }
+
+    fn chat_with_plan(id: Uuid, plan: &str) -> Box<types::CodersdkChat> {
+        Box::new(serde_json::from_value(json!({"id": id, "title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}, "plan_mode": plan})).unwrap())
+    }
+
+    #[test]
+    fn plan_mode_toggles_and_sets_on_an_existing_chat() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        assert!(!app.plan_mode);
+        assert_eq!(
+            app.update(Msg::Command(Command::PlanMode(None))),
+            vec![Effect::SetPlanMode { chat: id, on: true }]
+        );
+        assert!(app.plan_mode);
+        assert!(
+            app.update(Msg::Command(Command::PlanMode(Some(true))))
+                .is_empty()
+        );
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("already on")));
+        assert_eq!(
+            app.update(Msg::Command(Command::PlanMode(Some(false)))),
+            vec![Effect::SetPlanMode {
+                chat: id,
+                on: false
+            }]
+        );
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn a_chat_loaded_in_plan_mode_shows_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_plan(Uuid::new_v4(), "plan"),
+            messages: vec![],
+        });
+        assert!(app.plan_mode);
+    }
+
+    #[test]
+    fn plan_mode_on_a_blank_chat_rides_on_the_create() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        assert!(
+            app.update(Msg::Command(Command::PlanMode(Some(true))))
+                .is_empty()
+        );
+        assert_eq!(
+            app.update(Msg::Submit("hi".into())),
+            vec![Effect::CreateChat {
+                org,
+                text: "hi".into(),
+                model: None,
+                workspace: None,
+                turn: TurnOptions {
+                    plan_mode: Some(true),
+                    ..Default::default()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_mode_set_while_the_chat_is_being_created_applies_after_creation() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("hi".into()));
+        assert!(
+            app.update(Msg::Command(Command::PlanMode(Some(true))))
+                .is_empty()
+        );
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("once the chat is created"))
+        );
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::ChatCreated(chat_with_plan(id, "")));
+        assert!(
+            effects.contains(&Effect::SetPlanMode { chat: id, on: true }),
+            "{effects:?}"
+        );
+        assert!(app.plan_mode);
+    }
+
+    #[test]
+    fn plan_mode_set_while_creating_rides_on_the_queued_message() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("two".into()));
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::ChatCreated(chat(id)));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetPlanMode { .. })),
+            "a separate update could race the message: {effects:?}"
+        );
+        assert!(effects.contains(&Effect::SendMessage {
+            chat: id,
+            text: "two".into(),
+            model: None,
+            busy: BusyBehavior::Queue,
+            turn: TurnOptions {
+                plan_mode: Some(true),
+                ..Default::default()
+            }
+        }));
+    }
+
+    #[test]
+    fn a_failed_send_that_carried_plan_mode_reverts_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("two".into()));
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::ChatCreated(chat(Uuid::new_v4())));
+        assert!(app.plan_mode);
+        let effects = app.update(Msg::SendFailed {
+            text: "two".into(),
+            message: "HTTP 500".into(),
+        });
+        assert_eq!(effects, vec![Effect::RestoreComposer("two".into())]);
+        assert!(!app.plan_mode);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("Could not send the message") && m.contains("Plan mode is still off")),
+            "{:?}",
+            app.notices.last()
+        );
+    }
+
+    #[test]
+    fn a_failed_send_without_plan_mode_leaves_it_alone() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_plan(id, "plan"),
+            messages: vec![],
+        });
+        app.update(Msg::Submit("two".into()));
+        app.update(Msg::SendFailed {
+            text: "two".into(),
+            message: "HTTP 500".into(),
+        });
+        assert!(app.plan_mode);
+    }
+
+    #[test]
+    fn a_created_chat_that_already_matches_needs_no_update() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::Submit("hi".into()));
+        let effects = app.update(Msg::ChatCreated(chat_with_plan(Uuid::new_v4(), "plan")));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetPlanMode { .. }))
+        );
+    }
+
+    #[test]
+    fn plan_mode_waits_while_the_chat_loads() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::Started {
+            org_id: Uuid::new_v4(),
+            open_chat: Some(Uuid::new_v4()),
+        });
+        assert!(app.update(Msg::Command(Command::PlanMode(None))).is_empty());
+        assert!(!app.plan_mode);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("Wait for the chat to load"))
+        );
+    }
+
+    #[test]
+    fn a_failed_plan_mode_update_reverts() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::PlanModeFailed {
+            on: true,
+            message: "HTTP 500".into(),
+        });
+        assert!(!app.plan_mode);
+        assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("plan mode on")));
     }
 }
