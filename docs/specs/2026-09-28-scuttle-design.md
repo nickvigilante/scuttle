@@ -5,7 +5,7 @@ Section 1 was approved live in the brainstorming session on 2026-09-28.
 Sections 2 through 10 were drafted autonomously overnight from the decisions recorded below and from read-only research against coder/coder `main` at `d1597a583b`.
 Every drafted section needs review before an implementation plan is written.
 
-**Related:** an internal ticket (revisit an interactive TUI for Coder Agents), a scriptable CLI (out of scope here), the upstream Swagger annotation fixes (Swagger annotation bugs found while generating the SDK).
+**Related:** revisiting an interactive TUI for Coder Agents, the non-interactive scriptable CLI (out of scope here), and Swagger annotation bugs found while generating the SDK.
 
 ## Intent
 
@@ -29,7 +29,7 @@ Daily use by its author is also the maintenance strategy: the previous Go TUI (`
 ### Assumptions made while drafting
 
 - macOS and Linux are the supported platforms for v1; Windows may work but is untested.
-- The target deployment is a Coder deployment that tracks main, which runs close to `main`.
+- The target deployment is a Coder deployment that tracks `main`.
 - Enterprise-only features (AI spend, workspace quota) are available on the author's deployment and must degrade gracefully elsewhere.
 
 ## Non-goals
@@ -38,7 +38,7 @@ Daily use by its author is also the maintenance strategy: the previous Go TUI (`
 - Admin settings (deployment prompts, providers, budgets, retention). The web UI owns those.
 - Client-executed dynamic tools (`unsafe_dynamic_tools`). scuttle never declares them.
 - Publishing either repo's crates to crates.io. Both repos stay on the author's personal GitHub account until Coder has weighed in.
-- The non-interactive scriptable CLI tracked separately, although `scuttle-core` should not prevent it.
+- The non-interactive scriptable CLI, although `scuttle-core` should not prevent it.
 - The live git diff drawer from the old TUI. It is a candidate for after v1.
 
 ## Decision log
@@ -425,20 +425,20 @@ The pipeline is a GitHub Actions workflow in `unofficial-coder-sdk-rs`, with top
 1. **Publish:** open a pull request containing the regenerated crate, the patch log, and the coder/coder SHA recorded in crate metadata.
 
 A change in which patch rules fire, or a large change in their counts, is flagged in the pull request description, because it means the spec changed shape.
-Patch rules are deleted as the corresponding the upstream Swagger annotation fixes fixes land upstream.
+Patch rules are deleted as the corresponding upstream Swagger annotation fixes land.
 
 ### Patch rules found by the spike
 
-| Rule                                                             | Count | Upstream fix     |
-|------------------------------------------------------------------|-------|------------------|
-| Drop enums that narrow a referenced enum type                    | 54    | upstream Swagger fix 1 |
-| Treat `json.RawMessage` and `[]byte` as free-form or base64       | 10    | upstream Swagger fix 2 |
-| Collapse multi-media request bodies and map odd media types       | 8     | None needed      |
-| Merge or pick among multiple success responses                   | 2     | None needed      |
-| Move `format` from arrays to their items                         | 2     | upstream Swagger fix 6 |
-| Deduplicate enum values                                          | 2     | upstream Swagger fix 5 |
+| Rule                                                             | Count | Upstream fix                    |
+|------------------------------------------------------------------|-------|----------------------------------|
+| Drop enums that narrow a referenced enum type                    | 54    | Upstream Swagger annotation fix |
+| Treat `json.RawMessage` and `[]byte` as free-form or base64       | 10    | Upstream Swagger annotation fix |
+| Collapse multi-media request bodies and map odd media types       | 8     | None needed                      |
+| Merge or pick among multiple success responses                   | 2     | None needed                      |
+| Move `format` from arrays to their items                         | 2     | Upstream Swagger annotation fix |
+| Deduplicate enum values                                          | 2     | Upstream Swagger annotation fix |
 
-The openapi-generator-only rules (header `example`, undeclared path parameters, the `_` enum variant) are not needed for progenitor but are also tracked in the upstream Swagger annotation fixes.
+The openapi-generator-only rules (header `example`, undeclared path parameters, the `_` enum variant) are not needed for progenitor but are also covered by the same upstream Swagger annotation fixes.
 
 ### The hand-written layer
 
@@ -481,7 +481,7 @@ The openapi-generator-only rules (header `example`, undeclared path parameters, 
 
 ## 9. Testing
 
-- **Reducer tests in `scuttle-core`:** recorded stream fixtures (JSON arrays of real frames captured from the Coder deployment) drive the reducer, and tests assert on resulting state. Required cases include `seq` gaps, stale generation attempts, `preview_reset` mid-turn, `history_reset` after an edit, reconnect with `after_id`, queue updates, retry, interrupt, and tool calls whose arguments stream as partial JSON.
+- **Reducer tests in `scuttle-core`:** recorded stream fixtures (JSON arrays of real frames captured from a Coder deployment that tracks main) drive the reducer, and tests assert on resulting state. Required cases include `seq` gaps, stale generation attempts, `preview_reset` mid-turn, `history_reset` after an edit, reconnect with `after_id`, queue updates, retry, interrupt, and tool calls whose arguments stream as partial JSON.
 - **Property tests:** reordering or duplicating `message` events never changes the final durable transcript.
 - **Rendering snapshots in `scuttle-tui`:** `ratatui`'s `TestBackend` with `insta` for layouts, density modes, themes, and narrow widths, plus a `vt100`-backed harness for escape-sequence behavior.
 - **SDK smoke tests:** a `coderd` container from the matching coder/coder image exercises the REST endpoints scuttle uses, with the stream and watch sockets tested against a local WebSocket server replaying fixtures.
@@ -508,7 +508,7 @@ Each milestone ends with the author using the result daily before starting the n
 1. **Ctrl+R for `/chats`:** it matches shell history search, but Claude Code uses a different binding. Confirm the default.
 1. **Local mock provider for end-to-end tests:** choose between a small custom OpenAI-compatible server and an existing mock, and confirm a Docker `coderd` can be configured to use it.
 1. **Diff viewing:** the old TUI had a diff drawer. Decide after M2 whether a `/diff` view is wanted.
-1. **Codernaut artwork:** the mascot is Coder brand material. Where to get the source artwork, and whether an unofficial tool may use it at all, are questions for Coder alongside the repo naming question.
+1. **Codernaut artwork:** the mascot is Coder brand material. Where to get the source artwork, and whether an unofficial tool may use it at all, are questions for a Coder maintainer alongside the repo naming question.
 
 ## References
 

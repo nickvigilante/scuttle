@@ -27,7 +27,7 @@
 
 Spec section 7 did not decide how to handle enums.
 The SDK spike showed progenitor generates closed Rust enums, which fail to deserialize a whole response when the server sends a value the SDK has never seen.
-The author's Coder deployment runs ahead of any tagged release, so that would happen routinely.
+The author's deployment, which tracks main, runs ahead of any tagged release, so that would happen routinely.
 This plan therefore adds an `open-enums` patch rule (Task 3) that turns every enum in the spec into its base type with the allowed values listed in the description, and adds hand-written open enums with an `Unknown` variant in `coder-sdk` for the three types scuttle matches on (Task 8).
 This rule also makes the spike's "drop narrowing enums" and "dedupe enum values" rules unnecessary, so they are omitted.
 
@@ -972,7 +972,7 @@ Run: `chmod +x scripts/regenerate.sh`
 Run: `scripts/regenerate.sh <coder checkout>`
 Expected: the last line reads `generated from coder/coder local (d1597a583b)` and `cargo build -p coder-api-gen` succeeds.
 
-If progenitor panics or the build fails, the spec has a construct the rules do not cover yet. Read the panic message, add a rule and a test for it to Task 3's files following the existing pattern, and rerun. The spike's notes in `~/git/nickvigilante/scuttle/docs/research/sdk-spike/` list every construct found so far.
+If progenitor panics or the build fails, the spec has a construct the rules do not cover yet. Read the panic message, add a rule and a test for it to Task 3's files following the existing pattern, and rerun. The spike's notes in `docs/research/sdk-spike/` list every construct found so far.
 
 - [ ] **Step 3: Check the raw-field fix reached the generated code**
 
