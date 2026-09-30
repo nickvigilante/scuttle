@@ -795,7 +795,7 @@ impl Tui {
                 .iter()
                 .map(|c| {
                     Line::from(vec![
-                        Span::styled(c.usage, self.theme.accent),
+                        Span::styled(c.display_usage(), self.theme.accent),
                         Span::raw("  "),
                         Span::styled(c.description, self.theme.dim),
                     ])
@@ -952,6 +952,14 @@ mod tests {
         // The code block's actual screen row, shifted down by the margin, still resolves.
         click(&mut t, code_row);
         assert_eq!(t.last_copied.as_deref(), Some("echo hi\n"));
+    }
+
+    #[test]
+    fn the_slash_menu_shows_aliases() {
+        let mut t = tui();
+        t.composer.set_text("/q");
+        let shown = screen(&mut t, 60, 16);
+        assert!(shown.contains("/quit (/exit)"), "{shown}");
     }
 
     #[test]

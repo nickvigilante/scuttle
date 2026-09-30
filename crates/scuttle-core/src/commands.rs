@@ -18,62 +18,94 @@ pub enum Command {
 #[derive(Debug)]
 pub struct CommandInfo {
     pub name: &'static str,
+    /// Other names that run the same command, each with its slash.
+    pub aliases: &'static [&'static str],
     pub usage: &'static str,
     pub description: &'static str,
+}
+
+impl CommandInfo {
+    /// The usage with any aliases after it, as the slash menu and `/help` show it.
+    pub fn display_usage(&self) -> String {
+        if self.aliases.is_empty() {
+            self.usage.to_owned()
+        } else {
+            format!("{} ({})", self.usage, self.aliases.join(", "))
+        }
+    }
 }
 
 pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/model",
+        aliases: &[],
         usage: "/model [name]",
         description: "Pick the model for the next message",
     },
     CommandInfo {
         name: "/effort",
+        aliases: &[],
         usage: "/effort [level]",
         description: "Pick the reasoning effort for the next message",
     },
     CommandInfo {
         name: "/workspace",
+        aliases: &[],
         usage: "/workspace [name|none]",
         description: "Attach or detach a workspace",
     },
     CommandInfo {
         name: "/plan-mode",
+        aliases: &[],
         usage: "/plan-mode [on|off]",
         description: "Toggle plan mode, or turn it on or off",
     },
     CommandInfo {
         name: "/compact",
+        aliases: &[],
         usage: "/compact",
         description: "Summarize the conversation to free context",
     },
     CommandInfo {
         name: "/clear",
+        aliases: &[],
         usage: "/clear",
         description: "Reset the model context and keep the transcript",
     },
     CommandInfo {
         name: "/copy",
+        aliases: &[],
         usage: "/copy [n]",
         description: "Copy the last message, or its nth code block",
     },
     CommandInfo {
         name: "/mouse",
+        aliases: &[],
         usage: "/mouse",
         description: "Toggle mouse capture",
     },
     CommandInfo {
         name: "/help",
+        aliases: &[],
         usage: "/help",
         description: "Show commands and keys",
     },
     CommandInfo {
         name: "/quit",
+        aliases: &["/exit"],
         usage: "/quit",
         description: "Exit scuttle",
     },
 ];
+
+/// The command `name` (without its slash) stands for, following aliases.
+fn canonical(name: &str) -> &str {
+    COMMANDS
+        .iter()
+        .find(|c| c.aliases.iter().any(|a| a.strip_prefix('/') == Some(name)))
+        .and_then(|c| c.name.strip_prefix('/'))
+        .unwrap_or(name)
+}
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -84,7 +116,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         Some((name, arg)) => (name, Some(arg.trim()).filter(|a| !a.is_empty())),
         None => (rest, None),
     };
-    match name {
+    match canonical(name) {
         "model" => Ok(Command::Model(arg.map(str::to_owned))),
         "effort" => Ok(Command::Effort(arg.map(str::to_owned))),
         "workspace" => Ok(Command::Workspace(arg.map(str::to_owned))),
@@ -110,10 +142,11 @@ pub fn parse(input: &str) -> Result<Command, String> {
     }
 }
 
+/// Commands whose name or one of whose aliases starts with `prefix`.
 pub fn completions(prefix: &str) -> Vec<&'static CommandInfo> {
     COMMANDS
         .iter()
-        .filter(|c| c.name.starts_with(prefix))
+        .filter(|c| c.name.starts_with(prefix) || c.aliases.iter().any(|a| a.starts_with(prefix)))
         .collect()
 }
 
@@ -168,5 +201,29 @@ mod tests {
         let names: Vec<_> = completions("/c").iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["/compact", "/clear", "/copy"]);
         assert!(completions("/zzz").is_empty());
+    }
+
+    #[test]
+    fn aliases_parse_complete_and_display() {
+        assert_eq!(parse("/exit"), Ok(Command::Quit));
+        let names: Vec<_> = completions("/ex").iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["/quit"]);
+        let quit = COMMANDS.iter().find(|c| c.name == "/quit").unwrap();
+        assert_eq!(quit.display_usage(), "/quit (/exit)");
+        let model = COMMANDS.iter().find(|c| c.name == "/model").unwrap();
+        assert_eq!(model.display_usage(), "/model [name]");
+    }
+
+    #[test]
+    fn aliases_never_shadow_a_command() {
+        for c in COMMANDS {
+            for alias in c.aliases {
+                assert!(alias.starts_with('/'), "{alias}");
+                assert!(
+                    COMMANDS.iter().all(|other| other.name != *alias),
+                    "{alias} is also a command's name"
+                );
+            }
+        }
     }
 }

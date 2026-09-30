@@ -518,6 +518,15 @@ mod tests {
     }
 
     #[test]
+    fn tab_completes_an_alias_to_its_command() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "/ex");
+        assert_eq!(c.slash_matches().len(), 1);
+        c.handle_key(key(KeyCode::Tab, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(c.text(), "/quit ");
+    }
+
+    #[test]
     fn paste_is_verbatim_and_ctrl_g_opens_the_editor() {
         let mut c = Composer::new(10);
         c.paste("line one\nline two");
