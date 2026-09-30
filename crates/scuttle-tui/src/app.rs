@@ -597,6 +597,24 @@ impl Tui {
             .cloned()
             .collect();
         f.render_widget(Paragraph::new(visible), transcript);
+        // A line's own style only covers its text, so the tint is painted across the row.
+        for (row, meta) in self
+            .view
+            .meta
+            .iter()
+            .skip(top)
+            .take(transcript.height as usize)
+            .enumerate()
+        {
+            if meta.user {
+                let line = Rect {
+                    y: transcript.y + row as u16,
+                    height: 1,
+                    ..transcript
+                };
+                f.buffer_mut().set_style(line, self.theme.user_tint);
+            }
+        }
         if let Some(activity) = activity.as_ref() {
             let elapsed = now.saturating_duration_since(self.epoch);
             f.render_widget(
@@ -1323,5 +1341,94 @@ mod tests {
         t.tick();
         screen_at(&mut t, 70, 16, now);
         assert_eq!(t.view_builds, 3, "a resize rebuilds even on a timer frame");
+    }
+    #[test]
+    fn the_tint_fills_the_row_on_light_and_dark_terminals() {
+        use ratatui::style::Color;
+        for dark in [true, false] {
+            let theme = Theme::terminal(dark);
+            let mut t = Tui::new(
+                scuttle_core::config::LocalConfig::default(),
+                None,
+                theme,
+                Welcome {
+                    url: "https://x".into(),
+                    user: "nick".into(),
+                    art: vec![],
+                    show: true,
+                },
+            );
+            loaded(
+                &mut t,
+                json!([{"id": 1, "role": "user", "content": [{"type": "text", "text": "my question"}]}]),
+            );
+            let (w, h) = (50u16, 12u16);
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| t.draw(f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let y = (0..h)
+                .find(|&y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains("my question")
+                })
+                .unwrap();
+            let tint = theme.user_tint.bg.unwrap();
+            for x in 1..w - 1 {
+                assert_eq!(buf[(x, y)].bg, tint, "dark={dark} x={x}");
+            }
+            assert_ne!(buf[(0, y)].bg, tint, "the margin stays untinted");
+            let marker = (0..w).find(|&x| buf[(x, y)].symbol() == "›").unwrap();
+            assert_eq!(
+                buf[(marker, y)].fg,
+                Color::Blue,
+                "the marker keeps its color"
+            );
+        }
+        assert_eq!(
+            Theme::terminal(false).user_tint.bg,
+            Some(Color::Indexed(254))
+        );
+        assert_eq!(
+            Theme::terminal(true).user_tint.bg,
+            Some(Color::Indexed(236))
+        );
+    }
+
+    #[test]
+    fn the_tint_covers_wrapped_rows_and_nothing_else() {
+        let mut t = tui();
+        let long = "wrapped words ".repeat(6);
+        loaded(
+            &mut t,
+            json!([
+                {"id": 1, "role": "user", "content": [{"type": "text", "text": long.trim()}]},
+                {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "Answer."}]}
+            ]),
+        );
+        let (w, h) = (30u16, 16u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| t.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let tint = t.theme.user_tint.bg.unwrap();
+        let tinted: Vec<u16> = (0..h).filter(|&y| buf[(w / 2, y)].bg == tint).collect();
+        assert!(
+            tinted.len() >= 2,
+            "the continuation row is tinted too: {tinted:?}"
+        );
+        for &y in &tinted {
+            assert_ne!(buf[(0, y)].bg, tint, "left margin");
+            assert_ne!(buf[(w - 1, y)].bg, tint, "right margin");
+        }
+        let answer = (0..h)
+            .find(|&y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Answer.")
+            })
+            .unwrap();
+        assert!(!tinted.contains(&answer));
     }
 }

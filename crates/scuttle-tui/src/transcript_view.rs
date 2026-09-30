@@ -11,7 +11,7 @@ use scuttle_core::live::LiveBlock;
 
 use crate::markdown;
 use crate::theme::Theme;
-use crate::wrap::wrap_lines;
+use crate::wrap::{wrap_lines, wrap_rows};
 
 /// A block: (message ID, or `None` for the live turn; index of the block within it).
 pub type BlockId = (Option<i64>, usize);
@@ -28,9 +28,20 @@ pub struct Hit {
     pub target: HitTarget,
 }
 
+/// What the TUI needs to know about one transcript row beyond its text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineMeta {
+    /// The row continues a soft-wrapped line from the row before it.
+    pub continuation: bool,
+    /// The row belongs to one of the user's own messages, which the TUI tints.
+    pub user: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct View {
     pub lines: Vec<Line<'static>>,
+    /// One entry per row of `lines`.
+    pub meta: Vec<LineMeta>,
     pub hits: Vec<Hit>,
     /// Code blocks of the most recent assistant turn (durable or live) that had any.
     pub last_code_blocks: Vec<String>,
@@ -74,12 +85,31 @@ struct Out<'t> {
     hidden: usize,
 }
 
+/// What `render_items` reads besides the items themselves.
+struct Ctx<'c> {
+    app: &'c App,
+    overrides: &'c BTreeMap<String, Density>,
+    toggles: &'c HashSet<BlockId>,
+    /// Assistant text blocks that start a turn's answer and get a rule above them.
+    answers: &'c HashSet<BlockId>,
+}
+
 impl Out<'_> {
-    fn push(&mut self, lines: Vec<Line<'static>>) -> Range<usize> {
-        self.flush_hidden();
+    /// Appends wrapped rows with their metadata and returns their range.
+    fn extend_rows(&mut self, rows: Vec<(Line<'static>, bool)>, user: bool) -> Range<usize> {
         let start = self.view.lines.len();
-        self.view.lines.extend(wrap_lines(&lines, self.width));
+        for (line, continuation) in rows {
+            self.view.lines.push(line);
+            self.view.meta.push(LineMeta { continuation, user });
+        }
         start..self.view.lines.len()
+    }
+
+    /// Wraps and appends `lines`; `user` marks them as the user's own message.
+    fn push(&mut self, lines: Vec<Line<'static>>, user: bool) -> Range<usize> {
+        self.flush_hidden();
+        let rows = wrap_rows(&lines, self.width);
+        self.extend_rows(rows, user)
     }
 
     fn flush_hidden(&mut self) {
@@ -93,14 +123,25 @@ impl Out<'_> {
             format!("{n} hidden tool calls")
         };
         let line = Line::from(Span::styled(format!("  ({label})"), self.theme.dim));
-        self.view.lines.extend(wrap_lines(&[line], self.width));
+        let rows = wrap_rows(&[line], self.width);
+        self.extend_rows(rows, false);
     }
 
     fn gap(&mut self) {
         self.flush_hidden();
         if self.view.lines.last().is_some_and(|l| !l.spans.is_empty()) {
-            self.view.lines.push(Line::default());
+            self.extend_rows(vec![(Line::default(), false)], false);
         }
+    }
+
+    /// A full-width rule between a turn's work and its answer.
+    fn rule(&mut self) {
+        self.gap();
+        let line = Line::from(Span::styled(
+            "─".repeat(self.width as usize),
+            self.theme.rule,
+        ));
+        self.extend_rows(vec![(line, false)], false);
     }
 }
 
@@ -311,6 +352,37 @@ fn items_for_live<'a>(
     items
 }
 
+/// The first assistant text after the last reasoning or tool block of each turn. A turn runs
+/// from one user message to the next, across every assistant and tool message between them,
+/// since Coder stores each step of a turn as its own message.
+fn answer_starts(groups: &[(Option<i64>, Vec<Item>)]) -> HashSet<BlockId> {
+    let mut starts = HashSet::new();
+    let mut saw_work = false;
+    let mut pending: Option<BlockId> = None;
+    for (owner, items) in groups {
+        for (index, item) in items.iter().enumerate() {
+            match item {
+                Item::UserText(_) => {
+                    starts.extend(pending.take());
+                    saw_work = false;
+                }
+                Item::Reasoning(_) | Item::Tool { .. } => {
+                    saw_work = true;
+                    pending = None;
+                }
+                Item::AssistantText(text)
+                    if saw_work && pending.is_none() && !text.trim().is_empty() =>
+                {
+                    pending = Some((*owner, index));
+                }
+                Item::AssistantText(_) => {}
+            }
+        }
+    }
+    starts.extend(pending);
+    starts
+}
+
 /// Renders `items` into `out`, returning the code blocks of any assistant text among them.
 /// `live` selects `markdown::render` (uncached, since live text keeps changing) over
 /// `markdown::render_cached` (for durable, unchanging text).
@@ -318,9 +390,7 @@ fn render_items(
     out: &mut Out,
     owner: Option<i64>,
     items: Vec<Item>,
-    app: &App,
-    overrides: &BTreeMap<String, Density>,
-    toggles: &HashSet<BlockId>,
+    ctx: &Ctx,
     live: bool,
 ) -> Vec<String> {
     let width = out.width as usize;
@@ -339,9 +409,12 @@ fn render_items(
                         ])
                     })
                     .collect();
-                out.push(lines);
+                out.push(lines, true);
             }
             Item::AssistantText(text) => {
+                if ctx.answers.contains(&id) {
+                    out.rule();
+                }
                 out.gap();
                 let rendered = if live {
                     markdown::render(text)
@@ -358,12 +431,12 @@ fn render_items(
                     });
                 }
                 code_blocks.extend(rendered.code_blocks.iter().map(|b| b.code.clone()));
-                out.push(rendered.lines);
+                out.push(rendered.lines, false);
             }
             Item::Reasoning(text) => {
                 out.gap();
-                let mut density = density_for(BlockKind::Reasoning, &app.prefs, overrides);
-                if toggles.contains(&id) {
+                let mut density = density_for(BlockKind::Reasoning, &ctx.app.prefs, ctx.overrides);
+                if ctx.toggles.contains(&id) {
                     density = if density == Density::Expanded {
                         Density::Summary
                     } else {
@@ -377,7 +450,7 @@ fn render_items(
                         .collect(),
                     _ => vec![Line::from(Span::styled("∴ Thinking", out.theme.dim))],
                 };
-                let range = out.push(lines);
+                let range = out.push(lines, false);
                 out.view.hits.push(Hit {
                     lines: range,
                     target: HitTarget::Toggle(id),
@@ -390,8 +463,8 @@ fn render_items(
                 is_error,
                 done,
             } => {
-                let mut density = density_for(BlockKind::Tool(name), &app.prefs, overrides);
-                if toggles.contains(&id) {
+                let mut density = density_for(BlockKind::Tool(name), &ctx.app.prefs, ctx.overrides);
+                if ctx.toggles.contains(&id) {
                     density = if density == Density::Expanded {
                         Density::Summary
                     } else {
@@ -427,9 +500,9 @@ fn render_items(
                     ))),
                     _ => {}
                 }
-                let mut wrapped = Vec::new();
+                let mut wrapped: Vec<(Line<'static>, bool)> = Vec::new();
                 for (i, l) in lines.into_iter().enumerate() {
-                    let w = wrap_lines(&[l], out.width);
+                    let w = wrap_rows(&[l], out.width);
                     if density == Density::Expanded || i > 0 || w.len() == 1 {
                         wrapped.extend(w);
                     } else {
@@ -439,10 +512,9 @@ fn render_items(
                 if density != Density::Expanded {
                     wrapped.truncate(2);
                 }
-                let start = out.view.lines.len();
-                out.view.lines.extend(wrapped);
+                let range = out.extend_rows(wrapped, false);
                 out.view.hits.push(Hit {
-                    lines: start..out.view.lines.len(),
+                    lines: range,
                     target: HitTarget::Toggle(id),
                 });
             }
@@ -502,35 +574,33 @@ pub fn build(
     let messages: Vec<_> = app.transcript.messages().collect();
     if messages.is_empty() && app.transcript.live.is_empty() {
         if welcome.show {
-            out.push(welcome_lines(welcome, theme));
+            out.push(welcome_lines(welcome, theme), false);
         }
         return out.view;
     }
     let (results, calls) = collect_tool_results(&messages, &app.transcript.live.blocks);
-    for m in &messages {
-        let code = render_items(
-            &mut out,
-            m.id,
-            items_for_message(m, &results),
-            app,
-            overrides,
-            toggles,
-            false,
-        );
-        if !code.is_empty() {
-            out.view.last_code_blocks = code;
-        }
-    }
-    if !app.transcript.live.is_empty() {
-        let code = render_items(
-            &mut out,
+    let mut groups: Vec<(Option<i64>, Vec<Item>)> = messages
+        .iter()
+        .map(|m| (m.id, items_for_message(m, &results)))
+        .collect();
+    let has_live = !app.transcript.live.is_empty();
+    if has_live {
+        groups.push((
             None,
             items_for_live(&app.transcript.live.blocks, &results, &calls),
-            app,
-            overrides,
-            toggles,
-            true,
-        );
+        ));
+    }
+    let answers = answer_starts(&groups);
+    let ctx = Ctx {
+        app,
+        overrides,
+        toggles,
+        answers: &answers,
+    };
+    let count = groups.len();
+    for (i, (owner, items)) in groups.into_iter().enumerate() {
+        let live = has_live && i + 1 == count;
+        let code = render_items(&mut out, owner, items, &ctx, live);
         if !code.is_empty() {
             out.view.last_code_blocks = code;
         }
@@ -542,20 +612,26 @@ pub fn build(
             .filter_map(|p| p.text.as_deref())
             .collect::<Vec<_>>()
             .join(" ");
-        out.push(vec![Line::from(Span::styled(
-            format!(
-                "  queued · {}",
-                one_line(&text, (width as usize).saturating_sub(12).max(8))
-            ),
-            theme.dim,
-        ))]);
+        out.push(
+            vec![Line::from(Span::styled(
+                format!(
+                    "  queued · {}",
+                    one_line(&text, (width as usize).saturating_sub(12).max(8))
+                ),
+                theme.dim,
+            ))],
+            false,
+        );
     }
     if let Some(err) = app.transcript.last_error.as_ref() {
         out.gap();
-        out.push(vec![Line::from(Span::styled(
-            format!("Error: {err}"),
-            theme.error,
-        ))]);
+        out.push(
+            vec![Line::from(Span::styled(
+                format!("Error: {err}"),
+                theme.error,
+            ))],
+            false,
+        );
     }
     out.flush_hidden();
     out.view
@@ -873,5 +949,213 @@ mod tests {
     fn result_text_strips_ansi_csi_sequences() {
         let colored = "\u{1b}[32mdone\u{1b}[0m";
         assert_eq!(result_text(Some(&json!({"output": colored})), ""), "done");
+    }
+    fn build_at(app: &App, width: u16) -> View {
+        build(
+            app,
+            &Default::default(),
+            &Default::default(),
+            &welcome(),
+            &Theme::terminal(true),
+            width,
+        )
+    }
+
+    fn rule_rows(lines: &[String]) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('─'))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn a_rule_separates_the_work_from_the_answer() {
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "fix it"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "reasoning", "text": "think"},
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}}
+            ]},
+            {"id": 3, "role": "tool", "content": [
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}}
+            ]},
+            {"id": 4, "role": "assistant", "content": [{"type": "text", "text": "All fixed."}]},
+            {"id": 5, "role": "user", "content": [{"type": "text", "text": "thanks"}]},
+            {"id": 6, "role": "assistant", "content": [{"type": "text", "text": "Any time."}]}
+        ]));
+        let view = build_at(&app, 40);
+        let lines = texts(&view);
+        let rules: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('─'))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            rules.len(),
+            1,
+            "a turn without work gets no rule: {lines:?}"
+        );
+        let rule = rules[0];
+        assert_eq!(lines[rule].chars().count(), 40, "the rule spans the width");
+        let tool = lines.iter().position(|l| l.contains("execute")).unwrap();
+        let answer = lines.iter().position(|l| l.contains("All fixed.")).unwrap();
+        assert!(tool < rule && rule < answer, "{lines:?}");
+    }
+
+    #[test]
+    fn a_turn_without_work_gets_no_rule() {
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "Hello."}]}
+        ]));
+        let lines = texts(&build_at(&app, 40));
+        assert!(rule_rows(&lines).is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn two_text_blocks_after_work_get_one_rule_above_the_first() {
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "text", "text": "Let me look."},
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}},
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}}
+            ]},
+            {"id": 3, "role": "assistant", "content": [
+                {"type": "text", "text": "First part."},
+                {"type": "text", "text": "Second part."}
+            ]}
+        ]));
+        let lines = texts(&build_at(&app, 40));
+        let rules = rule_rows(&lines);
+        assert_eq!(rules.len(), 1, "{lines:?}");
+        let look = lines
+            .iter()
+            .position(|l| l.contains("Let me look."))
+            .unwrap();
+        let first = lines
+            .iter()
+            .position(|l| l.contains("First part."))
+            .unwrap();
+        let second = lines
+            .iter()
+            .position(|l| l.contains("Second part."))
+            .unwrap();
+        assert!(
+            look < rules[0],
+            "text before the work gets no rule: {lines:?}"
+        );
+        assert!(rules[0] < first && first < second, "{lines:?}");
+    }
+
+    #[test]
+    fn only_the_text_after_the_last_work_gets_the_rule() {
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "reasoning", "text": "think"},
+                {"type": "text", "text": "Checking."},
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}},
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}},
+                {"type": "text", "text": "Done."}
+            ]}
+        ]));
+        let lines = texts(&build_at(&app, 40));
+        let rules = rule_rows(&lines);
+        assert_eq!(rules.len(), 1, "{lines:?}");
+        let tool = lines.iter().position(|l| l.contains("execute")).unwrap();
+        let done = lines.iter().position(|l| l.contains("Done.")).unwrap();
+        assert!(tool < rules[0] && rules[0] < done, "{lines:?}");
+    }
+
+    #[test]
+    fn a_live_turn_gets_no_rule_before_its_answer_starts() {
+        let mut app = app_with(
+            json!([{"id": 1, "role": "user", "content": [{"type": "text", "text": "go"}]}]),
+        );
+        app.transcript
+            .live
+            .blocks
+            .push(LiveBlock::Reasoning("hmm".into()));
+        app.transcript.live.blocks.push(LiveBlock::ToolCall {
+            id: "a".into(),
+            name: "execute".into(),
+            args_raw: String::new(),
+            args: Some(json!({"command": "ls"})),
+        });
+        let lines = texts(&build_at(&app, 40));
+        assert!(rule_rows(&lines).is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_streaming_answer_after_a_tool_gets_the_rule() {
+        let mut app = app_with(
+            json!([{"id": 1, "role": "user", "content": [{"type": "text", "text": "go"}]}]),
+        );
+        app.transcript.live.blocks.push(LiveBlock::ToolCall {
+            id: "a".into(),
+            name: "execute".into(),
+            args_raw: String::new(),
+            args: Some(json!({"command": "ls"})),
+        });
+        app.transcript
+            .live
+            .blocks
+            .push(LiveBlock::Text("Here is the answer".into()));
+        let lines = texts(&build_at(&app, 40));
+        let rule = lines
+            .iter()
+            .position(|l| l.starts_with('─'))
+            .expect("a rule");
+        let answer = lines
+            .iter()
+            .position(|l| l.contains("Here is the answer"))
+            .unwrap();
+        assert!(rule < answer);
+    }
+
+    #[test]
+    fn user_rows_are_marked_and_every_row_has_metadata() {
+        let long = "please look at this long request that wraps across more than one row";
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": long}]},
+            {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "Sure, looking now."}]}
+        ]));
+        let view = build_at(&app, 30);
+        assert_eq!(view.lines.len(), view.meta.len());
+        let lines = texts(&view);
+        let user_rows: Vec<usize> = view
+            .meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.user)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(user_rows.len() >= 2, "{lines:?}");
+        assert!(lines[user_rows[0]].starts_with("› "));
+        assert!(!view.meta[user_rows[0]].continuation);
+        assert!(view.meta[user_rows[1]].continuation);
+        let answer = lines.iter().position(|l| l.contains("Sure")).unwrap();
+        assert!(!view.meta[answer].user);
+    }
+
+    #[test]
+    fn every_fixture_keeps_lines_and_metadata_in_step() {
+        let huge: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "a\nb"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "text", "text": "text\n\n```sh\nls\n```"},
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "read_file", "args": {"path": "/x"}},
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "read_file", "result": {"content": huge}}
+            ]}
+        ]));
+        for width in [12u16, 40, 120] {
+            let view = build_at(&app, width);
+            assert_eq!(view.lines.len(), view.meta.len(), "width {width}");
+        }
     }
 }
