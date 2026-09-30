@@ -431,6 +431,7 @@ impl Runtime {
             Effect::ShowPicker(_)
             | Effect::ShowHelp
             | Effect::Copy(_)
+            | Effect::CopyWebUrl(_)
             | Effect::SetMouse(_)
             | Effect::SaveOrganization(_)
             | Effect::RestoreComposer(_)

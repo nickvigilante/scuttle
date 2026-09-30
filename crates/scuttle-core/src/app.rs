@@ -232,6 +232,8 @@ pub enum Effect {
         on: bool,
     },
     OpenWeb(Uuid),
+    /// Copies the chat's URL after `Effect::OpenWeb` opened no browser, and reports the copy.
+    CopyWebUrl(String),
     FetchPrefs,
     FetchModels(Uuid),
     FetchWorkspaces(Uuid),
@@ -817,10 +819,13 @@ impl App {
             }
             Msg::WebOpened { url, outcome } => {
                 match outcome {
-                    Ok(()) => self.info(format!("Opened {url}")),
-                    Err(why) => self.info(format!("Open {url} ({why})")),
+                    Ok(()) => {
+                        self.info(format!("Opened {url}"));
+                        vec![]
+                    }
+                    // The UI copies the URL and says whether that worked.
+                    Err(_) => vec![Effect::CopyWebUrl(url)],
                 }
-                vec![]
             }
             Msg::Submit(text) => self.submit(text),
             Msg::Command(cmd) => self.command(cmd),
@@ -2051,13 +2056,12 @@ mod tests {
             app.notices.last(),
             Some(&Notice::Info(format!("Opened {url}")))
         );
-        app.update(Msg::WebOpened {
-            url: url.clone(),
-            outcome: Err("over SSH".into()),
-        });
         assert_eq!(
-            app.notices.last(),
-            Some(&Notice::Info(format!("Open {url} (over SSH)")))
+            app.update(Msg::WebOpened {
+                url: url.clone(),
+                outcome: Err("over SSH".into()),
+            }),
+            vec![Effect::CopyWebUrl(url)]
         );
     }
 
@@ -3080,6 +3084,22 @@ mod tests {
         );
         assert!(app.update(Msg::Command(Command::Clear)).is_empty());
         assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m == "Start a chat first."));
+    }
+
+    #[test]
+    fn web_without_a_browser_asks_the_ui_to_copy_the_url() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let url = "https://coder.example.com/agents/x".to_owned();
+        let before = app.notices.len();
+        assert_eq!(
+            app.update(Msg::WebOpened {
+                url: url.clone(),
+                outcome: Err("over SSH".into()),
+            }),
+            vec![Effect::CopyWebUrl(url)]
+        );
+        assert_eq!(app.notices.len(), before, "the UI reports the copy");
     }
 
     #[test]

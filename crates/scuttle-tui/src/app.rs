@@ -62,6 +62,17 @@ fn editor_round_trip(
     (edited, resumed)
 }
 
+/// The notice for copying the chat URL after `/web` opened no browser.
+fn web_copy_notice(url: &str, outcome: CopyOutcome) -> Notice {
+    match outcome {
+        CopyOutcome::Copied => Notice::Info(format!("Copied the chat URL: {url}")),
+        CopyOutcome::CopiedWithWarning(w) => {
+            Notice::Info(format!("Copied the chat URL: {url}. {w}"))
+        }
+        CopyOutcome::Failed(_) => Notice::Error(format!("Could not copy the chat URL: {url}")),
+    }
+}
+
 /// A left-button press in the transcript that has not been released.
 #[derive(Debug, Clone, Copy)]
 struct Drag {
@@ -257,15 +268,23 @@ impl Tui {
     }
 
     fn copy(&mut self, text: String) {
+        if let Some(outcome) = self.write_clipboard(text) {
+            self.report_copy(outcome);
+        }
+    }
+
+    /// Puts `text` on the clipboard, opening it on first use. Tests only record the text, so
+    /// they return `None`.
+    fn write_clipboard(&mut self, text: String) -> Option<CopyOutcome> {
         self.last_copied = Some(text.clone());
         if cfg!(test) {
-            return;
+            return None;
         }
-        let outcome = self
-            .clipboard
-            .get_or_insert_with(Clipboard::new)
-            .copy(&text);
-        self.report_copy(outcome);
+        Some(
+            self.clipboard
+                .get_or_insert_with(Clipboard::new)
+                .copy(&text),
+        )
     }
 
     fn report_copy(&mut self, outcome: CopyOutcome) {
@@ -350,6 +369,12 @@ impl Tui {
                 self.drag = None;
                 self.scroll_from_bottom = 0;
                 self.composer.reset_history_position();
+            }
+            Effect::CopyWebUrl(url) => {
+                if let Some(outcome) = self.write_clipboard(url.clone()) {
+                    let notice = web_copy_notice(url, outcome);
+                    self.notice(notice);
+                }
             }
             Effect::RestoreComposer(text) => {
                 // Keep anything typed since the failed request, after the restored text.
@@ -2115,5 +2140,35 @@ mod tests {
         assert!(shown.contains("replaced"), "{shown}");
         assert!(t.selection.is_none());
         assert!(t.drag.is_none());
+    }
+
+    #[test]
+    fn a_web_url_that_opened_no_browser_is_copied() {
+        let mut t = tui();
+        let url = "https://coder.example.com/agents/x".to_owned();
+        assert!(t.apply_ui_effect(&Effect::CopyWebUrl(url.clone())));
+        assert_eq!(t.last_copied.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn the_web_url_copy_notice_names_the_url() {
+        let url = "https://coder.example.com/agents/x";
+        assert_eq!(
+            web_copy_notice(url, CopyOutcome::Copied),
+            Notice::Info("Copied the chat URL: https://coder.example.com/agents/x".into())
+        );
+        assert_eq!(
+            web_copy_notice(
+                url,
+                CopyOutcome::CopiedWithWarning("tmux may drop it".into())
+            ),
+            Notice::Info(
+                "Copied the chat URL: https://coder.example.com/agents/x. tmux may drop it".into()
+            )
+        );
+        assert_eq!(
+            web_copy_notice(url, CopyOutcome::Failed("no terminal".into())),
+            Notice::Error("Could not copy the chat URL: https://coder.example.com/agents/x".into())
+        );
     }
 }
