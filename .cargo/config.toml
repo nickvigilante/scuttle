@@ -1,0 +1,3 @@
+# coder-sdk comes from a private GitHub repository; fetch it with the git CLI so its credential helper applies.
+[net]
+git-fetch-with-cli = true
