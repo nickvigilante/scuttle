@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::density::Density;
 
@@ -48,6 +49,8 @@ pub struct LocalConfig {
     pub composer_max_lines: u16,
     pub welcome: WelcomeConfig,
     pub density: BTreeMap<String, Density>,
+    /// The organization new chats go to, saved by `/organization`. An ID, not a secret.
+    pub organization: Option<Uuid>,
 }
 
 impl Default for LocalConfig {
@@ -58,6 +61,7 @@ impl Default for LocalConfig {
             composer_max_lines: 10,
             welcome: WelcomeConfig::default(),
             density: BTreeMap::new(),
+            organization: None,
         }
     }
 }
@@ -177,6 +181,14 @@ pub fn set_mouse(path: &Path, enabled: bool) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_saved_organization() {
+        let id = uuid::Uuid::new_v4();
+        let cfg = load_from_str(&format!("organization = \"{id}\"\n")).unwrap();
+        assert_eq!(cfg.organization, Some(id));
+        assert_eq!(LocalConfig::default().organization, None);
+    }
 
     #[test]
     fn defaults_apply_to_an_empty_file() {

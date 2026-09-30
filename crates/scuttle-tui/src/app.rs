@@ -722,7 +722,10 @@ mod tests {
     fn slash_model_opens_the_picker_and_escape_closes_it() {
         let mut t = tui();
         // `/model` only opens the picker once the model list has loaded.
-        t.core.update(Msg::ModelsLoaded(vec![]));
+        t.core.update(Msg::ModelsLoaded(
+            serde_json::from_value(json!([{"id": uuid::Uuid::new_v4(), "display_name": "A", "enabled": true, "reasoning_efforts": []}]))
+                .unwrap(),
+        ));
         let effects = t
             .core
             .update(Msg::Command(scuttle_core::commands::Command::Model(None)));

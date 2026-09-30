@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use coder_sdk::{Client, types};
 use futures::StreamExt;
-use scuttle_core::app::{Effect, Msg, WorkspaceRef};
+use scuttle_core::app::{Effect, Msg, OrgRef, WorkspaceRef};
 use scuttle_core::density::DisplayPrefs;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -66,11 +66,20 @@ impl Runtime {
         }
     }
 
-    /// Resolves the user's first organization, the one new chats are created in, or `None`
-    /// when the user belongs to none.
-    pub async fn organization(&self) -> Result<Option<Uuid>, coder_sdk::Error> {
+    /// The user's organizations, in the server's order, which is not stable; pick one with
+    /// `scuttle_core::app::pick_organization`.
+    pub async fn organizations(&self) -> Result<Vec<OrgRef>, coder_sdk::Error> {
         match self.client.api().get_organizations_by_user("me").await {
-            Ok(r) => Ok(r.into_inner().first().map(|o| o.id)),
+            Ok(r) => Ok(r
+                .into_inner()
+                .into_iter()
+                .map(|o| OrgRef {
+                    id: o.id,
+                    name: o.name.unwrap_or_default(),
+                    display_name: o.display_name.unwrap_or_default(),
+                    is_default: o.is_default,
+                })
+                .collect()),
             Err(e) => Err(coder_sdk::Error::from_progenitor(e).await),
         }
     }
@@ -256,7 +265,7 @@ impl Runtime {
                 }
             })),
             Effect::FetchModels(org) => self.spawn(Box::pin(async move {
-                match client
+                let msg = match client
                     .api()
                     .list_ai_models_and_provider_descriptors_in_an_organization(&org.to_string())
                     .await
@@ -265,12 +274,17 @@ impl Runtime {
                     Err(e) => Msg::ModelsFailed {
                         message: err(e).await,
                     },
+                };
+                Msg::ForOrg {
+                    org,
+                    msg: Box::new(msg),
                 }
             })),
-            Effect::FetchWorkspaces => self.spawn(Box::pin(async move {
-                match client
+            Effect::FetchWorkspaces(org) => self.spawn(Box::pin(async move {
+                let query = format!("owner:me organization:{org}");
+                let msg = match client
                     .api()
-                    .list_workspaces(Some(100), None, Some("owner:me"))
+                    .list_workspaces(Some(100), None, Some(query.as_str()))
                     .await
                 {
                     Ok(r) => Msg::WorkspacesLoaded(
@@ -289,6 +303,10 @@ impl Runtime {
                         action: "load workspaces",
                         message: err(e).await,
                     },
+                };
+                Msg::ForOrg {
+                    org,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::ShowPicker(_)
@@ -434,8 +452,73 @@ mod tests {
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::FetchModels(org));
         match next(&mut rx).await {
-            Msg::ModelsFailed { message } => assert!(message.contains("not allowed"), "{message}"),
-            other => panic!("expected ModelsFailed, got {other:?}"),
+            Msg::ForOrg { org: tagged, msg } => {
+                assert_eq!(tagged, org);
+                assert!(
+                    matches!(*msg, Msg::ModelsFailed { ref message } if message.contains("not allowed")),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged ModelsFailed, got {other:?}"),
+        }
+    }
+
+    fn org_json(id: Uuid, name: &str, is_default: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name.to_lowercase(), "display_name": name, "description": "",
+            "icon": "", "is_default": is_default, "default_org_member_roles": [],
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn the_default_organization_wins_over_list_order() {
+        let server = MockServer::start().await;
+        let (product, coder) = (Uuid::new_v4(), Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(product, "Product", false),
+                org_json(coder, "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        let labels: Vec<&str> = orgs.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, ["Product", "Coder"]);
+        assert_eq!(
+            scuttle_core::app::pick_organization(None, &orgs),
+            Some(coder)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspaces_are_listed_for_one_organization() {
+        let server = MockServer::start().await;
+        let org = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path("/api/v2/workspaces"))
+            .and(wiremock::matchers::query_param(
+                "q",
+                format!("owner:me organization:{org}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workspaces": [{"id": Uuid::new_v4(), "name": "dev"}], "count": 1
+            })))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::FetchWorkspaces(org));
+        match next(&mut rx).await {
+            Msg::ForOrg { org: tagged, msg } => {
+                assert_eq!(tagged, org);
+                assert!(
+                    matches!(*msg, Msg::WorkspacesLoaded(ref w) if w.len() == 1 && w[0].name == "dev"),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged workspace list, got {other:?}"),
         }
     }
 

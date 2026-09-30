@@ -148,16 +148,25 @@ async fn main() -> ExitCode {
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(_) => {}
     }
-    let first = match runtime.organization().await {
-        Ok(Some(org)) => tui.update(Msg::Started {
-            org_id: org,
-            open_chat,
-        }),
-        Ok(None) => {
-            tui.core.notices.push(Notice::Error(
-                "Could not load your organization: you are not a member of any organization".into(),
-            ));
-            vec![]
+    let first = match runtime.organizations().await {
+        Ok(organizations) => {
+            match scuttle_core::app::pick_organization(local.organization, &organizations) {
+                Some(org) => {
+                    let mut effects = tui.update(Msg::OrganizationsLoaded(organizations));
+                    effects.extend(tui.update(Msg::Started {
+                        org_id: org,
+                        open_chat,
+                    }));
+                    effects
+                }
+                None => {
+                    tui.core.notices.push(Notice::Error(
+                        "Could not load your organization: you are not a member of any organization"
+                            .into(),
+                    ));
+                    vec![]
+                }
+            }
         }
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(e) => {
