@@ -68,6 +68,7 @@ The last row is always "Search all chats for “<query>”", which runs the serv
 Each row shows, from left to right:
 
 - A status marker: an animated spinner while `running` or `interrupting`, `?` for `requires_action`, `!` for `error`, and a blank for `waiting`.
+  The spinner uses the same frames as the activity line, as the user asked in feedback item 18.
 - An unread dot when the chat has an assistant message the user has not seen.
 - The title, truncated to fit.
 - A subagent count such as `+3` when the chat has children, and the marker of the most active child when the row is collapsed.
