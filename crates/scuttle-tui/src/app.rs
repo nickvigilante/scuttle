@@ -20,8 +20,8 @@ use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
 use crate::help::help_lines;
+use crate::links;
 use crate::picker::{PickerChoice, PickerState};
-use crate::runtime;
 use crate::selection::{Pos, Selection, selected_text};
 use crate::theme::Theme;
 use crate::transcript_view::{self, BlockId, HitTarget, View, Welcome};
@@ -81,7 +81,7 @@ fn web_copy_notice(url: &str, outcome: CopyOutcome) -> Notice {
 /// says so, since nothing else would explain why the click did not open it.
 fn link_copy_notice(url: &str, outcome: CopyOutcome) -> Notice {
     let notice = copy_url_notice("the link", url, outcome);
-    if runtime::web_link(url).is_some() {
+    if links::web_link(url).is_some() {
         return notice;
     }
     let why = "Only http and https links open in a browser.";

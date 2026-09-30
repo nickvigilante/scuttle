@@ -5,6 +5,7 @@ mod composer;
 mod footer;
 mod help;
 mod highlight;
+mod links;
 mod markdown;
 mod picker;
 mod runtime;

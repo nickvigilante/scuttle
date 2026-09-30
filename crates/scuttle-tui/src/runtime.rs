@@ -14,6 +14,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::links;
+
 pub struct Runtime {
     client: Client,
     tx: UnboundedSender<Msg>,
@@ -107,18 +109,9 @@ async fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
-/// `url` parsed, when it is an `http` or `https` link, the only kind a transcript link may
-/// open. Anything else, such as a file, a `javascript:` URL, or text that starts with `-` and
-/// would reach the opener as an option, could run something other than a browser.
-pub(crate) fn web_link(url: &str) -> Option<url::Url> {
-    url::Url::parse(url)
-        .ok()
-        .filter(|u| matches!(u.scheme(), "http" | "https"))
-}
-
 /// Opens a link from the transcript. Only web links open, and in normalized form.
 async fn open_link(url: &str) -> Result<(), String> {
-    match web_link(url) {
+    match links::web_link(url) {
         Some(parsed) => open_in_browser(parsed.as_str()).await,
         None => Err("only http and https links open in a browser".into()),
     }
@@ -392,6 +385,10 @@ impl Runtime {
                 }));
             }
             Effect::OpenLink(url) => self.spawn(Box::pin(async move {
+                // Report a web link in the normalized form the opener gets, so the notice names
+                // the real destination, such as the punycode form of a lookalike host. Any other
+                // text never reaches the opener and is copied as written.
+                let url = links::web_link(&url).map_or(url, |u| u.to_string());
                 let outcome = open_link(&url).await;
                 Msg::LinkOpened { url, outcome }
             })),
@@ -541,6 +538,29 @@ mod tests {
             }
             other => panic!("expected LinkOpened, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_opened_link_names_its_real_destination() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        // The first letter is Cyrillic, so the browser goes to the punycode host.
+        rt.run(Effect::OpenLink("https://\u{430}pple.com".into()));
+        let url = match next(&mut rx).await {
+            Msg::LinkOpened { url, .. } => url,
+            other => panic!("expected LinkOpened, got {other:?}"),
+        };
+        let mut app = scuttle_core::app::App::new(scuttle_core::config::BusyBehavior::Queue, true);
+        app.update(Msg::LinkOpened {
+            url,
+            outcome: Ok(()),
+        });
+        assert_eq!(
+            app.notices.last(),
+            Some(&scuttle_core::app::Notice::Info(
+                "Opened https://xn--pple-43d.com/".into()
+            ))
+        );
     }
 
     #[tokio::test]
