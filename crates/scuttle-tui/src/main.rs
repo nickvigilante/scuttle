@@ -7,6 +7,7 @@ mod highlight;
 mod markdown;
 mod picker;
 mod runtime;
+mod selection;
 mod terminal;
 mod theme;
 mod transcript_view;

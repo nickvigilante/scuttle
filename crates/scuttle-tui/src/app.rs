@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -21,6 +21,7 @@ use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
 use crate::picker::{PickerChoice, PickerState};
+use crate::selection::{Pos, Selection, selected_text};
 use crate::theme::Theme;
 use crate::transcript_view::{self, BlockId, HitTarget, View, Welcome};
 
@@ -61,6 +62,20 @@ fn editor_round_trip(
     (edited, resumed)
 }
 
+/// A left-button press in the transcript that has not been released.
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    anchor: Pos,
+    /// Whether the pointer left the anchor cell; a release without moving is a click.
+    moved: bool,
+    /// The transcript line kept at the top of the screen while the button is held, so new
+    /// output cannot scroll the text out from under the pointer.
+    top: usize,
+    /// The transcript area at the press. Both ends of the drag map through it, so the
+    /// activity row appearing or leaving mid-drag cannot shift the selection.
+    area: Rect,
+}
+
 pub struct Tui {
     pub core: App,
     pub composer: Composer,
@@ -99,6 +114,9 @@ pub struct Tui {
     view_width: u16,
     /// How many times `draw_at` rebuilt the transcript lines; tests check timer frames reuse them.
     view_builds: usize,
+    /// The highlighted text, kept after release until the next press or key.
+    selection: Option<Selection>,
+    drag: Option<Drag>,
 }
 
 impl Tui {
@@ -136,6 +154,8 @@ impl Tui {
             reuse_view: false,
             view_width: 0,
             view_builds: 0,
+            selection: None,
+            drag: None,
         }
     }
 
@@ -292,13 +312,17 @@ impl Tui {
                 if !cfg!(test) {
                     let _ = crate::terminal::set_mouse(*enabled);
                 }
+                if !*enabled {
+                    self.end_drag();
+                    self.selection = None;
+                }
                 if let Some(path) = self.config_path.as_ref()
                     && let Err(e) = config::set_mouse(path, *enabled)
                 {
                     self.notice(Notice::Error(e.to_string()));
                 }
                 let note = if *enabled {
-                    "Mouse capture on. Hold Shift (Option in iTerm2 or Terminal.app) to select text."
+                    "Mouse capture on. Drag to select and copy; hold Shift (Option in iTerm2 or Terminal.app) for the terminal's own selection."
                 } else {
                     "Mouse capture off."
                 };
@@ -363,27 +387,56 @@ impl Tui {
             .saturating_sub(self.area.height as usize)
     }
 
+    /// The transcript line at the top of the screen. A held drag pins it, even past the usual
+    /// bottom when the transcript grew taller mid-drag.
     fn top_line(&self) -> usize {
-        self.max_scroll().saturating_sub(self.scroll_from_bottom)
+        match self.drag {
+            Some(drag) => drag.top,
+            None => self.max_scroll().saturating_sub(self.scroll_from_bottom),
+        }
     }
 
     fn scroll_up(&mut self, lines: usize) {
+        if let Some(drag) = self.drag.as_mut() {
+            drag.top = drag.top.saturating_sub(lines);
+            return;
+        }
         self.scroll_from_bottom = (self.scroll_from_bottom + lines).min(self.max_scroll());
     }
 
     fn scroll_down(&mut self, lines: usize) {
+        let max = self.max_scroll();
+        if let Some(drag) = self.drag.as_mut() {
+            if drag.top < max {
+                drag.top = (drag.top + lines).min(max);
+            }
+            return;
+        }
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(lines);
     }
 
-    fn click(&mut self, column: u16, row: u16) {
-        let inside = row >= self.area.y
+    fn inside(&self, column: u16, row: u16) -> bool {
+        row >= self.area.y
             && row < self.area.y + self.area.height
             && column >= self.area.x
-            && column < self.area.x + self.area.width;
-        if !inside {
-            return;
+            && column < self.area.x + self.area.width
+    }
+
+    /// The transcript cell under the pointer, clamped into the transcript. During a drag it
+    /// maps through the transcript area as it was at the press.
+    fn pos_at(&self, column: u16, row: u16) -> Pos {
+        let area = self.drag.map_or(self.area, |d| d.area);
+        let bottom = area.y + area.height.saturating_sub(1);
+        let right = area.x + area.width.saturating_sub(1);
+        let row = row.clamp(area.y, bottom);
+        Pos {
+            line: self.top_line() + (row - area.y) as usize,
+            col: column.clamp(area.x, right) - area.x,
         }
-        let line = self.top_line() + (row - self.area.y) as usize;
+    }
+
+    /// Acts on a click on transcript row `line`: copies a code block or toggles a block.
+    fn click(&mut self, line: usize) {
         let target = self
             .view
             .hits
@@ -411,17 +464,81 @@ impl Tui {
                 vec![]
             }
             Event::Mouse(m) => {
-                match m.kind {
-                    MouseEventKind::Down(MouseButton::Left) if !self.overlay_showing() => {
-                        self.click(m.column, m.row)
-                    }
-                    MouseEventKind::ScrollUp => self.scroll_up(3),
-                    MouseEventKind::ScrollDown => self.scroll_down(3),
-                    _ => {}
-                }
+                self.mouse(m);
                 vec![]
             }
             _ => vec![],
+        }
+    }
+
+    fn mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = None;
+                self.end_drag();
+                if self.core.mouse && !self.overlay_showing() && self.inside(m.column, m.row) {
+                    self.drag = Some(Drag {
+                        anchor: self.pos_at(m.column, m.row),
+                        moved: false,
+                        top: self.top_line(),
+                        area: self.area,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(m.column, m.row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.extend_to(m.column, m.row);
+                let Some(drag) = self.drag else {
+                    return;
+                };
+                if !drag.moved {
+                    self.click(drag.anchor.line);
+                } else if let Some(selection) = self.selection {
+                    let text = selected_text(&self.view, &selection);
+                    if !text.is_empty() {
+                        self.copy(text);
+                    }
+                }
+                self.end_drag();
+            }
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
+            _ => {}
+        }
+    }
+
+    /// Extends the selection to the pointer, scrolling a line when it leaves the transcript.
+    fn drag_to(&mut self, column: u16, row: u16) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        if row < drag.area.y {
+            self.scroll_up(1);
+        } else if row >= drag.area.y + drag.area.height {
+            self.scroll_down(1);
+        }
+        self.extend_to(column, row);
+    }
+
+    fn extend_to(&mut self, column: u16, row: u16) {
+        let head = self.pos_at(column, row);
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        drag.moved |= head != drag.anchor;
+        if drag.moved {
+            self.selection = Some(Selection {
+                anchor: drag.anchor,
+                head,
+            });
+        }
+    }
+
+    /// Lets go of a held drag, handing its pinned top back to the scroll position.
+    fn end_drag(&mut self) {
+        if let Some(drag) = self.drag.take() {
+            let max = self.max_scroll();
+            self.scroll_from_bottom = max - drag.top.min(max);
         }
     }
 
@@ -432,6 +549,8 @@ impl Tui {
 
     fn key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.active_notice = None;
+        self.selection = None;
+        self.end_drag();
         // Handled before the overlays, so a double Ctrl+C quits from anywhere.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             let now = Instant::now();
@@ -615,6 +734,29 @@ impl Tui {
                 f.buffer_mut().set_style(line, self.theme.user_tint);
             }
         }
+        if let Some(selection) = self.selection {
+            let shown = self
+                .view
+                .lines
+                .len()
+                .saturating_sub(top)
+                .min(transcript.height as usize);
+            for row in 0..shown {
+                let line = top + row;
+                if self.view.meta.get(line).is_some_and(|m| m.rule) {
+                    continue;
+                }
+                if let Some((from, to)) = selection.columns(line, transcript.width) {
+                    let cells = Rect {
+                        x: transcript.x + from,
+                        y: transcript.y + row as u16,
+                        width: to - from,
+                        height: 1,
+                    };
+                    f.buffer_mut().set_style(cells, self.theme.selection);
+                }
+            }
+        }
         if let Some(activity) = activity.as_ref() {
             let elapsed = now.saturating_duration_since(self.epoch);
             f.render_widget(
@@ -775,23 +917,8 @@ mod tests {
 
     #[test]
     fn click_on_a_code_block_copies_it() {
-        let mut t = tui();
-        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
-        t.core.update(Msg::ChatLoaded {
-            chat: Box::new(chat),
-            messages: serde_json::from_value(json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "```\necho hi\n```"}]}])).unwrap(),
-        });
-        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        term.draw(|f| t.draw(f)).unwrap();
-        let row = t
-            .row_of(|target| matches!(target, HitTarget::CopyCode(_)))
-            .expect("code block on screen");
-        t.handle(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }));
+        let (mut t, row) = tui_with_a_code_block();
+        click(&mut t, row);
         assert_eq!(t.last_copied.as_deref(), Some("echo hi\n"));
     }
 
@@ -816,20 +943,10 @@ mod tests {
             .expect("code block on screen") as u16;
         assert!(code_row > 0, "the code row sits below the top margin");
         // The margin row is not backed by any transcript line, so a click there must miss.
-        t.handle(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }));
+        click(&mut t, 0);
         assert_eq!(t.last_copied, None, "the margin row is not a hit target");
         // The code block's actual screen row, shifted down by the margin, still resolves.
-        t.handle(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: code_row,
-            modifiers: KeyModifiers::NONE,
-        }));
+        click(&mut t, code_row);
         assert_eq!(t.last_copied.as_deref(), Some("echo hi\n"));
     }
 
@@ -1136,12 +1253,327 @@ mod tests {
     }
 
     fn click(t: &mut Tui, row: u16) {
+        mouse(t, MouseEventKind::Down(MouseButton::Left), 2, row);
+        mouse(t, MouseEventKind::Up(MouseButton::Left), 2, row);
+    }
+
+    fn mouse(t: &mut Tui, kind: MouseEventKind, column: u16, row: u16) {
         t.handle(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
+            kind,
+            column,
             row,
             modifiers: KeyModifiers::NONE,
         }));
+    }
+
+    /// The screen column and row where `needle` first appears.
+    fn find(shown: &str, needle: &str) -> (u16, u16) {
+        use unicode_width::UnicodeWidthStr;
+        shown
+            .lines()
+            .enumerate()
+            .find_map(|(y, row)| {
+                row.find(needle)
+                    .map(|i| (row[..i].width() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{shown}"))
+    }
+
+    fn numbered_rows(t: &mut Tui) {
+        let messages: Vec<_> = (1..=30)
+            .map(|i| json!({"id": i, "role": "assistant", "content": [{"type": "text", "text": format!("row {i:02}")}]}))
+            .collect();
+        loaded(t, serde_json::Value::Array(messages));
+    }
+
+    fn reversed(t: &mut Tui, w: u16, h: u16, x: u16, y: u16) -> bool {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| t.draw(f)).unwrap();
+        term.backend().buffer()[(x, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    }
+
+    /// Whether the first cell of `needle` on screen is highlighted, wherever it now is.
+    fn highlighted(t: &mut Tui, w: u16, h: u16, needle: &str) -> bool {
+        let (x, y) = find(&screen(t, w, h), needle);
+        reversed(t, w, h, x, y)
+    }
+
+    /// Presses at `from`, drags to `to`, and releases there.
+    fn drag(t: &mut Tui, from: (u16, u16), to: (u16, u16)) {
+        mouse(t, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+        mouse(t, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+        mouse(t, MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+    }
+
+    #[test]
+    fn dragging_selects_highlights_and_copies_on_release() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "alpha beta gamma"}]}]),
+        );
+        let shown = screen(&mut t, 60, 20);
+        let (x, y) = find(&shown, "beta");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 9, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 9, y);
+        assert_eq!(t.last_copied.as_deref(), Some("beta gamma"));
+        assert!(reversed(&mut t, 60, 20, x, y));
+        assert!(reversed(&mut t, 60, 20, x + 9, y));
+        assert!(!reversed(&mut t, 60, 20, x + 10, y));
+    }
+
+    #[test]
+    fn a_selection_across_wrapped_lines_copies_the_original_text() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": text}]}]),
+        );
+        let shown = screen(&mut t, 24, 20);
+        let (x0, y0) = find(&shown, "one two");
+        let (x1, y1) = find(&shown, "twelve");
+        assert!(
+            y1 > y0 + 1,
+            "the text wraps over at least three rows:\n{shown}"
+        );
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x0, y0);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x1 + 5, y1);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x1 + 5, y1);
+        assert_eq!(t.last_copied.as_deref(), Some(text));
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_text_when_scrolled() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(t.last_copied.as_deref(), Some("row 26"));
+        mouse(&mut t, MouseEventKind::ScrollUp, x, y);
+        let scrolled = screen(&mut t, 40, 24);
+        assert_eq!(find(&scrolled, "row 26"), (x, y + 3), "{scrolled}");
+        assert!(
+            reversed(&mut t, 40, 24, x, y + 3),
+            "the highlight moved with the text"
+        );
+        assert!(
+            !reversed(&mut t, 40, 24, x, y),
+            "and left the old screen row"
+        );
+    }
+
+    #[test]
+    fn streaming_during_a_drag_keeps_the_text_under_the_pointer() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        for seq in 1..=10 {
+            t.update(live_part(
+                seq,
+                json!({"type": "text", "text": "streamed line\n\n"}),
+            ));
+            let now = screen(&mut t, 40, 24);
+            assert_eq!(find(&now, "row 26"), (x, y), "the text moved:\n{now}");
+        }
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(t.last_copied.as_deref(), Some("row 26"));
+    }
+
+    #[test]
+    fn a_key_press_clears_the_selection() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert!(reversed(&mut t, 40, 24, x, y));
+        t.handle(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!reversed(&mut t, 40, 24, x, y));
+    }
+
+    fn status(s: &str) -> Msg {
+        stream(json!({"type": "status", "status": {"status": s}}))
+    }
+
+    #[test]
+    fn a_drag_keeps_its_text_when_the_activity_row_appears() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        let (bx, by) = find(&shown, "row 30");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        t.update(status("running"));
+        let now = screen(&mut t, 40, 24);
+        assert!(
+            now.contains("Working…"),
+            "the activity row appeared:\n{now}"
+        );
+        assert_eq!(find(&now, "row 26"), (x, y), "the text moved:\n{now}");
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(t.last_copied.as_deref(), Some("row 26"));
+        assert!(
+            highlighted(&mut t, 40, 24, "row 26"),
+            "the highlight is on the text"
+        );
+
+        // The press lands on the last transcript row, which the activity row then covers.
+        let mut t = tui();
+        numbered_rows(&mut t);
+        assert_eq!(find(&screen(&mut t, 40, 24), "row 30"), (bx, by));
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), bx, by);
+        t.update(status("running"));
+        screen(&mut t, 40, 24);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), bx + 5, by);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), bx + 5, by);
+        assert_eq!(t.last_copied.as_deref(), Some("row 30"));
+    }
+
+    #[test]
+    fn a_drag_keeps_its_text_when_the_activity_row_disappears() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        t.update(status("running"));
+        let shown = screen(&mut t, 40, 24);
+        assert!(shown.contains("Working…"), "{shown}");
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        t.update(status("waiting"));
+        let now = screen(&mut t, 40, 24);
+        assert!(!now.contains("Working…"), "the activity row left:\n{now}");
+        assert_eq!(find(&now, "row 26"), (x, y), "the text moved:\n{now}");
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(t.last_copied.as_deref(), Some("row 26"));
+        assert!(
+            highlighted(&mut t, 40, 24, "row 26"),
+            "the highlight is on the text"
+        );
+    }
+
+    #[test]
+    fn a_selection_across_a_rule_leaves_the_rule_out() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([
+                {"id": 1, "role": "assistant", "content": [
+                    {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}}
+                ]},
+                {"id": 2, "role": "tool", "content": [
+                    {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}}
+                ]},
+                {"id": 3, "role": "assistant", "content": [{"type": "text", "text": "All fixed."}]}
+            ]),
+        );
+        let shown = screen(&mut t, 40, 20);
+        let (x0, y0) = find(&shown, "execute");
+        let (x1, y1) = find(&shown, "All fixed.");
+        let (_, rule) = find(&shown, "────");
+        assert!(y0 < rule && rule < y1, "{shown}");
+        drag(&mut t, (x0, y0), (x1 + 9, y1));
+        let copied = t.last_copied.clone().expect("copied");
+        assert!(copied.starts_with("execute"), "{copied:?}");
+        assert!(copied.ends_with("All fixed."), "{copied:?}");
+        assert!(!copied.contains('─'), "the rule is left out: {copied:?}");
+        assert!(
+            !copied.contains("\n\n\n"),
+            "the rule leaves one paragraph break: {copied:?}"
+        );
+        assert!(
+            !reversed(&mut t, 40, 20, 20, rule),
+            "the rule is not highlighted"
+        );
+    }
+
+    #[test]
+    fn a_click_acts_on_release_and_survives_a_jiggle() {
+        let (mut t, row) = tui_with_a_code_block();
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), 2, row);
+        assert_eq!(t.last_copied, None, "a press alone does nothing");
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), 2, row);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), 2, row);
+        assert_eq!(
+            t.last_copied.as_deref(),
+            Some("echo hi\n"),
+            "a movement within the cell is still a click"
+        );
+    }
+
+    #[test]
+    fn a_click_toggles_a_tool_block() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}}
+            ]}]),
+        );
+        screen(&mut t, 60, 20);
+        let row = t
+            .row_of(|target| matches!(target, HitTarget::Toggle(_)))
+            .expect("tool block on screen");
+        click(&mut t, row);
+        assert_eq!(t.toggles.len(), 1, "the click toggled the block");
+        click(&mut t, row);
+        assert!(t.toggles.is_empty(), "a second click toggles it back");
+    }
+
+    #[test]
+    fn an_empty_selection_copies_nothing() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "short"}]}]),
+        );
+        let shown = screen(&mut t, 60, 20);
+        let (_, y) = find(&shown, "short");
+        let notices = t.core.notices.len();
+        drag(&mut t, (40, y), (50, y));
+        assert_eq!(t.last_copied, None);
+        assert_eq!(t.core.notices.len(), notices, "no notice");
+    }
+
+    #[test]
+    fn with_the_mouse_off_nothing_is_selected() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        t.update(Msg::Command(scuttle_core::commands::Command::Mouse));
+        assert!(!t.core.mouse);
+        drag(&mut t, (x, y), (x + 5, y));
+        assert_eq!(t.last_copied, None);
+        assert!(!reversed(&mut t, 40, 24, x, y));
+    }
+
+    #[test]
+    fn turning_the_mouse_off_mid_drag_releases_the_view() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        for e in t.update(Msg::Command(scuttle_core::commands::Command::Mouse)) {
+            t.apply_ui_effect(&e);
+        }
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(t.last_copied, None, "the drag ended with the capture");
+        assert!(!reversed(&mut t, 40, 24, x, y));
     }
 
     #[test]

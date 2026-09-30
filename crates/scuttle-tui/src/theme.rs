@@ -15,6 +15,8 @@ pub struct Theme {
     pub user_tint: Style,
     /// The rule between a turn's work and its answer, in the terminal's own foreground.
     pub rule: Style,
+    /// Text selected with the mouse.
+    pub selection: Style,
 }
 
 impl Theme {
@@ -34,6 +36,7 @@ impl Theme {
             warn: Style::new().fg(Color::Yellow),
             user_tint: Style::new().bg(tint),
             rule: Style::new().add_modifier(Modifier::BOLD),
+            selection: Style::new().add_modifier(Modifier::REVERSED),
         }
     }
 }

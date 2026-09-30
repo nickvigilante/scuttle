@@ -35,6 +35,8 @@ pub struct LineMeta {
     pub continuation: bool,
     /// The row belongs to one of the user's own messages, which the TUI tints.
     pub user: bool,
+    /// The row is a rule between a turn's work and its answer, which a selection leaves out.
+    pub rule: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,10 +99,24 @@ struct Ctx<'c> {
 impl Out<'_> {
     /// Appends wrapped rows with their metadata and returns their range.
     fn extend_rows(&mut self, rows: Vec<(Line<'static>, bool)>, user: bool) -> Range<usize> {
+        self.extend_marked(
+            rows,
+            LineMeta {
+                user,
+                ..LineMeta::default()
+            },
+        )
+    }
+
+    /// Appends wrapped rows that all share `meta` apart from their continuation flag.
+    fn extend_marked(&mut self, rows: Vec<(Line<'static>, bool)>, meta: LineMeta) -> Range<usize> {
         let start = self.view.lines.len();
         for (line, continuation) in rows {
             self.view.lines.push(line);
-            self.view.meta.push(LineMeta { continuation, user });
+            self.view.meta.push(LineMeta {
+                continuation,
+                ..meta
+            });
         }
         start..self.view.lines.len()
     }
@@ -141,7 +157,13 @@ impl Out<'_> {
             "─".repeat(self.width as usize),
             self.theme.rule,
         ));
-        self.extend_rows(vec![(line, false)], false);
+        self.extend_marked(
+            vec![(line, false)],
+            LineMeta {
+                rule: true,
+                ..LineMeta::default()
+            },
+        );
     }
 }
 
@@ -1003,6 +1025,10 @@ mod tests {
         let tool = lines.iter().position(|l| l.contains("execute")).unwrap();
         let answer = lines.iter().position(|l| l.contains("All fixed.")).unwrap();
         assert!(tool < rule && rule < answer, "{lines:?}");
+        let marked: Vec<usize> = (0..view.meta.len())
+            .filter(|&i| view.meta[i].rule)
+            .collect();
+        assert_eq!(marked, vec![rule], "only the rule row is marked");
     }
 
     #[test]
