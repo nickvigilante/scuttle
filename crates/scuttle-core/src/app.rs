@@ -2,13 +2,13 @@
 
 use std::time::Duration;
 
-use coder_sdk::{ChatStatus, StreamEvent, types};
+use coder_sdk::{ChatStatus, StreamEvent, StreamEventType, types};
 use uuid::Uuid;
 
 use crate::commands::{self, Command};
 use crate::config::BusyBehavior;
 use crate::density::DisplayPrefs;
-use crate::live::Applied;
+use crate::live::{Applied, LiveBlock};
 use crate::transcript::Transcript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +82,20 @@ pub enum ModelsState {
 pub enum CopyTarget {
     LastMessage,
     CodeBlock(usize),
+}
+
+/// What the agent is doing, for the animated activity line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity {
+    /// A message was sent and the agent has not picked it up yet.
+    Waiting,
+    Thinking,
+    /// A tool call is running; holds the tool name, which may still be empty while it streams.
+    Tool(String),
+    Writing,
+    Interrupting,
+    /// Running, with nothing streamed for the current step yet.
+    Working,
 }
 
 #[derive(Debug)]
@@ -221,6 +235,9 @@ pub struct App {
     failed_load: Option<Uuid>,
     /// Text submitted while a chat is being created or loaded, sent once it exists.
     pending_text: Option<String>,
+    /// Set by a submit that sends or queues a message, and cleared once the chat reports a
+    /// status other than `waiting`, an error, or a failed send.
+    awaiting_reply: bool,
     reconnect_attempt: u32,
 }
 
@@ -259,6 +276,38 @@ impl App {
         })?;
         let model = self.models.iter().find(|m| m.id == Some(id))?;
         model.display_name.clone().or_else(|| model.model.clone())
+    }
+
+    /// What the agent is doing, or `None` while it is idle or waiting on the user.
+    pub fn activity(&self) -> Option<Activity> {
+        match self.transcript.status {
+            Some(ChatStatus::Interrupting) => Some(Activity::Interrupting),
+            Some(ChatStatus::Running) => Some(match self.transcript.live.blocks.last() {
+                Some(LiveBlock::Reasoning(_)) => Activity::Thinking,
+                Some(LiveBlock::Text(_)) => Activity::Writing,
+                Some(LiveBlock::ToolCall { name, .. })
+                | Some(LiveBlock::ToolResult {
+                    name, done: false, ..
+                }) => Activity::Tool(name.clone()),
+                _ if self.awaiting_reply => Activity::Waiting,
+                _ => Activity::Working,
+            }),
+            _ if self.awaiting_reply => Some(Activity::Waiting),
+            _ => None,
+        }
+    }
+
+    /// Whether `ev`, already applied, means the agent picked up the sent message or gave up.
+    /// A `waiting` status does not count: a snapshot or the end of an earlier turn can report
+    /// it before the new message starts.
+    fn ends_wait(&self, ev: &StreamEvent) -> bool {
+        match ev.kind {
+            StreamEventType::Status => {
+                !matches!(self.transcript.status, None | Some(ChatStatus::Waiting))
+            }
+            StreamEventType::Error => true,
+            _ => false,
+        }
     }
 
     /// The open chat's organization, else the one new chats go to.
@@ -410,6 +459,7 @@ impl App {
             }
             Msg::CreateFailed { message } => self.fail_create(message),
             Msg::SendFailed { text, message } => {
+                self.awaiting_reply = false;
                 self.error(format!("Could not send the message: {message}"));
                 vec![Effect::RestoreComposer(text)]
             }
@@ -438,6 +488,9 @@ impl App {
                     self.connection = Connection::Live;
                     self.reconnect_attempt = 0;
                     self.last_stream_error = None;
+                    if self.ends_wait(&ev) {
+                        self.awaiting_reply = false;
+                    }
                     vec![]
                 }
             },
@@ -503,6 +556,7 @@ impl App {
     /// Restores whatever text was typed for the failed `Effect::CreateChat` (and anything
     /// queued behind it) to the composer, and records the failure.
     fn fail_create(&mut self, message: String) -> Vec<Effect> {
+        self.awaiting_reply = false;
         let in_flight = self.creating.take().unwrap_or_default();
         let restored = match self.pending_text.take() {
             Some(pending) => format!("{in_flight}\n\n{pending}"),
@@ -519,7 +573,10 @@ impl App {
     /// Puts text queued behind a chat load back in the composer once that load has failed.
     fn restore_pending(&mut self) -> Vec<Effect> {
         match self.pending_text.take() {
-            Some(text) => vec![Effect::RestoreComposer(text)],
+            Some(text) => {
+                self.awaiting_reply = false;
+                vec![Effect::RestoreComposer(text)]
+            }
             None => vec![],
         }
     }
@@ -546,6 +603,7 @@ impl App {
             };
         }
         if let Some(chat) = self.chat_id {
+            self.awaiting_reply = true;
             return vec![Effect::SendMessage {
                 chat,
                 text,
@@ -555,16 +613,19 @@ impl App {
         }
         if self.creating.is_some() {
             self.queue_pending(text);
+            self.awaiting_reply = true;
             self.info("Waiting for the chat to be created; your message will follow.");
             return vec![];
         }
         if self.loading.is_some() {
             self.queue_pending(text);
+            self.awaiting_reply = true;
             self.info("Waiting for the chat to load; your message will follow.");
             return vec![];
         }
         if let Some(id) = self.failed_load.take() {
             self.queue_pending(text);
+            self.awaiting_reply = true;
             self.loading = Some(id);
             self.connection = Connection::Connecting;
             self.info("Retrying the chat load.");
@@ -580,6 +641,7 @@ impl App {
             return vec![Effect::RestoreComposer(text)];
         }
         self.creating = Some(text.clone());
+        self.awaiting_reply = true;
         vec![Effect::CreateChat {
             org,
             text,
@@ -1509,5 +1571,99 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_millis(500));
         assert_eq!(backoff(3), Duration::from_millis(2000));
         assert_eq!(backoff(20), Duration::from_secs(10));
+    }
+
+    fn text_part(seq: i64, kind: &str, text: &str) -> Msg {
+        ev(
+            json!({"type": "message_part", "message_part": {"history_version": 1, "generation_attempt": 1, "seq": seq, "part": {"type": kind, "text": text}}}),
+        )
+    }
+
+    fn status(s: &str) -> Msg {
+        ev(json!({"type": "status", "status": {"status": s}}))
+    }
+
+    #[test]
+    fn activity_follows_the_whole_turn() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        assert_eq!(app.activity(), None);
+        app.update(Msg::Submit("hi".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        app.update(ev(json!({"type": "message", "message": {"id": 1, "role": "user", "content": [{"type": "text", "text": "hi"}]}})));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Waiting),
+            "the echo of our own message"
+        );
+        app.update(status("waiting"));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Waiting),
+            "a stale waiting status"
+        );
+        app.update(status("running"));
+        assert_eq!(app.activity(), Some(Activity::Working));
+        app.update(text_part(1, "reasoning", "hmm"));
+        assert_eq!(app.activity(), Some(Activity::Thinking));
+        app.update(ev(json!({"type": "message_part", "message_part": {"history_version": 1, "generation_attempt": 1, "seq": 2, "part": {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args_delta": "{"}}})));
+        assert_eq!(app.activity(), Some(Activity::Tool("execute".into())));
+        app.update(text_part(3, "text", "Done"));
+        assert_eq!(app.activity(), Some(Activity::Writing));
+        app.update(ev(json!({"type": "message", "message": {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "Done"}]}})));
+        assert_eq!(
+            app.activity(),
+            Some(Activity::Working),
+            "running until the status changes"
+        );
+        app.update(status("interrupting"));
+        assert_eq!(app.activity(), Some(Activity::Interrupting));
+        app.update(status("waiting"));
+        assert_eq!(app.activity(), None);
+    }
+
+    #[test]
+    fn a_failed_send_or_create_stops_the_wait() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("hi".into()));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        app.update(Msg::CreateFailed {
+            message: "HTTP 500".into(),
+        });
+        assert_eq!(app.activity(), None);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        app.update(Msg::Submit("again".into()));
+        app.update(Msg::SendFailed {
+            text: "again".into(),
+            message: "HTTP 409".into(),
+        });
+        assert_eq!(app.activity(), None);
+        app.update(Msg::Submit("third".into()));
+        app.update(ev(
+            json!({"type": "error", "error": {"message": "provider down"}}),
+        ));
+        assert_eq!(app.activity(), None);
+    }
+
+    #[test]
+    fn requires_action_is_not_working() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        app.update(status("requires_action"));
+        assert_eq!(app.activity(), None);
     }
 }

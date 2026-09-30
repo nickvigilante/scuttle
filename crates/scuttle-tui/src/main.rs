@@ -1,3 +1,4 @@
+mod activity;
 mod app;
 mod clipboard;
 mod composer;
@@ -46,6 +47,17 @@ async fn sleep_until(deadline: Option<std::time::Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
         None => std::future::pending().await,
+    }
+}
+
+/// The earlier of two optional deadlines.
+fn earliest(
+    a: Option<std::time::Instant>,
+    b: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -204,7 +216,13 @@ async fn main() -> ExitCode {
         if term.draw(|f| tui.draw(f)).is_err() {
             break ExitCode::FAILURE;
         }
-        let deadline = tui.notice_deadline();
+        let deadline = earliest(
+            tui.notice_deadline(),
+            tui.animation_deadline(std::time::Instant::now()),
+        );
+        // Each iteration handles at most one terminal event before the next draw: the composer
+        // learns its wrap width only when it renders, so a second key must not arrive before
+        // that. Channel messages may be drained in a batch, and a timer wakeup handles no input.
         tokio::select! {
             item = events.next() => match next_input(item) {
                 ControlFlow::Continue(ev) => pending = tui.handle(ev),
@@ -215,7 +233,7 @@ async fn main() -> ExitCode {
                 }
             },
             Some(msg) = rx.recv() => pending = update_queued(&mut tui, msg, &mut rx),
-            () = sleep_until(deadline) => {}
+            () = sleep_until(deadline) => tui.tick(),
             else => break ExitCode::SUCCESS,
         }
     };
@@ -290,5 +308,15 @@ mod tests {
         update_queued(&mut t, first, &mut rx);
         assert_eq!(t.core.notices.len(), 3);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn earliest_picks_the_sooner_deadline() {
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
+        assert_eq!(earliest(Some(later), Some(now)), Some(now));
+        assert_eq!(earliest(None, Some(later)), Some(later));
+        assert_eq!(earliest(Some(now), None), Some(now));
+        assert_eq!(earliest(None, None), None);
     }
 }

@@ -16,6 +16,7 @@ use scuttle_core::commands::COMMANDS;
 use scuttle_core::config::{self, LocalConfig};
 use scuttle_core::density::SendShortcut;
 
+use crate::activity::{SPINNER_INTERVAL, activity_line};
 use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
@@ -89,6 +90,15 @@ pub struct Tui {
     keyboard_enhanced: bool,
     /// Set when the app must quit with an error, for example when the terminal cannot be restored.
     fatal: Option<String>,
+    /// When the Tui was made; the spinner frame is a function of the time since.
+    epoch: Instant,
+    /// Set by `tick` for a timer wakeup, where only the clock changed, so `draw_at` reuses the
+    /// transcript lines instead of rebuilding them. Cleared by every draw.
+    reuse_view: bool,
+    /// The transcript width `view` was built for.
+    view_width: u16,
+    /// How many times `draw_at` rebuilt the transcript lines; tests check timer frames reuse them.
+    view_builds: usize,
 }
 
 impl Tui {
@@ -122,6 +132,10 @@ impl Tui {
             needs_full_redraw: false,
             keyboard_enhanced: true,
             fatal: None,
+            epoch: Instant::now(),
+            reuse_view: false,
+            view_width: 0,
+            view_builds: 0,
         }
     }
 
@@ -204,6 +218,16 @@ impl Tui {
     /// Whether the next draw must repaint every cell. Resets the request.
     pub fn take_full_redraw(&mut self) -> bool {
         std::mem::take(&mut self.needs_full_redraw)
+    }
+
+    /// When the spinner needs its next frame, or `None` while the agent is idle.
+    pub fn animation_deadline(&self, now: Instant) -> Option<Instant> {
+        self.core.activity().map(|_| now + SPINNER_INTERVAL)
+    }
+
+    /// Marks the next draw as a timer wakeup: nothing but the clock changed since the last one.
+    pub fn tick(&mut self) {
+        self.reuse_view = true;
     }
 
     fn copy(&mut self, text: String) {
@@ -527,28 +551,41 @@ impl Tui {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
+        self.draw_at(f, Instant::now());
+    }
+
+    /// Draws the screen as of `now`, which picks the spinner frame and expires notices.
+    pub fn draw_at(&mut self, f: &mut Frame, now: Instant) {
         self.prune_live_toggles();
-        self.sync_notice(Instant::now());
+        self.sync_notice(now);
         let outer = padded(f.area());
+        let activity = self.core.activity();
+        let activity_height = u16::from(activity.is_some());
         let composer_height = self
             .composer
             .height(outer.width)
-            .min(outer.height.saturating_sub(2).max(3));
-        let [transcript, composer, footer] = Layout::vertical([
+            .min(outer.height.saturating_sub(2 + activity_height).max(3));
+        let [transcript, activity_row, composer, footer] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(activity_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
         .areas(outer);
         self.area = transcript;
-        self.view = transcript_view::build(
-            &self.core,
-            &self.config.density,
-            &self.toggles,
-            &self.welcome,
-            &self.theme,
-            transcript.width,
-        );
+        let reuse = std::mem::take(&mut self.reuse_view) && self.view_width == transcript.width;
+        if !reuse {
+            self.view = transcript_view::build(
+                &self.core,
+                &self.config.density,
+                &self.toggles,
+                &self.welcome,
+                &self.theme,
+                transcript.width,
+            );
+            self.view_width = transcript.width;
+            self.view_builds += 1;
+        }
         self.scroll_from_bottom = self.scroll_from_bottom.min(self.max_scroll());
         let top = self.top_line();
         let visible: Vec<Line> = self
@@ -560,6 +597,13 @@ impl Tui {
             .cloned()
             .collect();
         f.render_widget(Paragraph::new(visible), transcript);
+        if let Some(activity) = activity.as_ref() {
+            let elapsed = now.saturating_duration_since(self.epoch);
+            f.render_widget(
+                Paragraph::new(activity_line(activity, elapsed, &self.theme)),
+                activity_row,
+            );
+        }
         let frame = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(self.theme.dim);
@@ -1162,5 +1206,122 @@ mod tests {
         assert_eq!(t.composer.text(), "edited");
         assert!(t.take_full_redraw());
         assert!(!t.take_full_redraw());
+    }
+
+    fn screen_at(t: &mut Tui, w: u16, h: u16, now: Instant) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| t.draw_at(f, now)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Loads a chat with `messages` into the Tui.
+    fn loaded(t: &mut Tui, messages: serde_json::Value) {
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
+        t.update(Msg::ChatLoaded {
+            chat: Box::new(chat),
+            messages: serde_json::from_value(messages).unwrap(),
+        });
+    }
+
+    fn stream(v: serde_json::Value) -> Msg {
+        Msg::Stream(coder_sdk::StreamEvent {
+            kind: coder_sdk::StreamEventType::parse(v["type"].as_str().unwrap_or_default()),
+            event: serde_json::from_value(v.clone()).ok(),
+            raw: v,
+        })
+    }
+
+    fn live_part(seq: i64, part: serde_json::Value) -> Msg {
+        stream(
+            json!({"type": "message_part", "message_part": {"history_version": 1, "generation_attempt": 1, "seq": seq, "part": part}}),
+        )
+    }
+
+    #[test]
+    fn the_spinner_shows_from_submit_and_animates() {
+        let mut t = tui();
+        t.core.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        loaded(&mut t, json!([]));
+        let now = Instant::now();
+        assert_eq!(t.animation_deadline(now), None, "no timer while idle");
+        for c in "hi".chars() {
+            t.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            t.animation_deadline(now),
+            Some(now + crate::activity::SPINNER_INTERVAL)
+        );
+        let first = screen_at(&mut t, 60, 16, now);
+        assert!(first.contains("Waiting for the agent…"), "{first}");
+        let later = screen_at(&mut t, 60, 16, now + crate::activity::SPINNER_INTERVAL);
+        assert_ne!(first, later, "the spinner advanced");
+    }
+
+    #[test]
+    fn the_spinner_keeps_going_while_the_agent_streams() {
+        let mut t = tui();
+        loaded(&mut t, json!([]));
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        assert!(screen(&mut t, 60, 16).contains("Working…"));
+        t.update(live_part(1, json!({"type": "reasoning", "text": "hmm"})));
+        assert!(screen(&mut t, 60, 16).contains("Thinking…"));
+        t.update(live_part(2, json!({"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args_delta": "{"})));
+        assert!(screen(&mut t, 60, 16).contains("Running execute…"));
+        t.update(live_part(3, json!({"type": "text", "text": "Done"})));
+        assert!(screen(&mut t, 60, 16).contains("Writing…"));
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "waiting"}}),
+        ));
+        let idle = screen(&mut t, 60, 16);
+        assert!(
+            !idle.contains("Writing…") && !idle.contains("Working…"),
+            "{idle}"
+        );
+        assert_eq!(t.animation_deadline(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_spinner_tick_reuses_the_transcript_lines() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "hello"}]}]),
+        );
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        let now = Instant::now();
+        screen_at(&mut t, 60, 16, now);
+        assert_eq!(t.view_builds, 1);
+        t.tick();
+        let ticked = screen_at(&mut t, 60, 16, now + crate::activity::SPINNER_INTERVAL);
+        assert_eq!(
+            t.view_builds, 1,
+            "a timer frame must not rebuild the transcript"
+        );
+        assert!(
+            ticked.contains("hello") && ticked.contains("Working…"),
+            "{ticked}"
+        );
+        t.update(Msg::Refresh);
+        screen_at(&mut t, 60, 16, now);
+        assert_eq!(t.view_builds, 2, "a message rebuilds");
+        t.tick();
+        screen_at(&mut t, 70, 16, now);
+        assert_eq!(t.view_builds, 3, "a resize rebuilds even on a timer frame");
     }
 }
