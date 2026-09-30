@@ -1266,6 +1266,18 @@ mod tests {
     }
 
     #[test]
+    fn result_summary_ignores_malformed_results() {
+        assert_eq!(result_summary(Some(&json!("not json"))), None);
+        assert_eq!(result_summary(Some(&json!(42))), None);
+        assert_eq!(result_summary(Some(&json!([1, 2]))), None);
+        assert_eq!(
+            result_summary(Some(&json!("[1,2]"))),
+            None,
+            "a JSON string holding a non-object"
+        );
+    }
+
+    #[test]
     fn a_call_without_useful_arguments_is_named_from_its_result() {
         let app = app_with(json!([
             {"id": 1, "role": "assistant", "content": [
