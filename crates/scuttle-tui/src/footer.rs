@@ -55,7 +55,10 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
     }
     let mut parts = Vec::new();
     if let Some(name) = app.model_name() {
-        parts.push(name);
+        parts.push(match app.effort() {
+            Some(effort) => format!("{name} ({effort})"),
+            None => name,
+        });
     }
     if let Some(u) = context_usage(app.transcript.messages()) {
         match u.limit {
@@ -364,5 +367,14 @@ mod tests {
         )));
         let t = status_text(&app);
         assert!(t.contains("plan mode · waiting"), "{t}");
+    }
+
+    #[test]
+    fn the_effort_shows_next_to_the_model() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::ModelsLoaded(vec![serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "display_name": "Thinker", "is_default": true, "enabled": true, "reasoning_efforts": ["low", "high"]})).unwrap()]));
+        assert_eq!(status_text(&app), "Thinker (high) · new chat");
+        app.update(Msg::EffortChosen("low".into()));
+        assert_eq!(status_text(&app), "Thinker (low) · new chat");
     }
 }

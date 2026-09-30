@@ -89,7 +89,7 @@ pub enum CopyTarget {
 /// Options that ride along with a new chat or a sent message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnOptions {
-    /// The reasoning effort chosen with `/effort`; `None` leaves the server's default.
+    /// The reasoning effort to send, from `App::effort`; `None` only when the model offers none.
     pub effort: Option<String>,
     /// Switches the chat's plan mode with this request: `Some(true)` on, `Some(false)` off,
     /// `None` no change.
@@ -282,7 +282,8 @@ pub struct App {
     lists_org: Option<Uuid>,
     pub selected_model: Option<Uuid>,
     pub selected_workspace: Option<Uuid>,
-    /// The reasoning effort chosen with `/effort`, sent only while the current model offers it.
+    /// The reasoning effort chosen with `/effort`. It wins over the open chat's last effort
+    /// while the current model offers it.
     pub selected_effort: Option<String>,
     /// Whether plan mode is on for the chat, or for the chat the next message creates.
     pub plan_mode: bool,
@@ -360,24 +361,21 @@ impl App {
             .unwrap_or(&[])
     }
 
-    /// The effort sent with the next message: the chosen one, if the current model offers it.
+    /// The effort sent with the next message, picked the way the web UI picks it
+    /// (`pickReasoningEffort` in `site/src/pages/AgentsPage/utils/reasoningEffort.ts:32-50`,
+    /// called from `AgentChatPage.tsx:464-471`): the one chosen with `/effort`, else the open
+    /// chat's last one, if the current model offers it; else the model's default, if offered;
+    /// else the highest. `None` only when the model offers no efforts.
     pub fn effort(&self) -> Option<String> {
-        self.selected_effort
-            .clone()
-            .filter(|e| self.efforts().contains(e))
-    }
-
-    /// The effort to show as current: the chosen one, else the chat's last one, else the
-    /// model's default, each only if the current model offers it.
-    pub fn effort_label(&self) -> Option<String> {
-        let offered = |e: &String| self.efforts().contains(e);
-        self.effort()
-            .or_else(|| {
-                self.chat
-                    .as_ref()
-                    .and_then(|c| c.last_reasoning_effort.clone())
-                    .filter(offered)
-            })
+        let efforts = self.efforts();
+        let offered = |e: &String| efforts.contains(e);
+        let wanted = self.selected_effort.clone().or_else(|| {
+            self.chat
+                .as_ref()
+                .and_then(|c| c.last_reasoning_effort.clone())
+        });
+        wanted
+            .filter(offered)
             .or_else(|| {
                 self.current_model()
                     .and_then(|m| m.model_config.as_ref())
@@ -385,6 +383,7 @@ impl App {
                     .and_then(|r| r.default.clone())
                     .filter(offered)
             })
+            .or_else(|| efforts.last().cloned())
     }
 
     /// Options for the next message sent to an existing chat.
@@ -794,9 +793,13 @@ impl App {
                     .is_some_and(|e| !self.efforts().contains(e))
                 {
                     let effort = self.selected_effort.take().unwrap_or_default();
-                    self.info(format!(
-                        "This model does not offer {effort} reasoning effort; using its default."
-                    ));
+                    let note = match self.effort() {
+                        Some(now) => format!(
+                            "This model does not offer {effort} reasoning effort; using {now}."
+                        ),
+                        None => format!("This model does not offer {effort} reasoning effort."),
+                    };
+                    self.info(note);
                 }
                 vec![]
             }
@@ -1289,23 +1292,126 @@ mod tests {
         assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still loading")));
     }
 
+    fn chat_with_effort(effort: &str) -> Box<types::CodersdkChat> {
+        Box::new(
+            serde_json::from_value(json!({"id": Uuid::new_v4(), "title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}, "last_reasoning_effort": effort}))
+                .unwrap(),
+        )
+    }
+
     #[test]
-    fn the_effort_label_prefers_the_choice_then_the_chat_then_the_default() {
+    fn the_effort_prefers_the_choice_then_the_chat_then_the_default() {
         let mut app = App::new(BusyBehavior::Queue, true);
         started(&mut app);
         with_efforts(&mut app);
-        assert_eq!(app.effort_label().as_deref(), Some("medium"));
-        let with_last: Box<types::CodersdkChat> = Box::new(
-            serde_json::from_value(json!({"id": Uuid::new_v4(), "title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}, "last_reasoning_effort": "low"}))
-                .unwrap(),
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("medium"),
+            "the model's default"
         );
         app.update(Msg::ChatLoaded {
-            chat: with_last,
+            chat: chat_with_effort("low"),
             messages: vec![],
         });
-        assert_eq!(app.effort_label().as_deref(), Some("low"));
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("low"),
+            "the chat's last effort"
+        );
         app.update(Msg::EffortChosen("high".into()));
-        assert_eq!(app.effort_label().as_deref(), Some("high"));
+        assert_eq!(app.effort().as_deref(), Some("high"), "the /effort choice");
+    }
+
+    #[test]
+    fn an_opened_chat_sends_its_last_effort_with_every_message() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        with_efforts(&mut app);
+        let chat = chat_with_effort("low");
+        let id = chat.id.unwrap();
+        app.update(Msg::ChatLoaded {
+            chat,
+            messages: vec![],
+        });
+        for text in ["one", "two"] {
+            assert_eq!(
+                app.update(Msg::Submit(text.into())),
+                vec![Effect::SendMessage {
+                    chat: id,
+                    text: text.into(),
+                    model: None,
+                    busy: BusyBehavior::Queue,
+                    turn: TurnOptions {
+                        effort: Some("low".into()),
+                        ..Default::default()
+                    },
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_chat_sends_the_model_default_effort() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        with_efforts(&mut app);
+        assert_eq!(
+            app.update(Msg::Submit("hi".into())),
+            vec![Effect::CreateChat {
+                org,
+                text: "hi".into(),
+                model: None,
+                workspace: None,
+                turn: TurnOptions {
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn an_effort_the_model_does_not_offer_falls_back_to_the_default_then_the_highest() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        with_efforts(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_effort("xhigh"),
+            messages: vec![],
+        });
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("medium"),
+            "the model's default"
+        );
+        app.update(Msg::ModelsLoaded(vec![
+            serde_json::from_value(json!({"id": Uuid::new_v4(), "display_name": "Plain", "enabled": true, "is_default": true, "reasoning_efforts": ["low", "high"]})).unwrap(),
+        ]));
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("high"),
+            "without a default, the highest"
+        );
+    }
+
+    #[test]
+    fn switching_models_names_the_effort_now_used() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        with_efforts(&mut app);
+        let other = Uuid::new_v4();
+        let mut models = app.models.clone();
+        models.push(serde_json::from_value(json!({"id": other, "display_name": "Other", "enabled": true, "reasoning_efforts": ["low", "high"]})).unwrap());
+        app.update(Msg::ModelsLoaded(models));
+        app.update(Msg::EffortChosen("medium".into()));
+        app.update(Msg::ModelChosen(other));
+        assert_eq!(app.selected_effort, None);
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "This model does not offer medium reasoning effort; using high.".into()
+            ))
+        );
     }
 
     fn ev(v: serde_json::Value) -> Msg {

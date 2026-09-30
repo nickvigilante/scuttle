@@ -67,7 +67,7 @@ impl PickerState {
         };
         let selected = match kind {
             Picker::Effort => app
-                .effort_label()
+                .effort()
                 .and_then(|current| items.iter().position(|(name, _)| *name == current))
                 .unwrap_or(0),
             Picker::Organization => app
