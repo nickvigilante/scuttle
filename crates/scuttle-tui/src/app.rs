@@ -876,7 +876,7 @@ impl Tui {
             );
         }
         if let Some(picker) = self.picker.as_ref() {
-            let h = 10.min(transcript.height);
+            let h = picker.height().min(transcript.height);
             picker.render(
                 f,
                 Rect {
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_effort_opens_the_picker_and_enter_sets_the_effort() {
+    fn slash_effort_opens_the_slider_and_enter_saves_the_level() {
         let mut t = tui();
         t.core.update(Msg::ModelsLoaded(
             serde_json::from_value(json!([
@@ -1054,15 +1054,29 @@ mod tests {
             ]))
             .unwrap(),
         ));
-        let effects = t.update(Msg::Submit("/effort".into()));
-        for e in &effects {
-            t.apply_ui_effect(e);
-        }
-        assert!(t.picker.is_some());
-        t.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        let open = |t: &mut Tui| {
+            let effects = t.update(Msg::Submit("/effort".into()));
+            for e in &effects {
+                t.apply_ui_effect(e);
+            }
+            assert!(t.picker.is_some());
+        };
+        open(&mut t);
+        let shown = screen(&mut t, 60, 20);
+        assert!(shown.contains("low   high"), "{shown}");
+        t.handle(key(KeyCode::Left, KeyModifiers::NONE));
         t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(t.picker.is_none());
-        assert_eq!(t.core.selected_effort.as_deref(), Some("high"));
+        assert_eq!(t.core.selected_effort.as_deref(), Some("low"));
+        open(&mut t);
+        t.handle(key(KeyCode::Right, KeyModifiers::NONE));
+        t.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(t.picker.is_none());
+        assert_eq!(
+            t.core.selected_effort.as_deref(),
+            Some("low"),
+            "Esc keeps the effort"
+        );
     }
 
     #[test]
@@ -1323,7 +1337,7 @@ mod tests {
         let top = screen(&mut t, 60, 14);
         assert!(top.contains("/model"), "{top}");
         assert!(!top.contains("Ctrl+C twice"), "{top}");
-        for _ in 0..40 {
+        for _ in 0..45 {
             t.handle(key(KeyCode::Down, KeyModifiers::NONE));
         }
         let bottom = screen(&mut t, 60, 14);

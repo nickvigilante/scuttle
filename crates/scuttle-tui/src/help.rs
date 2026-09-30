@@ -40,6 +40,10 @@ pub const KEYS: &[KeyInfo] = &[
         action: "Complete a slash command",
     },
     KeyInfo {
+        keys: "Left, Right",
+        action: "Move the /effort slider; Enter saves, Esc cancels",
+    },
+    KeyInfo {
         keys: "PageUp, PageDown, wheel",
         action: "Scroll the transcript",
     },
