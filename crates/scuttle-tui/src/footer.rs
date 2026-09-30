@@ -1,4 +1,5 @@
-//! The one-line status footer: model, context, and status, or the given notice.
+//! The one-line status footer: model, context, organization, plan mode, and status, or the
+//! given notice.
 
 use coder_sdk::ChatStatus;
 use ratatui::text::{Line, Span};
@@ -69,6 +70,10 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
             _ => parts.push(format_tokens(u.used)),
         }
     }
+    let org_at = (app.organizations.len() > 1).then(|| {
+        parts.push(app.org_label(app.current_org()));
+        parts.len() - 1
+    });
     if app.plan_mode {
         parts.push("plan mode".into());
     }
@@ -87,6 +92,12 @@ pub fn footer_line(app: &App, notice: Option<&Notice>, theme: &Theme, width: u16
         },
     };
     parts.push(status);
+    // The organization is the least urgent part, so it goes first when the line is too long.
+    if let Some(i) = org_at
+        && UnicodeWidthStr::width(parts.join(" · ").as_str()) > width
+    {
+        parts.remove(i);
+    }
     Line::from(Span::styled(fit(parts.join(" · "), width), theme.dim))
 }
 
@@ -265,6 +276,83 @@ mod tests {
         ));
         assert!(t.contains("12.0k"), "{t}");
         assert!(!t.contains("12.0k/"), "{t}");
+    }
+
+    #[test]
+    fn the_organization_shows_when_there_are_several() {
+        use scuttle_core::app::OrgRef;
+        let org = |name: &str, is_default| OrgRef {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_lowercase(),
+            display_name: name.into(),
+            is_default,
+        };
+        let coder = org("Coder", true);
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::OrganizationsLoaded(vec![coder.clone()]));
+        app.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: None,
+        });
+        assert!(!status_text(&app).contains("Coder"));
+        app.update(Msg::OrganizationsLoaded(vec![coder, org("Product", false)]));
+        let t = status_text(&app);
+        assert!(t.contains("Coder · new chat"), "{t}");
+    }
+
+    /// A chat with a model, context usage, plan mode, and a status, in one of two organizations.
+    fn busy_footer_app() -> App {
+        use scuttle_core::app::OrgRef;
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let orgs: Vec<OrgRef> = ["Engineering Platform", "Product"]
+            .iter()
+            .map(|name| OrgRef {
+                id: uuid::Uuid::new_v4(),
+                name: name.to_lowercase(),
+                display_name: (*name).into(),
+                is_default: false,
+            })
+            .collect();
+        app.update(Msg::OrganizationsLoaded(orgs.clone()));
+        app.update(Msg::Started {
+            org_id: orgs[0].id,
+            open_chat: None,
+        });
+        app.update(Msg::ModelsLoaded(vec![serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "display_name": "Big", "is_default": true, "enabled": true, "reasoning_efforts": []})).unwrap()]));
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}, "plan_mode": "plan"})).unwrap();
+        app.update(Msg::ChatLoaded { chat: Box::new(chat), messages: serde_json::from_value(json!([{"id": 1, "role": "assistant", "content": [], "usage": {"input_tokens": 12000, "context_limit": 200000}}])).unwrap() });
+        app.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        app
+    }
+
+    #[test]
+    fn the_footer_with_an_organization_never_exceeds_its_width() {
+        let app = busy_footer_app();
+        let full = status_text(&app);
+        assert_eq!(
+            full,
+            "Big · 12.0k/200.0k (6%) · Engineering Platform · plan mode · running"
+        );
+        for width in 0..=120u16 {
+            let t = text(&footer_line(&app, None, &Theme::terminal(true), width));
+            assert!(
+                UnicodeWidthStr::width(t.as_str()) <= width as usize,
+                "{width}: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_organization_gives_way_to_the_status_when_space_is_short() {
+        let app = busy_footer_app();
+        let without_org = "Big · 12.0k/200.0k (6%) · plan mode · running";
+        let width = UnicodeWidthStr::width(without_org) as u16;
+        assert_eq!(
+            text(&footer_line(&app, None, &Theme::terminal(true), width)),
+            without_org
+        );
     }
 
     #[test]

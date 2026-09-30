@@ -1,4 +1,5 @@
-//! Pickers for the model and the workspace, drawn above the composer.
+//! Pickers for the model, the effort, the workspace, and the organization, drawn above the
+//! composer.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -14,6 +15,7 @@ pub enum PickerChoice {
     Model(Uuid),
     Workspace(Option<Uuid>),
     Effort(String),
+    Organization(Uuid),
     Cancel,
 }
 
@@ -43,11 +45,34 @@ impl PickerState {
                 .chain(app.workspaces.iter().map(|w| (w.name.clone(), Some(w.id))))
                 .collect(),
             Picker::Effort => app.efforts().iter().map(|e| (e.clone(), None)).collect(),
+            Picker::Organization => app
+                .organizations
+                .iter()
+                .map(|o| {
+                    let mut marks = Vec::new();
+                    if o.is_default {
+                        marks.push("default");
+                    }
+                    if Some(o.id) == app.org_id {
+                        marks.push("current");
+                    }
+                    let label = if marks.is_empty() {
+                        o.label().to_owned()
+                    } else {
+                        format!("{} ({})", o.label(), marks.join(", "))
+                    };
+                    (label, Some(o.id))
+                })
+                .collect(),
         };
         let selected = match kind {
             Picker::Effort => app
                 .effort_label()
                 .and_then(|current| items.iter().position(|(name, _)| *name == current))
+                .unwrap_or(0),
+            Picker::Organization => app
+                .org_id
+                .and_then(|current| items.iter().position(|(_, id)| *id == Some(current)))
                 .unwrap_or(0),
             Picker::Model | Picker::Workspace => 0,
         };
@@ -77,6 +102,7 @@ impl PickerState {
                     Picker::Model => PickerChoice::Model((*id)?),
                     Picker::Workspace => PickerChoice::Workspace(*id),
                     Picker::Effort => PickerChoice::Effort(name.clone()),
+                    Picker::Organization => PickerChoice::Organization((*id)?),
                 })
             }
             _ => None,
@@ -88,6 +114,7 @@ impl PickerState {
             Picker::Model => " Model ",
             Picker::Workspace => " Workspace ",
             Picker::Effort => " Reasoning effort ",
+            Picker::Organization => " Organization ",
         };
         let items: Vec<ListItem> = self
             .items
@@ -172,6 +199,39 @@ mod tests {
         assert_eq!(
             press(&mut p, KeyCode::Enter),
             Some(PickerChoice::Effort("high".into()))
+        );
+    }
+
+    #[test]
+    fn organization_picker_marks_the_default_and_the_current_one() {
+        use scuttle_core::app::OrgRef;
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        app.update(Msg::OrganizationsLoaded(vec![
+            OrgRef {
+                id: product,
+                name: "product".into(),
+                display_name: "Product".into(),
+                is_default: false,
+            },
+            OrgRef {
+                id: coder,
+                name: "coder".into(),
+                display_name: "Coder".into(),
+                is_default: true,
+            },
+        ]));
+        app.update(Msg::Started {
+            org_id: coder,
+            open_chat: None,
+        });
+        let mut p = PickerState::open(Picker::Organization, &app);
+        let names: Vec<&str> = p.items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Product", "Coder (default, current)"]);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            Some(PickerChoice::Organization(coder)),
+            "the picker starts on the current organization"
         );
     }
 

@@ -328,6 +328,13 @@ impl Tui {
                 };
                 self.notice(Notice::Info(note.into()));
             }
+            Effect::SaveOrganization(id) => {
+                if let Some(path) = self.config_path.as_ref()
+                    && let Err(e) = config::set_organization(path, *id)
+                {
+                    self.notice(Notice::Error(e.to_string()));
+                }
+            }
             Effect::RestoreComposer(text) => {
                 // Keep anything typed since the failed request, after the restored text.
                 let current = self.composer.text();
@@ -588,6 +595,10 @@ impl Tui {
                 Some(PickerChoice::Effort(level)) => {
                     self.picker = None;
                     self.update(Msg::EffortChosen(level))
+                }
+                Some(PickerChoice::Organization(id)) => {
+                    self.picker = None;
+                    self.update(Msg::OrganizationChosen(id))
                 }
                 None => vec![],
             };
@@ -1894,5 +1905,67 @@ mod tests {
             })
             .unwrap();
         assert!(!tinted.contains(&answer));
+    }
+
+    #[test]
+    fn choosing_an_organization_saves_it_to_the_config() {
+        let dir = std::env::temp_dir().join(format!("scuttle-org-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        let mut t = Tui::new(
+            scuttle_core::config::LocalConfig::default(),
+            Some(path.clone()),
+            Theme::terminal(true),
+            Welcome {
+                url: "https://x".into(),
+                user: String::new(),
+                art: vec![],
+                show: true,
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        assert!(t.apply_ui_effect(&Effect::SaveOrganization(id)));
+        assert_eq!(
+            scuttle_core::config::load(&path).unwrap().organization,
+            Some(id)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_organization_picker_choice_reaches_the_core() {
+        use scuttle_core::app::OrgRef;
+        let mut t = tui();
+        let org = |name: &str, is_default| OrgRef {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_lowercase(),
+            display_name: name.into(),
+            is_default,
+        };
+        let (product, coder) = (org("Product", false), org("Coder", true));
+        t.core.update(Msg::OrganizationsLoaded(vec![
+            product.clone(),
+            coder.clone(),
+        ]));
+        t.core.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: None,
+        });
+        let effects = t
+            .core
+            .update(Msg::Command(scuttle_core::commands::Command::Organization(
+                None,
+            )));
+        for e in &effects {
+            assert!(t.apply_ui_effect(e), "{e:?}");
+        }
+        assert!(t.picker.is_some());
+        t.handle(key(KeyCode::Up, KeyModifiers::NONE));
+        let effects = t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.picker.is_none());
+        assert!(
+            effects.contains(&Effect::SaveOrganization(product.id)),
+            "{effects:?}"
+        );
+        assert_eq!(t.core.org_id, Some(product.id));
     }
 }

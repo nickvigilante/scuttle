@@ -69,6 +69,7 @@ pub enum Picker {
     Model,
     Workspace,
     Effort,
+    Organization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +119,8 @@ pub enum Msg {
     },
     /// The user's organizations, sent once at startup, before `Started`.
     OrganizationsLoaded(Vec<OrgRef>),
+    /// An organization picked for new chats, from `/organization <name>` or the picker.
+    OrganizationChosen(Uuid),
     /// A reply about the model or workspace list of `org`, applied only while those lists still
     /// belong to it.
     ForOrg {
@@ -220,6 +223,8 @@ pub enum Effect {
     ShowHelp,
     Copy(CopyTarget),
     SetMouse(bool),
+    /// Saves the organization new chats go to in the local config.
+    SaveOrganization(Uuid),
     /// Puts text back in the composer after a failed chat creation or send.
     RestoreComposer(String),
     Quit,
@@ -490,6 +495,38 @@ impl App {
             Msg::OrganizationsLoaded(organizations) => {
                 self.organizations = organizations;
                 vec![]
+            }
+            Msg::OrganizationChosen(id) => {
+                let Some(label) = self
+                    .organizations
+                    .iter()
+                    .find(|o| o.id == id)
+                    .map(|o| o.label().to_owned())
+                else {
+                    return vec![];
+                };
+                self.org_id = Some(id);
+                let mut effects = vec![Effect::SaveOrganization(id)];
+                // An open chat, or one being created or loaded, keeps its own organization and
+                // lists.
+                if self.chat_id.is_some()
+                    || self.creating.is_some()
+                    || self.loading.is_some()
+                    || self.failed_load.is_some()
+                {
+                    self.info(format!(
+                        "New chats will use {label}; this chat stays in its organization. Use /new to start one."
+                    ));
+                } else {
+                    self.info(format!("New chats will use {label}."));
+                    let lists = self.load_lists_for(id);
+                    if !lists.is_empty() {
+                        // Workspaces belong to one organization too.
+                        self.selected_workspace = None;
+                    }
+                    effects.extend(lists);
+                }
+                effects
             }
             Msg::ForOrg { org, msg } => {
                 if self.lists_org == Some(org) {
@@ -890,6 +927,36 @@ impl App {
         }
     }
 
+    fn organization_command(&mut self, name: Option<String>) -> Vec<Effect> {
+        if self.organizations.len() < 2 {
+            match self.organizations.first().map(|o| o.label().to_owned()) {
+                Some(label) => self.info(format!("You belong to one organization, {label}.")),
+                None => self.info("Your organizations have not loaded."),
+            }
+            return vec![];
+        }
+        if self.creating.is_some() {
+            self.info("The chat is still being created.");
+            return vec![];
+        }
+        let Some(name) = name else {
+            return vec![Effect::ShowPicker(Picker::Organization)];
+        };
+        let wanted = name.to_lowercase();
+        let found = self
+            .organizations
+            .iter()
+            .find(|o| o.name.to_lowercase() == wanted || o.display_name.to_lowercase() == wanted)
+            .map(|o| o.id);
+        match found {
+            Some(id) => self.update(Msg::OrganizationChosen(id)),
+            None => {
+                self.error(format!("No organization named {name:?}"));
+                vec![]
+            }
+        }
+    }
+
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         match cmd {
             Command::Model(_) | Command::Effort(_) if self.models_state == ModelsState::Loading => {
@@ -963,6 +1030,7 @@ impl App {
                 self.mouse = !self.mouse;
                 vec![Effect::SetMouse(self.mouse)]
             }
+            Command::Organization(name) => self.organization_command(name),
             Command::Help => vec![Effect::ShowHelp],
             Command::Quit => vec![Effect::Quit],
         }
@@ -1134,6 +1202,155 @@ mod tests {
             display_name: label.into(),
             is_default,
         }
+    }
+
+    /// Loads a non-default "Product" and a default "Coder", and starts in Coder.
+    fn two_orgs(app: &mut App) -> (OrgRef, OrgRef) {
+        let (product, coder) = (org("Product", false), org("Coder", true));
+        app.update(Msg::OrganizationsLoaded(vec![
+            product.clone(),
+            coder.clone(),
+        ]));
+        app.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: None,
+        });
+        (product, coder)
+    }
+
+    #[test]
+    fn organization_with_one_membership_says_so() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::OrganizationsLoaded(vec![org("Coder", true)]));
+        assert!(
+            app.update(Msg::Command(Command::Organization(None)))
+                .is_empty()
+        );
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "You belong to one organization, Coder.".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn choosing_an_organization_on_a_blank_chat_saves_it_and_reloads_its_lists() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, _) = two_orgs(&mut app);
+        assert_eq!(
+            app.update(Msg::Command(Command::Organization(None))),
+            vec![Effect::ShowPicker(Picker::Organization)]
+        );
+        let effects = app.update(Msg::Command(Command::Organization(Some("PRODUCT".into()))));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::SaveOrganization(product.id),
+                Effect::FetchModels(product.id),
+                Effect::FetchWorkspaces(product.id)
+            ]
+        );
+        assert_eq!(app.org_id, Some(product.id));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info("New chats will use Product.".into()))
+        );
+    }
+
+    #[test]
+    fn choosing_an_organization_with_a_chat_open_waits_for_new() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, _) = two_orgs(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        let effects = app.update(Msg::OrganizationChosen(product.id));
+        assert_eq!(effects, vec![Effect::SaveOrganization(product.id)]);
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("/new")));
+    }
+
+    #[test]
+    fn an_unknown_organization_name_is_an_error() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        two_orgs(&mut app);
+        assert!(
+            app.update(Msg::Command(Command::Organization(Some("nope".into()))))
+                .is_empty()
+        );
+        assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("nope")));
+    }
+
+    #[test]
+    fn switching_organizations_drops_the_old_model_effort_and_workspace() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = two_orgs(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(thinker));
+        app.update(Msg::EffortChosen("high".into()));
+        app.update(Msg::WorkspaceChosen(Some(Uuid::new_v4())));
+        app.update(Msg::OrganizationChosen(product.id));
+        assert_eq!(app.selected_model, None, "model IDs are per organization");
+        assert_eq!(app.selected_effort, None);
+        assert_eq!(app.selected_workspace, None);
+        assert!(app.models.is_empty());
+        assert_eq!(app.models_state, ModelsState::Loading);
+        app.update(Msg::ForOrg {
+            org: coder.id,
+            msg: Box::new(Msg::ModelsLoaded(vec![])),
+        });
+        assert_eq!(
+            app.models_state,
+            ModelsState::Loading,
+            "a late reply for the old organization is dropped"
+        );
+        assert_eq!(
+            app.update(Msg::ForOrg {
+                org: product.id,
+                msg: Box::new(Msg::ModelsFailed {
+                    message: "HTTP 500".into()
+                }),
+            }),
+            vec![]
+        );
+        assert_eq!(
+            app.update(Msg::Command(Command::Model(None))),
+            vec![Effect::FetchModels(product.id)],
+            "a retry fetches for the new organization"
+        );
+    }
+
+    #[test]
+    fn choosing_an_organization_while_a_chat_loads_waits_for_new() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = two_orgs(&mut app);
+        let effects = app.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: Some(Uuid::new_v4()),
+        });
+        assert!(effects.iter().any(|e| matches!(e, Effect::LoadChat(_))));
+        assert_eq!(
+            app.update(Msg::OrganizationChosen(product.id)),
+            vec![Effect::SaveOrganization(product.id)],
+            "the chat being loaded brings its own lists"
+        );
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("/new")));
+        assert_eq!(app.org_id, Some(product.id));
+    }
+
+    #[test]
+    fn choosing_the_current_organization_again_keeps_the_lists() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (_, coder) = two_orgs(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(thinker));
+        assert_eq!(
+            app.update(Msg::OrganizationChosen(coder.id)),
+            vec![Effect::SaveOrganization(coder.id)]
+        );
+        assert_eq!(app.selected_model, Some(thinker));
+        assert_eq!(app.models_state, ModelsState::Loaded);
     }
 
     #[test]

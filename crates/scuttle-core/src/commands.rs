@@ -5,6 +5,7 @@ pub enum Command {
     Model(Option<String>),
     Effort(Option<String>),
     Workspace(Option<String>),
+    Organization(Option<String>),
     /// `None` toggles; `Some` turns plan mode on or off.
     PlanMode(Option<bool>),
     Compact,
@@ -53,6 +54,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         aliases: &[],
         usage: "/workspace [name|none]",
         description: "Attach or detach a workspace",
+    },
+    CommandInfo {
+        name: "/organization",
+        aliases: &["/org"],
+        usage: "/organization [name]",
+        description: "Choose the organization new chats go to",
     },
     CommandInfo {
         name: "/plan-mode",
@@ -120,6 +127,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "model" => Ok(Command::Model(arg.map(str::to_owned))),
         "effort" => Ok(Command::Effort(arg.map(str::to_owned))),
         "workspace" => Ok(Command::Workspace(arg.map(str::to_owned))),
+        "organization" => Ok(Command::Organization(arg.map(str::to_owned))),
         "plan-mode" => match arg {
             None => Ok(Command::PlanMode(None)),
             Some(a) if a.eq_ignore_ascii_case("on") => Ok(Command::PlanMode(Some(true))),
@@ -212,6 +220,17 @@ mod tests {
         assert_eq!(quit.display_usage(), "/quit (/exit)");
         let model = COMMANDS.iter().find(|c| c.name == "/model").unwrap();
         assert_eq!(model.display_usage(), "/model [name]");
+    }
+
+    #[test]
+    fn parses_organization_and_its_alias() {
+        assert_eq!(parse("/organization"), Ok(Command::Organization(None)));
+        assert_eq!(
+            parse("/org coder"),
+            Ok(Command::Organization(Some("coder".into())))
+        );
+        let names: Vec<_> = completions("/or").iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["/organization"]);
     }
 
     #[test]

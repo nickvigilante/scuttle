@@ -339,6 +339,7 @@ impl Runtime {
             | Effect::ShowHelp
             | Effect::Copy(_)
             | Effect::SetMouse(_)
+            | Effect::SaveOrganization(_)
             | Effect::RestoreComposer(_)
             | Effect::Quit => {}
         }
