@@ -79,6 +79,15 @@ pub fn wrap_rows(lines: &[Line<'static>], width: u16) -> Vec<(Line<'static>, boo
         .collect()
 }
 
+/// The display columns `text` takes, measured the way `wrap_line` measures it: tabs as four
+/// columns, then one width per grapheme cluster.
+pub fn cells_width(text: &str) -> usize {
+    text.replace('\t', "    ")
+        .graphemes(true)
+        .map(|g| g.width())
+        .sum()
+}
+
 fn to_line(cells: &[(String, Style)], line_style: Style) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (g, style) in cells {

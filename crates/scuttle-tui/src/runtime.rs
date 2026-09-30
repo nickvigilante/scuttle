@@ -107,6 +107,23 @@ async fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
+/// `url` parsed, when it is an `http` or `https` link, the only kind a transcript link may
+/// open. Anything else, such as a file, a `javascript:` URL, or text that starts with `-` and
+/// would reach the opener as an option, could run something other than a browser.
+pub(crate) fn web_link(url: &str) -> Option<url::Url> {
+    url::Url::parse(url)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// Opens a link from the transcript. Only web links open, and in normalized form.
+async fn open_link(url: &str) -> Result<(), String> {
+    match web_link(url) {
+        Some(parsed) => open_in_browser(parsed.as_str()).await,
+        None => Err("only http and https links open in a browser".into()),
+    }
+}
+
 /// The user-facing text of a generated-client error. Never includes the session token,
 /// which only travels in a request header.
 async fn err<E: serde::Serialize + std::fmt::Debug>(e: progenitor_client::Error<E>) -> String {
@@ -374,6 +391,10 @@ impl Runtime {
                     Msg::WebOpened { url, outcome }
                 }));
             }
+            Effect::OpenLink(url) => self.spawn(Box::pin(async move {
+                let outcome = open_link(&url).await;
+                Msg::LinkOpened { url, outcome }
+            })),
             Effect::FetchPrefs => self.spawn(Box::pin(async move {
                 match client.api().get_user_preference_settings("me").await {
                     Ok(p) => Msg::PrefsLoaded(DisplayPrefs::from(&p.into_inner())),
@@ -432,6 +453,7 @@ impl Runtime {
             | Effect::ShowHelp
             | Effect::Copy(_)
             | Effect::CopyWebUrl(_)
+            | Effect::CopyLink(_)
             | Effect::SetMouse(_)
             | Effect::SaveOrganization(_)
             | Effect::RestoreComposer(_)
@@ -501,6 +523,45 @@ mod tests {
             }
             other => panic!("expected WebOpened, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_link_reports_the_link() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::OpenLink("https://coder.com/docs".into()));
+        match next(&mut rx).await {
+            Msg::LinkOpened { url, outcome } => {
+                assert_eq!(url, "https://coder.com/docs");
+                assert_eq!(
+                    outcome,
+                    Err("not opened".into()),
+                    "tests never launch a browser"
+                );
+            }
+            other => panic!("expected LinkOpened, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_web_links_reach_the_browser() {
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "-a Calculator",
+            "docs/setup.md",
+        ] {
+            assert_eq!(
+                open_link(url).await,
+                Err("only http and https links open in a browser".into()),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            open_link("https://coder.com").await,
+            Err("not opened".into()),
+            "a web link gets as far as the opener"
+        );
     }
 
     #[test]

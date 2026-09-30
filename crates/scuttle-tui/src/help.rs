@@ -53,7 +53,7 @@ pub const KEYS: &[KeyInfo] = &[
     },
     KeyInfo {
         keys: "Click",
-        action: "Expand a tool call or thinking, or copy a code block",
+        action: "Open a link, expand a tool call or thinking, or copy a code block",
     },
     KeyInfo {
         keys: "Drag",

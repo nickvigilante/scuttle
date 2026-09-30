@@ -191,6 +191,12 @@ pub enum Msg {
         url: String,
         outcome: Result<(), String>,
     },
+    /// The runtime sends this after `Effect::OpenLink`, with the link and why no browser opened,
+    /// if none did.
+    LinkOpened {
+        url: String,
+        outcome: Result<(), String>,
+    },
     Submit(String),
     Command(Command),
     Interrupt,
@@ -240,6 +246,10 @@ pub enum Effect {
     OpenWeb(Uuid),
     /// Copies the chat's URL after `Effect::OpenWeb` opened no browser, and reports the copy.
     CopyWebUrl(String),
+    /// Opens a link from the transcript in the browser. The UI sends it on a click.
+    OpenLink(String),
+    /// Copies a link after `Effect::OpenLink` opened no browser, and reports the copy.
+    CopyLink(String),
     FetchPrefs,
     FetchModels(Uuid),
     FetchWorkspaces(Uuid),
@@ -499,6 +509,23 @@ impl App {
 
     fn info(&mut self, text: impl Into<String>) {
         self.notices.push(Notice::Info(text.into()));
+    }
+
+    /// Reports a browser open for `url`. A URL that opened no browser goes back to the UI as
+    /// `copy(url)`, and the UI copies it and says whether that worked.
+    fn opened(
+        &mut self,
+        url: String,
+        outcome: Result<(), String>,
+        copy: fn(String) -> Effect,
+    ) -> Vec<Effect> {
+        match outcome {
+            Ok(()) => {
+                self.info(format!("Opened {url}"));
+                vec![]
+            }
+            Err(_) => vec![copy(url)],
+        }
     }
 
     fn error(&mut self, text: impl Into<String>) {
@@ -835,16 +862,8 @@ impl App {
                 self.error(format!("Could not turn plan mode {word}: {message}"));
                 vec![]
             }
-            Msg::WebOpened { url, outcome } => {
-                match outcome {
-                    Ok(()) => {
-                        self.info(format!("Opened {url}"));
-                        vec![]
-                    }
-                    // The UI copies the URL and says whether that worked.
-                    Err(_) => vec![Effect::CopyWebUrl(url)],
-                }
-            }
+            Msg::WebOpened { url, outcome } => self.opened(url, outcome, Effect::CopyWebUrl),
+            Msg::LinkOpened { url, outcome } => self.opened(url, outcome, Effect::CopyLink),
             Msg::Submit(text) => self.submit(text),
             Msg::Command(cmd) => self.command(cmd),
             Msg::Interrupt => match self.chat_id {
@@ -2183,6 +2202,30 @@ mod tests {
                 outcome: Err("over SSH".into()),
             }),
             vec![Effect::CopyWebUrl(url)]
+        );
+    }
+
+    #[test]
+    fn a_link_that_opened_no_browser_is_handed_back_to_copy() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let url = "https://coder.com/docs".to_owned();
+        assert!(
+            app.update(Msg::LinkOpened {
+                url: url.clone(),
+                outcome: Ok(()),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(format!("Opened {url}")))
+        );
+        assert_eq!(
+            app.update(Msg::LinkOpened {
+                url: url.clone(),
+                outcome: Err("over SSH".into()),
+            }),
+            vec![Effect::CopyLink(url)]
         );
     }
 

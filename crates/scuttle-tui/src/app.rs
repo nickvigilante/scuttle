@@ -21,6 +21,7 @@ use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
 use crate::help::help_lines;
 use crate::picker::{PickerChoice, PickerState};
+use crate::runtime;
 use crate::selection::{Pos, Selection, selected_text};
 use crate::theme::Theme;
 use crate::transcript_view::{self, BlockId, HitTarget, View, Welcome};
@@ -62,14 +63,31 @@ fn editor_round_trip(
     (edited, resumed)
 }
 
+/// The notice for copying `url`, called `what`, after it opened no browser.
+fn copy_url_notice(what: &str, url: &str, outcome: CopyOutcome) -> Notice {
+    match outcome {
+        CopyOutcome::Copied => Notice::Info(format!("Copied {what}: {url}")),
+        CopyOutcome::CopiedWithWarning(w) => Notice::Info(format!("Copied {what}: {url}. {w}")),
+        CopyOutcome::Failed(_) => Notice::Error(format!("Could not copy {what}: {url}")),
+    }
+}
+
 /// The notice for copying the chat URL after `/web` opened no browser.
 fn web_copy_notice(url: &str, outcome: CopyOutcome) -> Notice {
-    match outcome {
-        CopyOutcome::Copied => Notice::Info(format!("Copied the chat URL: {url}")),
-        CopyOutcome::CopiedWithWarning(w) => {
-            Notice::Info(format!("Copied the chat URL: {url}. {w}"))
-        }
-        CopyOutcome::Failed(_) => Notice::Error(format!("Could not copy the chat URL: {url}")),
+    copy_url_notice("the chat URL", url, outcome)
+}
+
+/// The notice for copying a link that opened no browser. A link the runtime refuses to open
+/// says so, since nothing else would explain why the click did not open it.
+fn link_copy_notice(url: &str, outcome: CopyOutcome) -> Notice {
+    let notice = copy_url_notice("the link", url, outcome);
+    if runtime::web_link(url).is_some() {
+        return notice;
+    }
+    let why = "Only http and https links open in a browser.";
+    match notice {
+        Notice::Info(text) => Notice::Info(format!("{why} {text}")),
+        Notice::Error(text) => Notice::Error(format!("{why} {text}")),
     }
 }
 
@@ -287,6 +305,13 @@ impl Tui {
         )
     }
 
+    /// Copies a URL that opened no browser, reporting the copy with `notice`.
+    fn copy_url(&mut self, url: &str, notice: impl FnOnce(CopyOutcome) -> Notice) {
+        if let Some(outcome) = self.write_clipboard(url.to_owned()) {
+            self.notice(notice(outcome));
+        }
+    }
+
     fn report_copy(&mut self, outcome: CopyOutcome) {
         let notice = match outcome {
             CopyOutcome::Copied => Notice::Info("Copied".into()),
@@ -370,12 +395,8 @@ impl Tui {
                 self.scroll_from_bottom = 0;
                 self.composer.reset_history_position();
             }
-            Effect::CopyWebUrl(url) => {
-                if let Some(outcome) = self.write_clipboard(url.clone()) {
-                    let notice = web_copy_notice(url, outcome);
-                    self.notice(notice);
-                }
-            }
+            Effect::CopyWebUrl(url) => self.copy_url(url, |o| web_copy_notice(url, o)),
+            Effect::CopyLink(url) => self.copy_url(url, |o| link_copy_notice(url, o)),
             Effect::RestoreComposer(text) => {
                 // Keep anything typed since the failed request, after the restored text.
                 let current = self.composer.text();
@@ -504,6 +525,15 @@ impl Tui {
         }
     }
 
+    /// The URL of the link under transcript cell `pos`, if any.
+    fn link_at(&self, pos: Pos) -> Option<String> {
+        self.view
+            .links
+            .iter()
+            .find(|l| l.line == pos.line && l.cols.contains(&pos.col))
+            .map(|l| l.url.clone())
+    }
+
     pub fn handle(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
@@ -511,15 +541,12 @@ impl Tui {
                 self.composer.paste(&text);
                 vec![]
             }
-            Event::Mouse(m) => {
-                self.mouse(m);
-                vec![]
-            }
+            Event::Mouse(m) => self.mouse(m),
             _ => vec![],
         }
     }
 
-    fn mouse(&mut self, m: MouseEvent) {
+    fn mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.selection = None;
@@ -537,10 +564,16 @@ impl Tui {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.extend_to(m.column, m.row);
                 let Some(drag) = self.drag else {
-                    return;
+                    return vec![];
                 };
+                let mut effects = vec![];
                 if !drag.moved {
-                    self.click(drag.anchor.line);
+                    // The view is still pinned at the press, so this is the link that was
+                    // under the pointer then, even if the agent streamed more since.
+                    match self.link_at(drag.anchor) {
+                        Some(url) => effects.push(Effect::OpenLink(url)),
+                        None => self.click(drag.anchor.line),
+                    }
                 } else if let Some(selection) = self.selection {
                     let text = selected_text(&self.view, &selection);
                     if !text.is_empty() {
@@ -548,11 +581,13 @@ impl Tui {
                     }
                 }
                 self.end_drag();
+                return effects;
             }
             MouseEventKind::ScrollUp => self.scroll_up(3),
             MouseEventKind::ScrollDown => self.scroll_down(3),
             _ => {}
         }
+        vec![]
     }
 
     /// Extends the selection to the pointer, scrolling a line when it leaves the transcript.
@@ -2206,6 +2241,143 @@ mod tests {
         assert_eq!(
             web_copy_notice(url, CopyOutcome::Failed("no terminal".into())),
             Notice::Error("Could not copy the chat URL: https://coder.example.com/agents/x".into())
+        );
+    }
+
+    fn release(t: &mut Tui, column: u16, row: u16) -> Vec<Effect> {
+        t.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    fn open_docs() -> Vec<Effect> {
+        vec![Effect::OpenLink("https://coder.com/docs".into())]
+    }
+
+    #[test]
+    fn a_click_on_a_link_opens_it_and_a_drag_over_it_selects_it() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "See [the docs](https://coder.com/docs) here."}]}]),
+        );
+        let (x, y) = find(&screen(&mut t, 60, 20), "the docs");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x + 2, y);
+        assert_eq!(release(&mut t, x + 2, y), open_docs());
+        assert_eq!(t.last_copied, None);
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), x + 7, y);
+        assert!(
+            release(&mut t, x + 7, y).is_empty(),
+            "a drag never opens the link"
+        );
+        assert_eq!(t.last_copied.as_deref(), Some("the docs"));
+        let (x, y) = find(&screen(&mut t, 60, 20), "here.");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(
+            release(&mut t, x, y).is_empty(),
+            "the text beside a link is not the link"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_second_row_of_a_wrapped_link_opens_it() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "Read [the very long documentation title here](https://coder.com/docs) please"}]}]),
+        );
+        let shown = screen(&mut t, 22, 20);
+        let (x, y) = find(&shown, "documentation");
+        let (_, first) = find(&shown, "Read");
+        assert!(y > first, "the link wraps onto a second row:\n{shown}");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        assert_eq!(release(&mut t, x + 3, y), open_docs());
+        let (x, y) = find(&shown, "please");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(release(&mut t, x, y).is_empty());
+    }
+
+    #[test]
+    fn a_link_click_while_streaming_opens_the_link_under_the_press() {
+        let mut t = tui();
+        numbered_rows(&mut t);
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        t.update(live_part(
+            1,
+            json!({"type": "text", "text": "See [the docs](https://coder.com/docs)."}),
+        ));
+        let (x, y) = find(&screen(&mut t, 60, 16), "the docs");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        t.update(live_part(
+            2,
+            json!({"type": "text", "text": "\n\nMore.\n\nAnd more.\n\nStill more."}),
+        ));
+        let during = screen(&mut t, 60, 16);
+        assert_eq!(
+            find(&during, "the docs"),
+            (x, y),
+            "the held press pins the view:\n{during}"
+        );
+        assert_eq!(release(&mut t, x, y), open_docs());
+    }
+
+    #[test]
+    fn link_text_in_a_code_block_copies_the_code_instead() {
+        let mut t = tui();
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "```\n[the docs](https://coder.com/docs)\n```"}]}]),
+        );
+        let (x, y) = find(&screen(&mut t, 60, 20), "the docs");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(release(&mut t, x, y).is_empty(), "code is never a link");
+        assert_eq!(
+            t.last_copied.as_deref(),
+            Some("[the docs](https://coder.com/docs)\n")
+        );
+    }
+
+    #[test]
+    fn a_link_that_opened_no_browser_is_copied() {
+        let mut t = tui();
+        let url = "https://coder.com/docs".to_owned();
+        assert!(!t.apply_ui_effect(&Effect::OpenLink(url.clone())));
+        assert!(t.apply_ui_effect(&Effect::CopyLink(url.clone())));
+        assert_eq!(t.last_copied.as_deref(), Some(url.as_str()));
+        assert_eq!(
+            copy_url_notice("the link", &url, CopyOutcome::Copied),
+            Notice::Info("Copied the link: https://coder.com/docs".into())
+        );
+    }
+
+    #[test]
+    fn a_link_that_is_not_a_web_link_says_why_it_was_copied() {
+        assert_eq!(
+            link_copy_notice("https://coder.com/docs", CopyOutcome::Copied),
+            Notice::Info("Copied the link: https://coder.com/docs".into()),
+            "a web link that opened no browser needs no reason"
+        );
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "-a Calculator"] {
+            assert_eq!(
+                link_copy_notice(url, CopyOutcome::Copied),
+                Notice::Info(format!(
+                    "Only http and https links open in a browser. Copied the link: {url}"
+                )),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            link_copy_notice("file:///x", CopyOutcome::Failed("no terminal".into())),
+            Notice::Error(
+                "Only http and https links open in a browser. Could not copy the link: file:///x"
+                    .into()
+            )
         );
     }
 

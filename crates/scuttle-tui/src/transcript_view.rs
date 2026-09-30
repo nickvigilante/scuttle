@@ -11,7 +11,7 @@ use scuttle_core::live::LiveBlock;
 
 use crate::markdown;
 use crate::theme::Theme;
-use crate::wrap::{wrap_lines, wrap_rows};
+use crate::wrap::{cells_width, wrap_line, wrap_lines, wrap_rows};
 
 /// A block: (message ID, or `None` for the live turn; index of the block within it).
 pub type BlockId = (Option<i64>, usize);
@@ -26,6 +26,14 @@ pub enum HitTarget {
 pub struct Hit {
     pub lines: Range<usize>,
     pub target: HitTarget,
+}
+
+/// Link text on one transcript row: a click on columns `cols` of row `line` opens `url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkHit {
+    pub line: usize,
+    pub cols: Range<u16>,
+    pub url: String,
 }
 
 /// What the TUI needs to know about one transcript row beyond its text.
@@ -49,6 +57,8 @@ pub struct View {
     /// while the agent works. The TUI paints the spinner frame there on every draw, so a timer
     /// frame animates them without rebuilding `lines`, which keep the static glyph.
     pub spinners: Vec<usize>,
+    /// Every row part of every link, so a link that wraps is clickable on each of its rows.
+    pub links: Vec<LinkHit>,
     pub hits: Vec<Hit>,
     /// Code blocks of the most recent assistant turn (durable or live) that had any.
     pub last_code_blocks: Vec<String>,
@@ -190,6 +200,22 @@ fn one_line(text: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// The parts of a link at display columns `cols` of an unwrapped line that fall on each of
+/// `rows`, the rows `wrap_line` made of that line, as (row index, columns in that row).
+fn link_rows(rows: &[Line<'static>], cols: &Range<usize>) -> Vec<(usize, Range<u16>)> {
+    let mut parts = Vec::new();
+    let mut at = 0;
+    for (i, row) in rows.iter().enumerate() {
+        let width: usize = row.spans.iter().map(|s| cells_width(&s.content)).sum();
+        let (from, to) = (cols.start.max(at), cols.end.min(at + width));
+        if from < to {
+            parts.push((i, (from - at) as u16..(to - at) as u16));
+        }
+        at += width;
+    }
+    parts
 }
 
 /// The call's arguments on one line: the first non-empty string among them, else all of them
@@ -532,6 +558,25 @@ fn render_items(
                         lines: start..end,
                         target: HitTarget::CopyCode(block.code.clone()),
                     });
+                }
+                if !rendered.links.is_empty() {
+                    // The first transcript row of each rendered line, as `push` will wrap them.
+                    let mut starts = Vec::with_capacity(rendered.lines.len());
+                    let mut at = base;
+                    for line in &rendered.lines {
+                        starts.push(at);
+                        at += wrap_line(line, out.width).len();
+                    }
+                    for link in &rendered.links {
+                        let rows = wrap_line(&rendered.lines[link.line], out.width);
+                        for (row, cols) in link_rows(&rows, &link.cols) {
+                            out.view.links.push(LinkHit {
+                                line: starts[link.line] + row,
+                                cols,
+                                url: link.url.clone(),
+                            });
+                        }
+                    }
                 }
                 code_blocks.extend(rendered.code_blocks.iter().map(|b| b.code.clone()));
                 out.push(rendered.lines, false);
@@ -1074,6 +1119,34 @@ mod tests {
         let colored = "\u{1b}[32mdone\u{1b}[0m";
         assert_eq!(result_text(Some(&json!({"output": colored})), ""), "done");
     }
+    #[test]
+    fn a_wrapped_link_is_clickable_on_every_row() {
+        let text = "Read [the very long documentation title here](https://coder.com/docs) please";
+        let app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [{"type": "text", "text": text}]}
+        ]));
+        let view = build_at(&app, 20);
+        let lines = texts(&view);
+        assert_eq!(view.links.len(), 3, "{lines:?} {:?}", view.links);
+        assert!(
+            view.links.windows(2).all(|w| w[1].line == w[0].line + 1),
+            "one part per row, on consecutive rows"
+        );
+        assert!(view.links.iter().all(|l| l.url == "https://coder.com/docs"));
+        let covered: String = view
+            .links
+            .iter()
+            .map(|l| {
+                lines[l.line]
+                    .chars()
+                    .skip(l.cols.start as usize)
+                    .take((l.cols.end - l.cols.start) as usize)
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(covered, "the very long documentation title here");
+    }
+
     fn build_at(app: &App, width: u16) -> View {
         build(
             app,
