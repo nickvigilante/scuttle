@@ -17,8 +17,8 @@ Both are in the `m2-design` worktree; executors read the M2 design for every tas
 
 ## Global Constraints
 
-- SDK work happens in `~/git/nickvigilante/unofficial-coder-sdk-rs/.worktrees/m2-sdk` on branch `m2-sdk`, created from `main`.
-- scuttle work happens in `~/git/nickvigilante/scuttle/.worktrees/m2` on branch `m2`, created from `m1-polish` after M1.6 lands.
+- SDK work happens in `<unofficial-coder-sdk-rs checkout>/.worktrees/m2-sdk` on branch `m2-sdk`, created from `main`.
+- scuttle work happens in `<scuttle checkout>/.worktrees/m2` on branch `m2`, created from `m1-polish` after M1.6 lands.
 - SDK tasks never touch scuttle, and scuttle tasks never touch the SDK.
 - Never push, never commit on `main`, never add a remote, and stage only the files a task names; never `git add -A`.
 - Commit messages use Conventional Commits and end with the trailer `Assisted-by: AI`; they never name an AI model or vendor.
@@ -59,7 +59,7 @@ If the merged code names something differently, the implementer uses the merged 
 - **The effort slider stays in `PickerState`.** The design turns the M1 `PickerState` into the table overlay, but M1.6 built the `/effort` slider inside `PickerState`, so Task 7 moves only the model, workspace, and organization lists to the table and leaves the slider where M1.6 put it.
 - **Task split.** The design's 24 tasks become 4 SDK tasks and 34 scuttle tasks, split wherever a reviewer could reject one part and approve its neighbor: the watch merge rules apart from the socket, the preview stream apart from the `/subagents` popup, question menus apart from plan-mode serialization, `/attach` apart from `@path`, the `/workspace` table apart from its details, the `/git` panel apart from the pager, and scroll anchoring apart from the wheel fix.
 - **Repins.** Each SDK task has its own repin task in scuttle, placed just before the first task that needs it.
-  Because nobody pushes, a repin points `coder-sdk` at the local repository (`git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs"`), as M1 did, with the new `rev`; after the author pushes `m2-sdk`, one follow-up switches the URL back to GitHub with the same `rev`.
+  Because nobody pushes, a repin points `coder-sdk` at the local repository (`git = "file://<unofficial-coder-sdk-rs checkout>"`), as M1 did, with the new `rev`; after the author pushes `m2-sdk`, one follow-up switches the URL back to GitHub with the same `rev`.
 - **Healthy stream.** The reconnect counter resets only after a stream stays open for `STREAM_HEALTHY_AFTER` (10 seconds), reported by the runtime as `Msg::StreamHealthy`, instead of on its first event, because the first event after a reopen is the server's snapshot and says nothing about whether the connection will hold.
   The watch socket uses the same rule with `Msg::WatchHealthy`.
 - **Loads that apply.** A `ChatLoaded` or `ChatLoadFailed` applies when it answers the load in flight; with no load in flight it applies only to a blank screen, which is how the startup path and the existing tests deliver a chat.
@@ -145,10 +145,10 @@ These four tasks change only `unofficial-coder-sdk-rs` and can run in parallel w
 Create the worktree once, before Task S1:
 
 ```bash
-cd ~/git/nickvigilante/unofficial-coder-sdk-rs && git worktree add .worktrees/m2-sdk -b m2-sdk main
+cd <unofficial-coder-sdk-rs checkout> && git worktree add .worktrees/m2-sdk -b m2-sdk main
 ```
 
-Every SDK task runs its commands from `~/git/nickvigilante/unofficial-coder-sdk-rs/.worktrees/m2-sdk` and ends green on `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all --check`.
+Every SDK task runs its commands from `<unofficial-coder-sdk-rs checkout>/.worktrees/m2-sdk` and ends green on `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all --check`.
 
 ### Task S1: WebSocket upgrade timeout and readable watchdog durations
 
@@ -767,10 +767,10 @@ Assisted-by: AI"
 Create the worktree once, after M1.6 has landed on `m1-polish`:
 
 ```bash
-cd ~/git/nickvigilante/scuttle && git worktree add .worktrees/m2 -b m2 m1-polish
+cd <scuttle checkout> && git worktree add .worktrees/m2 -b m2 m1-polish
 ```
 
-Every scuttle task runs its commands from `~/git/nickvigilante/scuttle/.worktrees/m2`.
+Every scuttle task runs its commands from `<scuttle checkout>/.worktrees/m2`.
 
 ### Task 1: Repin coder-sdk for the socket timeouts
 
@@ -785,7 +785,7 @@ Every scuttle task runs its commands from `~/git/nickvigilante/scuttle/.worktree
 - [ ] **Step 1: Find the commit to pin**
 
 The commit to pin is the tip of `m2-sdk` when this task runs, or the tip of the SDK's `main` if the author has already merged `m2-sdk` into it.
-Run: `SDK=~/git/nickvigilante/unofficial-coder-sdk-rs; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "time out hung WebSocket upgrades"`
+Run: `SDK=<unofficial-coder-sdk-rs checkout>; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "time out hung WebSocket upgrades"`
 Expected: one line, which proves Task S1 is in `$REV`; the full SHA in `$REV` is called `<rev>` below.
 
 - [ ] **Step 2: Repin**
@@ -793,7 +793,7 @@ Expected: one line, which proves Task S1 is in `$REV`; the full SHA in `$REV` is
 In `Cargo.toml`, replace the `coder-sdk` line with:
 
 ```toml
-coder-sdk = { git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs", rev = "<rev>" }
+coder-sdk = { git = "file://<unofficial-coder-sdk-rs checkout>", rev = "<rev>" }
 ```
 
 with `<rev>` replaced by the SHA from Step 1.
@@ -11630,12 +11630,12 @@ Assisted-by: AI"
 - [ ] **Step 1: Find the commit to pin**
 
 The commit to pin is the tip of `m2-sdk` when this task runs, or the tip of the SDK's `main` if the author has merged `m2-sdk` into it.
-Run: `SDK=~/git/nickvigilante/unofficial-coder-sdk-rs; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "stream a chat's workspace git state"`
+Run: `SDK=<unofficial-coder-sdk-rs checkout>; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "stream a chat's workspace git state"`
 Expected: one line, which proves Task S2 is in `$REV`, called `<rev>` below.
 
 - [ ] **Step 2: Repin**
 
-In `Cargo.toml`, set the `coder-sdk` line's `rev` to `<rev>`, keeping `git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs"`.
+In `Cargo.toml`, set the `coder-sdk` line's `rev` to `<rev>`, keeping `git = "file://<unofficial-coder-sdk-rs checkout>"`.
 Run: `cargo update -p coder-sdk`
 Expected: `Cargo.lock` names `<rev>`.
 
@@ -12543,7 +12543,7 @@ Assisted-by: AI"
 - [ ] **Step 1: Find the commit to pin**
 
 The commit to pin is the tip of `m2-sdk` when this task runs, or the tip of the SDK's `main` if the author has merged `m2-sdk` into it.
-Run: `SDK=~/git/nickvigilante/unofficial-coder-sdk-rs; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "latest MCP connect outcomes"`
+Run: `SDK=<unofficial-coder-sdk-rs checkout>; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "latest MCP connect outcomes"`
 Expected: one line, which proves Task S3 is in `$REV`, called `<rev>` below.
 
 - [ ] **Step 2: Repin**
@@ -13073,7 +13073,7 @@ Cut this task together with Tasks S4 and 31.
 - [ ] **Step 1: Find the commit to pin**
 
 The commit to pin is the tip of `m2-sdk` when this task runs, or the tip of the SDK's `main` if the author has merged `m2-sdk` into it.
-Run: `SDK=~/git/nickvigilante/unofficial-coder-sdk-rs; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "explicit, possibly empty, MCP selection"`
+Run: `SDK=<unofficial-coder-sdk-rs checkout>; REV=$(git -C $SDK rev-parse m2-sdk); git -C $SDK log --oneline $REV --grep "explicit, possibly empty, MCP selection"`
 Expected: one line, which proves Task S4 is in `$REV`, called `<rev>` below.
 
 - [ ] **Step 2: Repin**

@@ -8,7 +8,7 @@ No plan or code starts until the author approves it.
 Citations are `path:line` in coder/coder unless another repo is named.
 Anything marked "unconfirmed" could not be verified against source.
 
-**Related:** [M1 daily-use feedback](../feedback/2026-09-29-m1-daily-use.md) on branch `m1-polish`, an internal ticket.
+**Related:** [M1 daily-use feedback](../feedback/2026-09-29-m1-daily-use.md) on branch `m1-polish`, and revisiting an interactive TUI for Coder Agents.
 
 ## Design rule
 
