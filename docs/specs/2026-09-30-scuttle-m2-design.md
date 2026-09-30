@@ -303,6 +303,9 @@ The core owns the editor text and the pending request; the runtime runs both cal
 
 Queued messages already render dimmed below the live turn (`crates/scuttle-tui/src/transcript_view.rs`).
 `/queue` opens an overlay listing them in order, where Enter promotes the selected message to run next and Delete removes it.
+Promoting is the web UI's "Send now" (`site/src/pages/AgentsPage/components/QueuedMessagesList.tsx:229-241`): when the chat is running, the server interrupts the turn, keeps the partial response, and then runs the promoted message (`coderd/x/chatd/chatd.go:2140-2164`).
+Pressing Enter on an empty composer while messages are queued promotes the first one, as the web UI does (`site/src/pages/AgentsPage/components/AgentChatInput.tsx:1130-1144`).
+The overlay labels the Enter action "Send now" and notes that it interrupts a running turn.
 
 ### API
 
