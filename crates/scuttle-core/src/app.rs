@@ -537,13 +537,29 @@ impl App {
                         "New chats will use {label}; this chat stays in its organization. Use /new to start one."
                     ));
                 } else {
-                    self.info(format!("New chats will use {label}."));
+                    let chosen = (
+                        self.selected_model,
+                        self.selected_effort.clone(),
+                        self.selected_workspace,
+                    );
                     let lists = self.load_lists_for(id);
                     if !lists.is_empty() {
                         // Workspaces belong to one organization too.
                         self.selected_workspace = None;
                     }
                     effects.extend(lists);
+                    let reset = chosen
+                        != (
+                            self.selected_model,
+                            self.selected_effort.clone(),
+                            self.selected_workspace,
+                        );
+                    let note = if reset {
+                        " Model, effort, and workspace reset to its defaults."
+                    } else {
+                        ""
+                    };
+                    self.info(format!("New chats will use {label}.{note}"));
                 }
                 effects
             }
@@ -570,6 +586,13 @@ impl App {
                     Msg::ApiFailed { action, message } => {
                         self.error(format!(
                             "In the previous chat, could not {action}: {message}"
+                        ));
+                        vec![]
+                    }
+                    Msg::PlanModeFailed { on, message } => {
+                        let word = if on { "on" } else { "off" };
+                        self.error(format!(
+                            "In the previous chat, could not turn plan mode {word}: {message}"
                         ));
                         vec![]
                     }
@@ -946,8 +969,12 @@ impl App {
 
     fn plan_mode_command(&mut self, wanted: Option<bool>) -> Vec<Effect> {
         // Loading replaces `plan_mode` with the chat's own, which would drop this change.
-        if self.loading.is_some() || (self.chat_id.is_none() && self.failed_load.is_some()) {
+        if self.loading.is_some() {
             self.info("Wait for the chat to load, then set plan mode.");
+            return vec![];
+        }
+        if self.chat_id.is_none() && self.failed_load.is_some() {
+            self.info("The chat did not load. Send a message to retry, then set plan mode.");
             return vec![];
         }
         let on = wanted.unwrap_or(!self.plan_mode);
@@ -1095,9 +1122,16 @@ impl App {
                 self.info("The chat is still being created.");
                 vec![]
             }
-            Command::Web | Command::Compact | Command::Clear => match self.chat_id {
+            // The chat being loaded, or the one that failed to load, already has a URL.
+            Command::Web => match self.chat_id.or(self.loading).or(self.failed_load) {
+                Some(chat) => vec![Effect::OpenWeb(chat)],
+                None => {
+                    self.error("Start a chat first.");
+                    vec![]
+                }
+            },
+            Command::Compact | Command::Clear => match self.chat_id {
                 Some(chat) => vec![match cmd {
-                    Command::Web => Effect::OpenWeb(chat),
                     Command::Compact => Effect::Compact(chat),
                     _ => Effect::Clear(chat),
                 }],
@@ -2846,10 +2880,11 @@ mod tests {
             .is_empty()
         );
         assert!(!app.plan_mode);
-        assert!(
-            !app.notices
-                .iter()
-                .any(|n| matches!(n, Notice::Error(m) if m.contains("plan mode")))
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "In the previous chat, could not turn plan mode off: nope".into()
+            ))
         );
     }
 
@@ -2986,5 +3021,122 @@ mod tests {
                 "In the previous chat, could not compact the chat: gone".into()
             ))
         );
+    }
+
+    #[test]
+    fn plan_mode_after_a_failed_load_says_a_message_retries_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: org,
+            open_chat: Some(id),
+        });
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "Wait for the chat to load, then set plan mode.".into()
+            ))
+        );
+        app.update(Msg::ChatLoadFailed {
+            chat_id: id,
+            message: "HTTP 500".into(),
+        });
+        assert!(
+            app.update(Msg::Command(Command::PlanMode(Some(true))))
+                .is_empty()
+        );
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "The chat did not load. Send a message to retry, then set plan mode.".into()
+            ))
+        );
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn web_opens_a_chat_that_is_loading_or_failed_to_load() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let id = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: Uuid::new_v4(),
+            open_chat: Some(id),
+        });
+        assert_eq!(
+            app.update(Msg::Command(Command::Web)),
+            vec![Effect::OpenWeb(id)]
+        );
+        assert!(app.update(Msg::Command(Command::Compact)).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m == "Start a chat first."));
+        app.update(Msg::ChatLoadFailed {
+            chat_id: id,
+            message: "HTTP 500".into(),
+        });
+        assert_eq!(
+            app.update(Msg::Command(Command::Web)),
+            vec![Effect::OpenWeb(id)]
+        );
+        assert!(app.update(Msg::Command(Command::Clear)).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m == "Start a chat first."));
+    }
+
+    #[test]
+    fn organization_on_a_blank_chat_says_when_it_reset_choices() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = two_orgs(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(thinker));
+        app.update(Msg::OrganizationChosen(product.id));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "New chats will use Product. Model, effort, and workspace reset to its defaults."
+                    .into()
+            ))
+        );
+        app.update(Msg::WorkspaceChosen(Some(Uuid::new_v4())));
+        app.update(Msg::OrganizationChosen(coder.id));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "New chats will use Coder. Model, effort, and workspace reset to its defaults."
+                    .into()
+            ))
+        );
+        app.update(Msg::OrganizationChosen(product.id));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info("New chats will use Product.".into())),
+            "nothing was set, so nothing reset"
+        );
+    }
+
+    #[test]
+    fn a_late_plan_mode_failure_from_the_old_chat_is_reported() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let old = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(old),
+            messages: vec![],
+        });
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::Command(Command::New));
+        app.update(Msg::ForChat {
+            chat: old,
+            msg: Box::new(Msg::PlanModeFailed {
+                on: true,
+                message: "nope".into(),
+            }),
+        });
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "In the previous chat, could not turn plan mode on: nope".into()
+            ))
+        );
+        assert!(!app.plan_mode);
     }
 }
