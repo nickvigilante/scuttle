@@ -98,9 +98,11 @@ impl Tui {
         theme: Theme,
         welcome: Welcome,
     ) -> Tui {
+        let mut composer = Composer::new(config.composer_max_lines);
+        composer.set_gutter_style(theme.dim);
         Tui {
             core: App::new(config.busy_behavior, config.mouse),
-            composer: Composer::new(config.composer_max_lines),
+            composer,
             picker: None,
             last_copied: None,
             config,
@@ -530,7 +532,7 @@ impl Tui {
         let outer = padded(f.area());
         let composer_height = self
             .composer
-            .height()
+            .height(outer.width)
             .min(outer.height.saturating_sub(2).max(3));
         let [transcript, composer, footer] = Layout::vertical([
             Constraint::Min(1),
