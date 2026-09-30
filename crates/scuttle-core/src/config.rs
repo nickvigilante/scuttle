@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use crate::density::Density;
@@ -50,6 +50,8 @@ pub struct LocalConfig {
     pub welcome: WelcomeConfig,
     pub density: BTreeMap<String, Density>,
     /// The organization new chats go to, saved by `/organization`. An ID, not a secret.
+    /// A value that is not a valid ID is ignored, so startup falls back to the default.
+    #[serde(deserialize_with = "lenient_uuid")]
     pub organization: Option<Uuid>,
 }
 
@@ -64,6 +66,12 @@ impl Default for LocalConfig {
             organization: None,
         }
     }
+}
+
+/// Reads an optional string and keeps it only when it parses as a UUID.
+fn lenient_uuid<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+    let text = Option::<String>::deserialize(d)?;
+    Ok(text.and_then(|t| Uuid::parse_str(t.trim()).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -188,6 +196,24 @@ mod tests {
         let cfg = load_from_str(&format!("organization = \"{id}\"\n")).unwrap();
         assert_eq!(cfg.organization, Some(id));
         assert_eq!(LocalConfig::default().organization, None);
+    }
+
+    #[test]
+    fn a_malformed_saved_organization_is_ignored() {
+        let cfg = load_from_str(
+            "organization = \"nope\"\nmouse = false\nbusy_behavior = \"interrupt\"\ncomposer_max_lines = 6\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.organization, None);
+        assert!(!cfg.mouse);
+        assert_eq!(cfg.busy_behavior, BusyBehavior::Interrupt);
+        assert_eq!(cfg.composer_max_lines, 6);
+        assert_eq!(
+            load_from_str("organization = \"nope\"")
+                .unwrap()
+                .organization,
+            None
+        );
     }
 
     #[test]

@@ -269,10 +269,12 @@ impl App {
             .or(self.org_id)
     }
 
-    /// The name of organization `id`, or a generic phrase when it is unknown.
+    /// The name of organization `id`, or a generic phrase when it is unknown or unnamed.
     pub fn org_label(&self, id: Option<Uuid>) -> String {
         id.and_then(|id| self.organizations.iter().find(|o| o.id == id))
-            .map(|o| o.label().to_owned())
+            .map(|o| o.label().trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
             .unwrap_or_else(|| "this organization".into())
     }
 
@@ -822,6 +824,29 @@ mod tests {
             "the retried reply is applied"
         );
         assert_eq!(app.model_name().as_deref(), Some("M"));
+    }
+
+    #[test]
+    fn an_organization_without_any_name_is_called_this_organization() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let mut unnamed = org("", false);
+        unnamed.name = String::new();
+        app.update(Msg::OrganizationsLoaded(vec![unnamed.clone()]));
+        app.update(Msg::Started {
+            org_id: unnamed.id,
+            open_chat: None,
+        });
+        app.update(Msg::ForOrg {
+            org: unnamed.id,
+            msg: Box::new(Msg::ModelsLoaded(vec![])),
+        });
+        app.update(Msg::Command(Command::Model(None)));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(
+                "No chat models are available in this organization. Try /organization.".into()
+            ))
+        );
     }
 
     #[test]
