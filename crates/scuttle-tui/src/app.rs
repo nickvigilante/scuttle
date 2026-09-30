@@ -15,7 +15,7 @@ use scuttle_core::app::{App, CopyTarget, Effect, Msg, Notice};
 use scuttle_core::config::{self, LocalConfig};
 use scuttle_core::density::SendShortcut;
 
-use crate::activity::{SPINNER_INTERVAL, activity_line};
+use crate::activity::{SPINNER_INTERVAL, activity_line, spinner_frame};
 use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
@@ -804,6 +804,21 @@ impl Tui {
                     ..transcript
                 };
                 f.buffer_mut().set_style(line, self.theme.user_tint);
+            }
+        }
+        // The markers of blocks in progress show the spinner's frame. Painting the cells keeps
+        // a timer frame from rebuilding the lines, as with the tint.
+        if !self.view.spinners.is_empty() {
+            let frame = spinner_frame(now.saturating_duration_since(self.epoch));
+            let buf = f.buffer_mut();
+            for &line in &self.view.spinners {
+                if let Some(row) = line
+                    .checked_sub(top)
+                    .filter(|row| *row < transcript.height as usize)
+                    && let Some(cell) = buf.cell_mut((transcript.x, transcript.y + row as u16))
+                {
+                    cell.set_symbol(frame);
+                }
             }
         }
         if let Some(selection) = self.selection {
@@ -2192,5 +2207,137 @@ mod tests {
             web_copy_notice(url, CopyOutcome::Failed("no terminal".into())),
             Notice::Error("Could not copy the chat URL: https://coder.example.com/agents/x".into())
         );
+    }
+
+    /// The first transcript row containing `needle` that is not the activity row, and its
+    /// first visible character.
+    fn marker_of(shown: &str, needle: &str) -> char {
+        shown
+            .lines()
+            .find(|l| l.contains(needle) && !l.contains('…'))
+            .and_then(|l| l.trim_start().chars().next())
+            .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{shown}"))
+    }
+
+    #[test]
+    fn the_thinking_line_animates_with_the_spinner() {
+        let mut t = tui();
+        loaded(&mut t, json!([]));
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        t.update(live_part(1, json!({"type": "reasoning", "text": "hmm"})));
+        let start = t.epoch;
+        let first = screen_at(&mut t, 60, 16, start);
+        assert_eq!(
+            marker_of(&first, " Thinking").to_string(),
+            crate::activity::spinner_frame(Duration::ZERO)
+        );
+        t.tick();
+        let later = screen_at(&mut t, 60, 16, start + crate::activity::SPINNER_INTERVAL);
+        assert_eq!(
+            marker_of(&later, " Thinking").to_string(),
+            crate::activity::spinner_frame(crate::activity::SPINNER_INTERVAL)
+        );
+        assert_eq!(t.view_builds, 1, "the frame came from a reused view");
+        t.update(live_part(2, json!({"type": "text", "text": "Done."})));
+        let answered = screen_at(&mut t, 60, 16, start);
+        assert_eq!(
+            marker_of(&answered, " Thinking"),
+            '∴',
+            "a finished thought stops"
+        );
+    }
+
+    #[test]
+    fn animating_a_long_transcript_reuses_its_lines() {
+        let mut t = tui();
+        let messages: Vec<_> = (1..=500)
+            .map(|i| json!({"id": i, "role": "assistant", "content": [{"type": "text", "text": format!("message {i} with **markdown** and `code`")}]}))
+            .collect();
+        loaded(&mut t, serde_json::Value::Array(messages));
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        t.update(live_part(
+            1,
+            json!({"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args_delta": "{\"command\": \"make\"}"}),
+        ));
+        let start = t.epoch;
+        let first = screen_at(&mut t, 60, 16, start);
+        assert_eq!(t.view_builds, 1);
+        assert_eq!(
+            t.view.spinners.len(),
+            1,
+            "one marker animates, however long the chat"
+        );
+        assert_eq!(
+            marker_of(&first, "execute(").to_string(),
+            crate::activity::spinner_frame(Duration::ZERO)
+        );
+        for step in 1..=3u32 {
+            t.tick();
+            let at = crate::activity::SPINNER_INTERVAL * step;
+            let shown = screen_at(&mut t, 60, 16, start + at);
+            assert_eq!(
+                marker_of(&shown, "execute(").to_string(),
+                crate::activity::spinner_frame(at)
+            );
+        }
+        assert_eq!(
+            t.view_builds, 1,
+            "timer frames never rebuild the transcript"
+        );
+    }
+
+    #[test]
+    fn copying_an_animated_row_copies_its_static_marker() {
+        let mut t = tui();
+        loaded(&mut t, json!([]));
+        t.update(stream(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        t.update(live_part(
+            1,
+            json!({"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args_delta": "{\"command\": \"make\"}"}),
+        ));
+        let start = t.epoch;
+        let shown = screen_at(&mut t, 60, 16, start);
+        let (x, y) = find(&shown, "execute(make)");
+        assert_eq!(
+            marker_of(&shown, "execute(").to_string(),
+            crate::activity::spinner_frame(Duration::ZERO),
+            "the marker is animating"
+        );
+        drag(&mut t, (x - 2, y), (x + 12, y));
+        assert_eq!(t.last_copied.as_deref(), Some("◌ execute(make)"));
+    }
+
+    #[test]
+    fn a_sent_message_stills_an_unfinished_call_of_the_turn_before() {
+        let mut t = tui();
+        t.core.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        loaded(
+            &mut t,
+            json!([
+                {"id": 1, "role": "user", "content": [{"type": "text", "text": "build it"}]},
+                {"id": 2, "role": "assistant", "content": [
+                    {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "make"}}
+                ]}
+            ]),
+        );
+        for c in "again".chars() {
+            t.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        let now = Instant::now();
+        assert!(t.animation_deadline(now).is_some(), "the agent is awaited");
+        let shown = screen_at(&mut t, 60, 16, now);
+        assert!(shown.contains("Waiting for the agent…"), "{shown}");
+        assert_eq!(marker_of(&shown, "execute(make)"), '◌');
+        assert!(t.view.spinners.is_empty());
     }
 }

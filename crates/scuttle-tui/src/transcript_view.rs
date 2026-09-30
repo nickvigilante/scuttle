@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use coder_sdk::types;
 use ratatui::text::{Line, Span};
-use scuttle_core::app::App;
+use scuttle_core::app::{Activity, App};
 use scuttle_core::density::{BlockKind, Density, density_for};
 use scuttle_core::live::LiveBlock;
 
@@ -44,6 +44,11 @@ pub struct View {
     pub lines: Vec<Line<'static>>,
     /// One entry per row of `lines`.
     pub meta: Vec<LineMeta>,
+    /// Rows whose first cell is the marker of a block in progress: the thinking line of the
+    /// reasoning the agent is in, or a tool call of the latest turn without a finished result
+    /// while the agent works. The TUI paints the spinner frame there on every draw, so a timer
+    /// frame animates them without rebuilding `lines`, which keep the static glyph.
+    pub spinners: Vec<usize>,
     pub hits: Vec<Hit>,
     /// Code blocks of the most recent assistant turn (durable or live) that had any.
     pub last_code_blocks: Vec<String>,
@@ -96,6 +101,11 @@ struct Ctx<'c> {
     toggles: &'c HashSet<BlockId>,
     /// Assistant text blocks that start a turn's answer and get a rule above them.
     answers: &'c HashSet<BlockId>,
+    /// What the agent is doing, which decides whether a block's marker animates.
+    activity: Option<Activity>,
+    /// Tool calls after the last user message. Only these can be running: a call the provider
+    /// interrupted never gets a result, and must not animate on every later turn.
+    latest_tools: &'c HashSet<BlockId>,
 }
 
 impl Out<'_> {
@@ -458,6 +468,23 @@ fn answer_starts(groups: &[(Option<i64>, Vec<Item>)]) -> HashSet<BlockId> {
     starts
 }
 
+/// The tool calls after the last user message, which make up the turn the agent is in.
+fn latest_tools(groups: &[(Option<i64>, Vec<Item>)]) -> HashSet<BlockId> {
+    let mut tools = HashSet::new();
+    for (owner, items) in groups.iter().rev() {
+        for (index, item) in items.iter().enumerate().rev() {
+            match item {
+                Item::UserText(_) => return tools,
+                Item::Tool { .. } => {
+                    tools.insert((*owner, index));
+                }
+                _ => {}
+            }
+        }
+    }
+    tools
+}
+
 /// Renders `items` into `out`, returning the code blocks of any assistant text among them.
 /// `live` selects `markdown::render` (uncached, since live text keeps changing) over
 /// `markdown::render_cached` (for durable, unchanging text).
@@ -470,6 +497,7 @@ fn render_items(
 ) -> Vec<String> {
     let width = out.width as usize;
     let mut code_blocks = Vec::new();
+    let count = items.len();
     for (index, item) in items.into_iter().enumerate() {
         let id: BlockId = (owner, index);
         match item {
@@ -526,6 +554,14 @@ fn render_items(
                     _ => vec![Line::from(Span::styled("∴ Thinking", out.theme.dim))],
                 };
                 let range = out.push(lines, false);
+                // Only the block the agent is thinking in right now animates.
+                if density != Density::Expanded
+                    && live
+                    && index + 1 == count
+                    && matches!(ctx.activity, Some(Activity::Thinking))
+                {
+                    out.view.spinners.push(range.start);
+                }
                 out.view.hits.push(Hit {
                     lines: range,
                     target: HitTarget::Toggle(id),
@@ -588,6 +624,16 @@ fn render_items(
                     wrapped.truncate(2);
                 }
                 let range = out.extend_rows(wrapped, false);
+                // A sent message the agent has not picked up yet ends the turn before it.
+                if !done
+                    && ctx.latest_tools.contains(&id)
+                    && ctx
+                        .activity
+                        .as_ref()
+                        .is_some_and(|a| *a != Activity::Waiting)
+                {
+                    out.view.spinners.push(range.start);
+                }
                 out.view.hits.push(Hit {
                     lines: range,
                     target: HitTarget::Toggle(id),
@@ -666,11 +712,14 @@ pub fn build(
         ));
     }
     let answers = answer_starts(&groups);
+    let latest_tools = latest_tools(&groups);
     let ctx = Ctx {
         app,
         overrides,
         toggles,
         answers: &answers,
+        activity: app.activity(),
+        latest_tools: &latest_tools,
     };
     let count = groups.len();
     for (i, (owner, items)) in groups.into_iter().enumerate() {
@@ -1328,6 +1377,111 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("start_workspace(dev)")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_block_in_progress_is_marked_to_animate() {
+        let mut app = app_with(json!([
+            {"id": 1, "role": "assistant", "content": [
+                {"type": "reasoning", "text": "old thought"},
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "ls"}},
+                {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}}
+            ]}
+        ]));
+        app.transcript.status = Some(coder_sdk::ChatStatus::Running);
+        app.transcript
+            .live
+            .blocks
+            .push(LiveBlock::Reasoning("hmm".into()));
+        let view = build_at(&app, 40);
+        let lines = texts(&view);
+        let thinking: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("∴ Thinking"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(thinking.len(), 2, "{lines:?}");
+        assert_eq!(
+            view.spinners,
+            vec![thinking[1]],
+            "only the live thought animates"
+        );
+
+        app.transcript.live.blocks.push(LiveBlock::ToolCall {
+            id: "b".into(),
+            name: "execute".into(),
+            args_raw: String::new(),
+            args: Some(json!({"command": "make"})),
+        });
+        let view = build_at(&app, 40);
+        let running = texts(&view)
+            .iter()
+            .position(|l| l.contains("execute(make)"))
+            .unwrap();
+        assert_eq!(
+            view.spinners,
+            vec![running],
+            "the thought is over once the tool starts"
+        );
+
+        app.transcript.status = Some(coder_sdk::ChatStatus::Waiting);
+        assert!(
+            build_at(&app, 40).spinners.is_empty(),
+            "nothing animates once the agent stops"
+        );
+    }
+
+    #[test]
+    fn a_saved_call_whose_result_still_streams_animates() {
+        let mut app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "build it"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "make"}}
+            ]}
+        ]));
+        app.transcript.status = Some(coder_sdk::ChatStatus::Running);
+        app.transcript.live.blocks.push(LiveBlock::ToolResult {
+            id: "a".into(),
+            name: "execute".into(),
+            result_raw: "compiling".into(),
+            result: None,
+            reasoning: String::new(),
+            is_error: false,
+            done: false,
+        });
+        let view = build_at(&app, 40);
+        let head = texts(&view)
+            .iter()
+            .position(|l| l.contains("execute(make)"))
+            .unwrap();
+        assert_eq!(view.spinners, vec![head], "{:?}", texts(&view));
+    }
+
+    #[test]
+    fn a_call_left_without_a_result_in_an_earlier_turn_stays_still() {
+        let mut app = app_with(json!([
+            {"id": 1, "role": "user", "content": [{"type": "text", "text": "build it"}]},
+            {"id": 2, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "a", "tool_name": "execute", "args": {"command": "make"}}
+            ]},
+            {"id": 3, "role": "user", "content": [{"type": "text", "text": "try again"}]},
+            {"id": 4, "role": "assistant", "content": [
+                {"type": "tool-call", "tool_call_id": "b", "tool_name": "execute", "args": {"command": "make test"}}
+            ]}
+        ]));
+        app.transcript.status = Some(coder_sdk::ChatStatus::Running);
+        let view = build_at(&app, 40);
+        let lines = texts(&view);
+        let current = lines
+            .iter()
+            .position(|l| l.contains("execute(make test)"))
+            .unwrap();
+        assert_eq!(
+            view.spinners,
+            vec![current],
+            "only the call of the latest turn animates: {lines:?}"
         );
     }
 }
