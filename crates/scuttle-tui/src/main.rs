@@ -182,7 +182,9 @@ async fn main() -> ExitCode {
         );
         ExitCode::FAILURE
     };
-    match client.server_version().await {
+    // Both answers are needed before the first frame, so wait for them together.
+    let (version, organizations) = tokio::join!(client.server_version(), runtime.organizations());
+    match version {
         Ok(version) => {
             if let Some(w) = scuttle_core::skew::skew_warning(&version, coder_sdk::GENERATED_FROM) {
                 tui.core.notices.push(Notice::Info(w));
@@ -191,7 +193,7 @@ async fn main() -> ExitCode {
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(_) => {}
     }
-    let organizations = match runtime.organizations().await {
+    let organizations = match organizations {
         Ok(organizations) => Ok(organizations),
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(e) => Err(e.to_string()),

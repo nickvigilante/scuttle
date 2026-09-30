@@ -127,6 +127,12 @@ impl PickerState {
         }
     }
 
+    /// Which items are dimmed, one per item.
+    #[cfg(test)]
+    pub(crate) fn dimmed(&self) -> &[bool] {
+        &self.dimmed
+    }
+
     /// The rows the picker takes, borders included: the slider needs two, a list up to eight.
     pub fn height(&self) -> u16 {
         if self.kind == Picker::Effort { 4 } else { 10 }

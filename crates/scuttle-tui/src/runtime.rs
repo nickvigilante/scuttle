@@ -138,7 +138,8 @@ impl Runtime {
 
     /// The user's organizations, in the server's order, which is not stable; pick one with
     /// `scuttle_core::app::pick_organization`. With two or more, each is marked with whether
-    /// the user may create chats there.
+    /// the user may create chats there, which costs those users one extra round trip at
+    /// startup, since the pick needs the answer before the first frame.
     pub async fn organizations(&self) -> Result<Vec<OrgRef>, coder_sdk::Error> {
         let mut orgs: Vec<OrgRef> = match self.client.api().get_organizations_by_user("me").await {
             Ok(r) => r

@@ -2118,6 +2118,58 @@ mod tests {
     }
 
     #[test]
+    fn with_every_organization_denied_the_picker_dims_them_all_and_refuses_each() {
+        use scuttle_core::app::{Notice, OrgRef};
+        let mut t = tui();
+        let org = |name: &str, is_default| OrgRef {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_lowercase(),
+            display_name: name.into(),
+            is_default,
+            can_create_chats: false,
+        };
+        let (product, coder) = (org("Product", false), org("Coder", true));
+        t.core.update(Msg::OrganizationsLoaded(vec![
+            product.clone(),
+            coder.clone(),
+        ]));
+        t.core.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: None,
+        });
+        for (moves, label) in [(0, "Coder"), (1, "Product")] {
+            let effects =
+                t.core
+                    .update(Msg::Command(scuttle_core::commands::Command::Organization(
+                        None,
+                    )));
+            for e in &effects {
+                assert!(t.apply_ui_effect(e), "{e:?}");
+            }
+            let picker = t.picker.as_ref().expect("the picker opens");
+            assert_eq!(picker.dimmed(), [true, true], "every row is dimmed");
+            for _ in 0..moves {
+                t.handle(key(KeyCode::Up, KeyModifiers::NONE));
+            }
+            let effects = t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(t.picker.is_none());
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::SaveOrganization(_))),
+                "choosing {label} saves nothing: {effects:?}"
+            );
+            assert_eq!(t.core.org_id, Some(coder.id));
+            assert_eq!(
+                t.core.notices.last(),
+                Some(&Notice::Error(format!(
+                    "You do not have permission to create chats in {label}."
+                )))
+            );
+        }
+    }
+
+    #[test]
     fn slash_new_clears_the_view_and_keeps_the_draft() {
         let mut t = tui();
         t.core.update(Msg::Started {
