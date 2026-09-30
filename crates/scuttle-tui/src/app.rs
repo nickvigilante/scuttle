@@ -585,6 +585,10 @@ impl Tui {
                     self.picker = None;
                     self.update(Msg::WorkspaceChosen(ws))
                 }
+                Some(PickerChoice::Effort(level)) => {
+                    self.picker = None;
+                    self.update(Msg::EffortChosen(level))
+                }
                 None => vec![],
             };
         }
@@ -967,6 +971,26 @@ mod tests {
         assert!(t.picker.is_some());
         t.handle(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(t.picker.is_none());
+    }
+
+    #[test]
+    fn slash_effort_opens_the_picker_and_enter_sets_the_effort() {
+        let mut t = tui();
+        t.core.update(Msg::ModelsLoaded(
+            serde_json::from_value(json!([
+                {"id": uuid::Uuid::new_v4(), "display_name": "Thinker", "enabled": true, "is_default": true, "reasoning_efforts": ["low", "high"]}
+            ]))
+            .unwrap(),
+        ));
+        let effects = t.update(Msg::Submit("/effort".into()));
+        for e in &effects {
+            t.apply_ui_effect(e);
+        }
+        assert!(t.picker.is_some());
+        t.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.picker.is_none());
+        assert_eq!(t.core.selected_effort.as_deref(), Some("high"));
     }
 
     #[test]

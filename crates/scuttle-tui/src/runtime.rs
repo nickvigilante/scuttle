@@ -179,12 +179,14 @@ impl Runtime {
                 text,
                 model,
                 workspace,
+                turn,
             } => self.spawn(Box::pin(async move {
                 let body = types::CodersdkCreateChatRequest {
                     organization_id: Some(org),
                     content: vec![text_part(&text)],
                     model_config_id: model,
                     workspace_id: workspace,
+                    reasoning_effort: turn.effort,
                     ..Default::default()
                 };
                 match client.api().create_chat(&body).await {
@@ -199,11 +201,13 @@ impl Runtime {
                 text,
                 model,
                 busy,
+                turn,
             } => self.spawn(Box::pin(async move {
                 let body = types::CodersdkCreateChatMessageRequest {
                     content: vec![text_part(&text)],
                     model_config_id: model,
                     busy_behavior: Some(types::CodersdkChatBusyBehavior(busy.as_str().into())),
+                    reasoning_effort: turn.effort,
                     ..Default::default()
                 };
                 match client.api().send_chat_message(&chat, &body).await {
@@ -323,6 +327,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use futures::SinkExt;
+    use scuttle_core::app::TurnOptions;
     use secrecy::SecretString;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -400,6 +405,7 @@ mod tests {
             text: "hello".into(),
             model: None,
             workspace: None,
+            turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
             Msg::CreateFailed { message } => {
@@ -433,6 +439,7 @@ mod tests {
             text: "hello".into(),
             model: None,
             workspace: None,
+            turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
             Msg::ChatCreated(chat) => assert_eq!(chat.id, Some(id)),
@@ -599,6 +606,7 @@ mod tests {
             text: "keep this".into(),
             model: None,
             busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
             Msg::SendFailed { text, message } => {
@@ -608,6 +616,53 @@ mod tests {
             }
             other => panic!("expected SendFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn messages_and_new_chats_carry_the_chosen_effort() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/chats/{chat}/messages")))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"reasoning_effort": "high"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let created = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/chats"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"reasoning_effort": "low"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": created, "children": [], "files": [], "mcp_server_ids": [],
+                "inline_mcp_servers": [], "labels": {}
+            })))
+            .mount(&server)
+            .await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "hi".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                effort: Some("high".into()),
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        rt.run(Effect::CreateChat {
+            org: Uuid::new_v4(),
+            text: "hi".into(),
+            model: None,
+            workspace: None,
+            turn: TurnOptions {
+                effort: Some("low".into()),
+            },
+        });
+        assert!(matches!(next(&mut rx).await, Msg::ChatCreated(_)));
     }
 
     #[tokio::test]

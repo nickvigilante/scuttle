@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Model(Option<String>),
+    Effort(Option<String>),
     Workspace(Option<String>),
     Compact,
     Clear,
@@ -24,6 +25,11 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "/model",
         usage: "/model [name]",
         description: "Pick the model for the next message",
+    },
+    CommandInfo {
+        name: "/effort",
+        usage: "/effort [level]",
+        description: "Pick the reasoning effort for the next message",
     },
     CommandInfo {
         name: "/workspace",
@@ -73,6 +79,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
     };
     match name {
         "model" => Ok(Command::Model(arg.map(str::to_owned))),
+        "effort" => Ok(Command::Effort(arg.map(str::to_owned))),
         "workspace" => Ok(Command::Workspace(arg.map(str::to_owned))),
         "compact" => Ok(Command::Compact),
         "clear" => Ok(Command::Clear),
@@ -100,6 +107,16 @@ pub fn completions(prefix: &str) -> Vec<&'static CommandInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_effort() {
+        assert_eq!(
+            parse("/effort high"),
+            Ok(Command::Effort(Some("high".into())))
+        );
+        assert_eq!(parse("/effort"), Ok(Command::Effort(None)));
+        assert!(completions("/e").iter().any(|c| c.name == "/effort"));
+    }
 
     #[test]
     fn parses_commands_and_arguments() {

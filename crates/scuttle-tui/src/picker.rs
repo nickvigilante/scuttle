@@ -13,6 +13,7 @@ use crate::theme::Theme;
 pub enum PickerChoice {
     Model(Uuid),
     Workspace(Option<Uuid>),
+    Effort(String),
     Cancel,
 }
 
@@ -24,7 +25,7 @@ pub struct PickerState {
 
 impl PickerState {
     pub fn open(kind: Picker, app: &App) -> PickerState {
-        let items = match kind {
+        let items: Vec<(String, Option<Uuid>)> = match kind {
             // `enabled != Some(false)` matches App's own filter on `Msg::ModelsLoaded`;
             // repeating it here keeps the picker correct even if that changes.
             Picker::Model => app
@@ -41,11 +42,19 @@ impl PickerState {
             Picker::Workspace => std::iter::once(("none (no workspace)".to_string(), None))
                 .chain(app.workspaces.iter().map(|w| (w.name.clone(), Some(w.id))))
                 .collect(),
+            Picker::Effort => app.efforts().iter().map(|e| (e.clone(), None)).collect(),
+        };
+        let selected = match kind {
+            Picker::Effort => app
+                .effort_label()
+                .and_then(|current| items.iter().position(|(name, _)| *name == current))
+                .unwrap_or(0),
+            Picker::Model | Picker::Workspace => 0,
         };
         PickerState {
             kind,
             items,
-            selected: 0,
+            selected,
         }
     }
 
@@ -63,10 +72,11 @@ impl PickerState {
                 None
             }
             KeyCode::Enter => {
-                let (_, id) = self.items.get(self.selected)?;
+                let (name, id) = self.items.get(self.selected)?;
                 Some(match self.kind {
                     Picker::Model => PickerChoice::Model((*id)?),
                     Picker::Workspace => PickerChoice::Workspace(*id),
+                    Picker::Effort => PickerChoice::Effort(name.clone()),
                 })
             }
             _ => None,
@@ -77,6 +87,7 @@ impl PickerState {
         let title = match self.kind {
             Picker::Model => " Model ",
             Picker::Workspace => " Workspace ",
+            Picker::Effort => " Reasoning effort ",
         };
         let items: Vec<ListItem> = self
             .items
@@ -142,6 +153,26 @@ mod tests {
         );
         let mut p = PickerState::open(Picker::Workspace, &app);
         assert_eq!(press(&mut p, KeyCode::Esc), Some(PickerChoice::Cancel));
+    }
+
+    #[test]
+    fn effort_picker_lists_the_efforts_and_starts_on_the_current_one() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::ModelsLoaded(
+            serde_json::from_value(json!([
+                {"id": uuid::Uuid::new_v4(), "display_name": "Thinker", "enabled": true, "is_default": true, "reasoning_efforts": ["low", "medium", "high"]}
+            ]))
+            .unwrap(),
+        ));
+        app.update(Msg::EffortChosen("medium".into()));
+        let mut p = PickerState::open(Picker::Effort, &app);
+        let names: Vec<&str> = p.items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["low", "medium", "high"]);
+        press(&mut p, KeyCode::Down);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            Some(PickerChoice::Effort("high".into()))
+        );
     }
 
     #[test]

@@ -68,6 +68,7 @@ pub enum Connection {
 pub enum Picker {
     Model,
     Workspace,
+    Effort,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,6 +83,13 @@ pub enum ModelsState {
 pub enum CopyTarget {
     LastMessage,
     CodeBlock(usize),
+}
+
+/// Options that ride along with a new chat or a sent message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnOptions {
+    /// The reasoning effort chosen with `/effort`; `None` leaves the server's default.
+    pub effort: Option<String>,
 }
 
 /// What the agent is doing, for the animated activity line.
@@ -144,6 +152,8 @@ pub enum Msg {
     },
     WorkspacesLoaded(Vec<WorkspaceRef>),
     ModelChosen(Uuid),
+    /// A reasoning effort picked by name, from `/effort <level>` or the effort picker.
+    EffortChosen(String),
     WorkspaceChosen(Option<Uuid>),
     ApiFailed {
         action: &'static str,
@@ -173,12 +183,14 @@ pub enum Effect {
         text: String,
         model: Option<Uuid>,
         workspace: Option<Uuid>,
+        turn: TurnOptions,
     },
     SendMessage {
         chat: Uuid,
         text: String,
         model: Option<Uuid>,
         busy: BusyBehavior,
+        turn: TurnOptions,
     },
     Interrupt(Uuid),
     Compact(Uuid),
@@ -219,6 +231,8 @@ pub struct App {
     lists_org: Option<Uuid>,
     pub selected_model: Option<Uuid>,
     pub selected_workspace: Option<Uuid>,
+    /// The reasoning effort chosen with `/effort`, sent only while the current model offers it.
+    pub selected_effort: Option<String>,
     pub notices: Vec<Notice>,
     pub connection: Connection,
     pub busy: BusyBehavior,
@@ -269,16 +283,62 @@ impl App {
         )
     }
 
-    /// The display name of the model the next message will use.
-    pub fn model_name(&self) -> Option<String> {
+    /// The model the next message will use: the chosen one, else the deployment default.
+    pub fn current_model(&self) -> Option<&types::CodersdkChatModel> {
         let id = self.selected_model.or_else(|| {
             self.models
                 .iter()
                 .find(|m| m.is_default == Some(true))
                 .and_then(|m| m.id)
         })?;
-        let model = self.models.iter().find(|m| m.id == Some(id))?;
+        self.models.iter().find(|m| m.id == Some(id))
+    }
+
+    /// The display name of the model the next message will use.
+    pub fn model_name(&self) -> Option<String> {
+        let model = self.current_model()?;
         model.display_name.clone().or_else(|| model.model.clone())
+    }
+
+    /// The reasoning efforts the current model offers, lowest first.
+    pub fn efforts(&self) -> &[String] {
+        self.current_model()
+            .map(|m| m.reasoning_efforts.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The effort sent with the next message: the chosen one, if the current model offers it.
+    pub fn effort(&self) -> Option<String> {
+        self.selected_effort
+            .clone()
+            .filter(|e| self.efforts().contains(e))
+    }
+
+    /// The effort to show as current: the chosen one, else the chat's last one, else the
+    /// model's default, each only if the current model offers it.
+    pub fn effort_label(&self) -> Option<String> {
+        let offered = |e: &String| self.efforts().contains(e);
+        self.effort()
+            .or_else(|| {
+                self.chat
+                    .as_ref()
+                    .and_then(|c| c.last_reasoning_effort.clone())
+                    .filter(offered)
+            })
+            .or_else(|| {
+                self.current_model()
+                    .and_then(|m| m.model_config.as_ref())
+                    .and_then(|c| c.reasoning_effort.as_ref())
+                    .and_then(|r| r.default.clone())
+                    .filter(offered)
+            })
+    }
+
+    /// Options for the next message sent to an existing chat.
+    fn turn(&self) -> TurnOptions {
+        TurnOptions {
+            effort: self.effort(),
+        }
     }
 
     /// What the agent is doing, or `None` while it is idle or waiting on the user.
@@ -375,6 +435,7 @@ impl App {
         }
         if self.lists_org.is_some() {
             self.selected_model = None;
+            self.selected_effort = None;
         }
         self.lists_org = Some(org);
         self.models.clear();
@@ -445,6 +506,7 @@ impl App {
                         text,
                         model: self.selected_model,
                         busy: self.busy,
+                        turn: self.turn(),
                     });
                 }
                 effects
@@ -481,6 +543,7 @@ impl App {
                         text,
                         model: self.selected_model,
                         busy: self.busy,
+                        turn: self.turn(),
                     });
                 }
                 effects
@@ -564,6 +627,37 @@ impl App {
                 if let Some(name) = self.model_name() {
                     self.info(format!("Model set to {name}"));
                 }
+                if self
+                    .selected_effort
+                    .as_ref()
+                    .is_some_and(|e| !self.efforts().contains(e))
+                {
+                    let effort = self.selected_effort.take().unwrap_or_default();
+                    self.info(format!(
+                        "This model does not offer {effort} reasoning effort; using its default."
+                    ));
+                }
+                vec![]
+            }
+            Msg::EffortChosen(level) => {
+                let wanted = level.to_lowercase();
+                let found = self
+                    .efforts()
+                    .iter()
+                    .find(|e| e.to_lowercase() == wanted)
+                    .cloned();
+                match found {
+                    Some(effort) => {
+                        self.info(format!("Reasoning effort set to {effort}"));
+                        self.selected_effort = Some(effort);
+                    }
+                    None => {
+                        let offered = self.efforts().join(", ");
+                        self.error(format!(
+                            "No reasoning effort named {level:?}; choose one of {offered}."
+                        ));
+                    }
+                }
                 vec![]
             }
             Msg::WorkspaceChosen(ws) => self.set_workspace(ws),
@@ -637,6 +731,7 @@ impl App {
                 text,
                 model: self.selected_model,
                 busy: self.busy,
+                turn: self.turn(),
             }];
         }
         if self.creating.is_some() {
@@ -675,6 +770,7 @@ impl App {
             text,
             model: self.selected_model,
             workspace: self.selected_workspace,
+            turn: self.turn(),
         }]
     }
 
@@ -689,13 +785,27 @@ impl App {
         }
     }
 
+    fn effort_command(&mut self, level: Option<String>) -> Vec<Effect> {
+        if self.efforts().is_empty() {
+            let name = self
+                .model_name()
+                .unwrap_or_else(|| "The current model".into());
+            self.info(format!("{name} has no reasoning effort levels."));
+            return vec![];
+        }
+        match level {
+            None => vec![Effect::ShowPicker(Picker::Effort)],
+            Some(level) => self.update(Msg::EffortChosen(level)),
+        }
+    }
+
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         match cmd {
-            Command::Model(_) if self.models_state == ModelsState::Loading => {
+            Command::Model(_) | Command::Effort(_) if self.models_state == ModelsState::Loading => {
                 self.info("Models are still loading.");
                 vec![]
             }
-            Command::Model(_) if self.models_state == ModelsState::Failed => {
+            Command::Model(_) | Command::Effort(_) if self.models_state == ModelsState::Failed => {
                 // Retry for the organization the lists belong to, so the tagged reply is applied.
                 let Some(org) = self.lists_org.or(self.org_id) else {
                     self.info("Models are still loading.");
@@ -705,7 +815,7 @@ impl App {
                 self.info("Retrying the model list.");
                 vec![Effect::FetchModels(org)]
             }
-            Command::Model(_) if self.no_models() => {
+            Command::Model(_) | Command::Effort(_) if self.no_models() => {
                 let message = self.no_models_message();
                 self.info(message);
                 vec![]
@@ -725,6 +835,7 @@ impl App {
                     }
                 }
             }
+            Command::Effort(level) => self.effort_command(level),
             Command::Workspace(None) => vec![Effect::ShowPicker(Picker::Workspace)],
             Command::Workspace(Some(name)) if name == "none" => self.set_workspace(None),
             Command::Workspace(Some(name)) => match self
@@ -787,6 +898,116 @@ mod tests {
             open_chat: None,
         });
         org
+    }
+
+    /// Loads a default model with three efforts and a second model with none.
+    fn with_efforts(app: &mut App) -> (Uuid, Uuid) {
+        let (thinker, plain) = (Uuid::new_v4(), Uuid::new_v4());
+        app.update(Msg::ModelsLoaded(vec![
+            serde_json::from_value(json!({"id": thinker, "display_name": "Thinker", "model": "thinker", "enabled": true, "is_default": true, "reasoning_efforts": ["low", "medium", "high"], "model_config": {"reasoning_effort": {"default": "medium"}}})).unwrap(),
+            serde_json::from_value(json!({"id": plain, "display_name": "Plain", "model": "plain", "enabled": true, "reasoning_efforts": []})).unwrap(),
+        ]));
+        (thinker, plain)
+    }
+
+    #[test]
+    fn effort_is_chosen_by_name_and_sent_with_messages() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        with_efforts(&mut app);
+        assert!(
+            app.update(Msg::Command(Command::Effort(Some("HIGH".into()))))
+                .is_empty()
+        );
+        assert_eq!(app.selected_effort.as_deref(), Some("high"));
+        assert_eq!(
+            app.update(Msg::Submit("hi".into())),
+            vec![Effect::CreateChat {
+                org,
+                text: "hi".into(),
+                model: None,
+                workspace: None,
+                turn: TurnOptions {
+                    effort: Some("high".into())
+                }
+            }]
+        );
+        assert_eq!(
+            app.update(Msg::Command(Command::Effort(None))),
+            vec![Effect::ShowPicker(Picker::Effort)]
+        );
+        app.update(Msg::Command(Command::Effort(Some("extreme".into()))));
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("low, medium, high"))
+        );
+        assert_eq!(app.selected_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn effort_on_a_model_without_efforts_says_so() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        let (_, plain) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(plain));
+        assert!(app.update(Msg::Command(Command::Effort(None))).is_empty());
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m == "Plain has no reasoning effort levels.")
+        );
+        assert!(
+            app.update(Msg::Command(Command::Effort(Some("high".into()))))
+                .is_empty()
+        );
+        assert_eq!(app.selected_effort, None);
+        assert_eq!(
+            app.update(Msg::Submit("hi".into())),
+            vec![Effect::CreateChat {
+                org,
+                text: "hi".into(),
+                model: Some(plain),
+                workspace: None,
+                turn: TurnOptions::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn switching_to_a_model_without_the_effort_drops_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let (_, plain) = with_efforts(&mut app);
+        app.update(Msg::EffortChosen("low".into()));
+        app.update(Msg::ModelChosen(plain));
+        assert_eq!(app.selected_effort, None);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("does not offer low"))
+        );
+    }
+
+    #[test]
+    fn effort_waits_for_the_model_list() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        assert!(app.update(Msg::Command(Command::Effort(None))).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still loading")));
+    }
+
+    #[test]
+    fn the_effort_label_prefers_the_choice_then_the_chat_then_the_default() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        with_efforts(&mut app);
+        assert_eq!(app.effort_label().as_deref(), Some("medium"));
+        let with_last: Box<types::CodersdkChat> = Box::new(
+            serde_json::from_value(json!({"id": Uuid::new_v4(), "title": "t", "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}, "last_reasoning_effort": "low"}))
+                .unwrap(),
+        );
+        app.update(Msg::ChatLoaded {
+            chat: with_last,
+            messages: vec![],
+        });
+        assert_eq!(app.effort_label().as_deref(), Some("low"));
+        app.update(Msg::EffortChosen("high".into()));
+        assert_eq!(app.effort_label().as_deref(), Some("high"));
     }
 
     fn ev(v: serde_json::Value) -> Msg {
@@ -1014,7 +1235,8 @@ mod tests {
                 org,
                 text: "hello".into(),
                 model: None,
-                workspace: None
+                workspace: None,
+                turn: TurnOptions::default()
             }]
         );
     }
@@ -1037,7 +1259,8 @@ mod tests {
             chat: id,
             text: "two".into(),
             model: None,
-            busy: BusyBehavior::Queue
+            busy: BusyBehavior::Queue,
+            turn: TurnOptions::default()
         }));
     }
 
@@ -1073,7 +1296,8 @@ mod tests {
                 org,
                 text: "three".into(),
                 model: None,
-                workspace: None
+                workspace: None,
+                turn: TurnOptions::default()
             }]
         );
         let id = Uuid::new_v4();
@@ -1165,7 +1389,8 @@ mod tests {
                 chat: id,
                 text: "hi".into(),
                 model: None,
-                busy: BusyBehavior::Interrupt
+                busy: BusyBehavior::Interrupt,
+                turn: TurnOptions::default()
             }]
         );
         assert!(app.update(Msg::Submit("   ".into())).is_empty());
@@ -1504,7 +1729,8 @@ mod tests {
                     chat: requested,
                     text: "reply".into(),
                     model: None,
-                    busy: BusyBehavior::Queue
+                    busy: BusyBehavior::Queue,
+                    turn: TurnOptions::default()
                 }
             ]
         );
@@ -1528,7 +1754,8 @@ mod tests {
             chat: requested,
             text: "early".into(),
             model: None,
-            busy: BusyBehavior::Queue
+            busy: BusyBehavior::Queue,
+            turn: TurnOptions::default()
         }));
         assert!(
             !effects
