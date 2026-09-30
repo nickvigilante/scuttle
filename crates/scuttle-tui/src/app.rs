@@ -8,7 +8,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use scuttle_core::app::{App, CopyTarget, Effect, Msg, Notice};
@@ -25,6 +25,18 @@ use crate::transcript_view::{self, BlockId, HitTarget, View, Welcome};
 
 /// How long a notice replaces the status footer when no key is pressed.
 pub const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// Screens narrower or shorter than this keep every cell for content instead of a margin.
+const MIN_PADDED: (u16, u16) = (20, 8);
+
+/// The screen inside a one-cell margin on every side, or all of it on a tiny terminal.
+fn padded(area: Rect) -> Rect {
+    if area.width >= MIN_PADDED.0 && area.height >= MIN_PADDED.1 {
+        area.inner(Margin::new(1, 1))
+    } else {
+        area
+    }
+}
 
 const PLACEHOLDER_SHIFT: &str =
     "Message the agent. Enter to send, Shift+Enter for a new line, /help for commands.";
@@ -515,16 +527,17 @@ impl Tui {
     pub fn draw(&mut self, f: &mut Frame) {
         self.prune_live_toggles();
         self.sync_notice(Instant::now());
+        let outer = padded(f.area());
         let composer_height = self
             .composer
             .height()
-            .min(f.area().height.saturating_sub(2).max(3));
+            .min(outer.height.saturating_sub(2).max(3));
         let [transcript, composer, footer] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
-        .areas(f.area());
+        .areas(outer);
         self.area = transcript;
         self.view = transcript_view::build(
             &self.core,
@@ -719,6 +732,44 @@ mod tests {
     }
 
     #[test]
+    fn click_hit_testing_accounts_for_the_margin_offset() {
+        let mut t = tui();
+        let chat = serde_json::from_value(json!({"id": uuid::Uuid::new_v4(), "children": [], "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}})).unwrap();
+        t.core.update(Msg::ChatLoaded {
+            chat: Box::new(chat),
+            messages: serde_json::from_value(json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "```\necho hi\n```"}]}])).unwrap(),
+        });
+        let shown = screen(&mut t, 60, 20);
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(
+            rows[0].trim().is_empty(),
+            "top margin row holds no content: {:?}",
+            rows[0]
+        );
+        let code_row = rows
+            .iter()
+            .position(|r| r.contains("echo hi"))
+            .expect("code block on screen") as u16;
+        assert!(code_row > 0, "the code row sits below the top margin");
+        // The margin row is not backed by any transcript line, so a click there must miss.
+        t.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(t.last_copied, None, "the margin row is not a hit target");
+        // The code block's actual screen row, shifted down by the margin, still resolves.
+        t.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: code_row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(t.last_copied.as_deref(), Some("echo hi\n"));
+    }
+
+    #[test]
     fn slash_model_opens_the_picker_and_escape_closes_it() {
         let mut t = tui();
         // `/model` only opens the picker once the model list has loaded.
@@ -744,6 +795,39 @@ mod tests {
         let result = t.edit_with(|_path| Err(std::io::Error::other("editor crashed")));
         assert!(result.is_err());
         assert_eq!(t.composer.text(), "keep me");
+    }
+
+    #[test]
+    fn the_screen_keeps_a_one_cell_margin() {
+        let mut t = tui();
+        t.core.notices.push(Notice::Info("margin check".into()));
+        t.sync_notice(Instant::now());
+        let (w, h) = (60u16, 16u16);
+        let shown = screen(&mut t, w, h);
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(rows[0].trim().is_empty(), "top row: {:?}", rows[0]);
+        assert!(rows[h as usize - 1].trim().is_empty(), "bottom row");
+        for row in &rows {
+            assert!(row.starts_with(' ') && row.ends_with(' '), "{row:?}");
+        }
+        assert!(
+            rows[h as usize - 2].starts_with(" margin check"),
+            "the footer sits inside the margin: {:?}",
+            rows[h as usize - 2]
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_gives_up_the_margin() {
+        let mut t = tui();
+        let shown = screen(&mut t, 20, 6);
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(
+            rows[2].starts_with('─'),
+            "the composer border starts at column 0: {rows:?}"
+        );
+        let padded = screen(&mut t, 40, 10);
+        assert!(padded.lines().all(|r| r.starts_with(' ')), "{padded}");
     }
 
     #[test]
