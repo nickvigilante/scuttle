@@ -275,7 +275,6 @@ mod tests {
 
     #[test]
     fn the_slider_marks_the_chosen_level_under_its_name() {
-        use unicode_width::UnicodeWidthStr;
         let theme = Theme::terminal(true);
         let rows = slider_rows(&["low", "medium", "high"], 1, &theme);
         let (names, track) = (row_text(&rows[0]), row_text(&rows[1]));

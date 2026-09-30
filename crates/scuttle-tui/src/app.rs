@@ -1337,10 +1337,18 @@ mod tests {
         let top = screen(&mut t, 60, 14);
         assert!(top.contains("/model"), "{top}");
         assert!(!top.contains("Ctrl+C twice"), "{top}");
-        for _ in 0..45 {
+        // Scroll to the bottom without depending on today's exact help length: keep pressing
+        // Down until the screen stops changing, capped so a scrolling regression fails fast
+        // instead of looping.
+        let mut bottom = screen(&mut t, 60, 14);
+        for _ in 0..200 {
             t.handle(key(KeyCode::Down, KeyModifiers::NONE));
+            let next = screen(&mut t, 60, 14);
+            if next == bottom {
+                break;
+            }
+            bottom = next;
         }
-        let bottom = screen(&mut t, 60, 14);
         assert!(bottom.contains("Ctrl+C twice"), "{bottom}");
         assert!(t.show_help);
         t.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
