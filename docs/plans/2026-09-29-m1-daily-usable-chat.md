@@ -15,7 +15,7 @@
 - SDK work happens on branch `m1-sdk`, created from `m0-sdk`, in the worktree `~/git/nickvigilante/unofficial-coder-sdk-rs/.worktrees/m1-sdk`.
 - scuttle work happens on branch `m1` in the worktree `~/git/nickvigilante/scuttle/.worktrees/m1`.
 - Never commit on `main`, never push, never add a remote, never create a GitHub repo.
-- `scuttle` depends on `coder-sdk` by git revision: `coder-sdk = { git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs", rev = "<full sha>" }`.
+- `scuttle` depends on `coder-sdk` by git revision: `coder-sdk = { git = "file://<unofficial-coder-sdk-rs checkout>", rev = "<full sha>" }`.
 - `scuttle-core` has no terminal dependencies (no ratatui, crossterm, arboard); `scuttle-tui` never calls the API outside `runtime.rs`.
 - The local config file is `$XDG_CONFIG_HOME/scuttle/config.toml`, defaulting to `~/.config/scuttle/config.toml` on every platform, and never contains secrets.
 - The session token is never printed, logged, rendered, or written anywhere by scuttle.
@@ -26,7 +26,7 @@
 
 ## Decisions this plan makes that the spec left open
 
-- The Codernaut artwork is pending a brand question for Coder (spec open question 7), so the welcome screen shows a text wordmark by default and renders art only from a user-supplied file named by `welcome.art_file` in the local config.
+- The Codernaut artwork is pending a brand question for a Coder maintainer (spec open question 7), so the welcome screen shows a text wordmark by default and renders art only from a user-supplied file named by `welcome.art_file` in the local config.
 - `/new`, `/chats`, `/title`, `/queue`, `/plan`, attachments, `/statusline`, `/usage`, `/settings`, `/provider-keys`, `/theme`, and `/keybindings` belong to later milestones per spec section 10. M1 adds `/help` and `/quit` so the app is usable, because the spec's command table lists both.
 - M1 loads the most recent 200 messages of an existing chat; older history is out of scope until M2.
 - Typing an unknown `/name` shows an error instead of sending it to the agent; skills in the `/` menu arrive with M4.
@@ -281,7 +281,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-coder-sdk = { git = "https://github.com/nickvigilante/unofficial-coder-sdk-rs", rev = "REPLACE_WITH_TASK_2_SHA" }
+coder-sdk = { git = "file://<unofficial-coder-sdk-rs checkout>", rev = "REPLACE_WITH_TASK_2_SHA" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -4691,7 +4691,7 @@ Expected: all tests pass, including the six `app::tests`; clippy and fmt are cle
 
 - [ ] **Step 8: Try it for real**
 
-Run: `cargo run -p scuttle-tui` in a real terminal (the author's Coder session is discovered automatically).
+Run: `cargo run -p scuttle-tui` in a real terminal (the author's session, from a deployment that tracks main, is discovered automatically).
 Expected: the welcome screen appears, typing a message and pressing Enter creates a chat and streams a reply, Esc interrupts, clicking a tool call expands it, `/copy` copies, `/model` opens the picker, and Ctrl+C twice exits with the terminal restored. Record what happened in the report, including anything that looked wrong.
 
 - [ ] **Step 9: Commit**
