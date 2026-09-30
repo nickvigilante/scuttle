@@ -388,7 +388,11 @@ impl App {
     /// (`pickReasoningEffort` in `site/src/pages/AgentsPage/utils/reasoningEffort.ts:32-50`,
     /// called from `AgentChatPage.tsx:464-471`): the one chosen with `/effort`, else the open
     /// chat's last one, if the current model offers it; else the model's default, if offered;
-    /// else the highest. `None` only when the model offers no efforts.
+    /// else the highest. `None` when the model offers no efforts, and also while the model
+    /// list is still unloaded (no model is known to offer any). For an existing chat, sending
+    /// `None` is not a loss: the server keeps the chat's last effort when none is sent
+    /// (`COALESCE(batch.last_reasoning_effort, chats.last_reasoning_effort)` in
+    /// `coderd/database/queries/chats.sql`).
     pub fn effort(&self) -> Option<String> {
         let efforts = self.efforts();
         let offered = |e: &String| efforts.contains(e);
@@ -829,12 +833,14 @@ impl App {
                 if let Some(name) = self.model_name() {
                     self.info(format!("Model set to {name}"));
                 }
-                if self
+                if let Some(effort) = self
                     .selected_effort
-                    .as_ref()
-                    .is_some_and(|e| !self.efforts().contains(e))
+                    .clone()
+                    .filter(|e| !self.efforts().contains(e))
                 {
-                    let effort = self.selected_effort.take().unwrap_or_default();
+                    // The selection stays (the web UI never clears it on a model change), so a
+                    // later switch back to a model that offers it uses it again. `effort()`
+                    // already falls back to this model's default, filtered by what it offers.
                     let note = match self.effort() {
                         Some(now) => format!(
                             "This model does not offer {effort} reasoning effort; using {now}."
@@ -1306,15 +1312,61 @@ mod tests {
     }
 
     #[test]
-    fn switching_to_a_model_without_the_effort_drops_it() {
+    fn switching_to_a_model_without_the_effort_keeps_it_for_later() {
         let mut app = App::new(BusyBehavior::Queue, true);
         started(&mut app);
-        let (_, plain) = with_efforts(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        let other = Uuid::new_v4();
+        let mut models = app.models.clone();
+        models.push(serde_json::from_value(json!({"id": other, "display_name": "Other", "enabled": true, "reasoning_efforts": ["medium", "high"], "model_config": {"reasoning_effort": {"default": "high"}}})).unwrap());
+        app.update(Msg::ModelsLoaded(models));
         app.update(Msg::EffortChosen("low".into()));
-        app.update(Msg::ModelChosen(plain));
-        assert_eq!(app.selected_effort, None);
+        assert_eq!(app.selected_effort.as_deref(), Some("low"));
+
+        app.update(Msg::ModelChosen(other));
+        assert_eq!(
+            app.selected_effort.as_deref(),
+            Some("low"),
+            "the web UI never clears the selection on a model change"
+        );
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("high"),
+            "the new model's default is sent, not the selection it lacks"
+        );
         assert!(
-            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("does not offer low"))
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("does not offer low") && m.contains("using high"))
+        );
+
+        app.update(Msg::ModelChosen(thinker));
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("low"),
+            "switching back to a model that offers the selection sends it again"
+        );
+    }
+
+    #[test]
+    fn a_selected_effort_the_new_model_lacks_beats_the_chats_last_effort_it_offers() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        with_efforts(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_effort("low"),
+            messages: vec![],
+        });
+        app.update(Msg::EffortChosen("high".into()));
+
+        let other = Uuid::new_v4();
+        let mut models = app.models.clone();
+        models.push(serde_json::from_value(json!({"id": other, "display_name": "Other", "enabled": true, "reasoning_efforts": ["low", "medium"], "model_config": {"reasoning_effort": {"default": "medium"}}})).unwrap());
+        app.update(Msg::ModelsLoaded(models));
+        app.update(Msg::ModelChosen(other));
+
+        assert_eq!(
+            app.effort().as_deref(),
+            Some("medium"),
+            "the model default wins; the chat's last effort does not, even though the new model offers it"
         );
     }
 
@@ -1439,7 +1491,11 @@ mod tests {
         app.update(Msg::ModelsLoaded(models));
         app.update(Msg::EffortChosen("medium".into()));
         app.update(Msg::ModelChosen(other));
-        assert_eq!(app.selected_effort, None);
+        assert_eq!(
+            app.selected_effort.as_deref(),
+            Some("medium"),
+            "the selection stays for a later model that offers it"
+        );
         assert_eq!(
             app.notices.last(),
             Some(&Notice::Info(
