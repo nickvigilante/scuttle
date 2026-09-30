@@ -12,7 +12,6 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use scuttle_core::app::{App, CopyTarget, Effect, Msg, Notice};
-use scuttle_core::commands::COMMANDS;
 use scuttle_core::config::{self, LocalConfig};
 use scuttle_core::density::SendShortcut;
 
@@ -20,6 +19,7 @@ use crate::activity::{SPINNER_INTERVAL, activity_line};
 use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::composer::{Composer, ComposerAction};
 use crate::footer::footer_line;
+use crate::help::help_lines;
 use crate::picker::{PickerChoice, PickerState};
 use crate::selection::{Pos, Selection, selected_text};
 use crate::theme::Theme;
@@ -91,6 +91,8 @@ pub struct Tui {
     scroll_from_bottom: usize,
     last_ctrl_c: Option<Instant>,
     show_help: bool,
+    /// How far the help overlay is scrolled, in lines.
+    help_scroll: u16,
     /// Created on the first copy: opening the native clipboard can block on a stale display.
     clipboard: Option<Clipboard>,
     /// The footer's notice: an index into `core.notices` and when it became active.
@@ -143,6 +145,7 @@ impl Tui {
             scroll_from_bottom: 0,
             last_ctrl_c: None,
             show_help: false,
+            help_scroll: 0,
             clipboard: None,
             active_notice: None,
             notices_seen: 0,
@@ -275,7 +278,10 @@ impl Tui {
     pub fn apply_ui_effect(&mut self, effect: &Effect) -> bool {
         match effect {
             Effect::ShowPicker(kind) => self.picker = Some(PickerState::open(*kind, &self.core)),
-            Effect::ShowHelp => self.show_help = true,
+            Effect::ShowHelp => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             Effect::Copy(CopyTarget::LastMessage) => {
                 let text = self
                     .core
@@ -581,7 +587,14 @@ impl Tui {
             return vec![];
         }
         if self.show_help {
-            self.show_help = false;
+            let page = self.area.height.saturating_sub(2).max(1);
+            match key.code {
+                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                _ => self.show_help = false,
+            }
             return vec![];
         }
         if let Some(picker) = self.picker.as_mut() {
@@ -838,21 +851,15 @@ impl Tui {
             );
         }
         if self.show_help {
-            let mut lines: Vec<Line> = COMMANDS
-                .iter()
-                .map(|c| {
-                    Line::from(vec![
-                        Span::styled(c.usage, self.theme.accent),
-                        Span::raw("  "),
-                        Span::raw(c.description),
-                    ])
-                })
-                .collect();
-            lines.push(Line::default());
-            lines.push(Line::from(
-                "Esc interrupts · Ctrl+G opens $EDITOR · Ctrl+C twice quits · PageUp/PageDown/End scroll · click tool calls to expand",
-            ));
+            let lines = help_lines(&self.theme, transcript.width.saturating_sub(2));
             let h = (lines.len() as u16 + 2).min(transcript.height);
+            let max_scroll = (lines.len() as u16).saturating_sub(h.saturating_sub(2));
+            self.help_scroll = self.help_scroll.min(max_scroll);
+            let title = if max_scroll > 0 {
+                " Help (Up and Down scroll, any other key closes) "
+            } else {
+                " Help "
+            };
             let area = Rect {
                 y: transcript.y,
                 height: h,
@@ -860,7 +867,9 @@ impl Tui {
             };
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Help ")),
+                Paragraph::new(lines)
+                    .scroll((self.help_scroll, 0))
+                    .block(Block::default().borders(Borders::ALL).title(title)),
                 area,
             );
         }
@@ -1267,6 +1276,28 @@ mod tests {
         assert_eq!(
             t.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             vec![Effect::Quit]
+        );
+    }
+
+    #[test]
+    fn help_scrolls_on_a_short_screen() {
+        let mut t = tui();
+        t.apply_ui_effect(&Effect::ShowHelp);
+        let top = screen(&mut t, 60, 14);
+        assert!(top.contains("/model"), "{top}");
+        assert!(!top.contains("Ctrl+C twice"), "{top}");
+        for _ in 0..40 {
+            t.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let bottom = screen(&mut t, 60, 14);
+        assert!(bottom.contains("Ctrl+C twice"), "{bottom}");
+        assert!(t.show_help);
+        t.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!t.show_help);
+        t.apply_ui_effect(&Effect::ShowHelp);
+        assert!(
+            screen(&mut t, 60, 14).contains("/model"),
+            "reopening starts at the top"
         );
     }
 

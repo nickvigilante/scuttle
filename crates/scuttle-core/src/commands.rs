@@ -12,6 +12,7 @@ pub enum Command {
     Compact,
     Clear,
     Copy(Option<usize>),
+    Web,
     Mouse,
     Help,
     Quit,
@@ -93,6 +94,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Copy the last message, or its nth code block",
     },
     CommandInfo {
+        name: "/web",
+        aliases: &[],
+        usage: "/web",
+        description: "Open this chat in the Coder web UI",
+    },
+    CommandInfo {
         name: "/mouse",
         aliases: &[],
         usage: "/mouse",
@@ -102,7 +109,7 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "/help",
         aliases: &[],
         usage: "/help",
-        description: "Show commands and keys",
+        description: "Show every command and key",
     },
     CommandInfo {
         name: "/quit",
@@ -151,6 +158,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 .map(|n| Command::Copy(Some(n)))
                 .map_err(|_| format!("/copy takes a code block number, got {n:?}")),
         },
+        "web" => Ok(Command::Web),
         "mouse" => Ok(Command::Mouse),
         "help" => Ok(Command::Help),
         "quit" => Ok(Command::Quit),
@@ -244,6 +252,41 @@ mod tests {
         );
         let names: Vec<_> = completions("/or").iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["/organization"]);
+    }
+
+    #[test]
+    fn parses_web() {
+        assert_eq!(parse("/web"), Ok(Command::Web));
+    }
+
+    #[test]
+    fn every_listed_command_parses() {
+        for c in COMMANDS {
+            assert!(
+                parse(c.name).is_ok(),
+                "{} is listed but does not parse",
+                c.name
+            );
+        }
+        let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            [
+                "/new",
+                "/model",
+                "/effort",
+                "/workspace",
+                "/organization",
+                "/plan-mode",
+                "/compact",
+                "/clear",
+                "/copy",
+                "/web",
+                "/mouse",
+                "/help",
+                "/quit"
+            ]
+        );
     }
 
     #[test]

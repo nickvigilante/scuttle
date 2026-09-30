@@ -3,6 +3,7 @@ mod app;
 mod clipboard;
 mod composer;
 mod footer;
+mod help;
 mod highlight;
 mod markdown;
 mod picker;

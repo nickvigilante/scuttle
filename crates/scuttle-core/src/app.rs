@@ -179,6 +179,12 @@ pub enum Msg {
         on: bool,
         message: String,
     },
+    /// The runtime sends this after `Effect::OpenWeb`, with the chat's URL and why no browser
+    /// opened, if none did.
+    WebOpened {
+        url: String,
+        outcome: Result<(), String>,
+    },
     Submit(String),
     Command(Command),
     Interrupt,
@@ -225,6 +231,7 @@ pub enum Effect {
         chat: Uuid,
         on: bool,
     },
+    OpenWeb(Uuid),
     FetchPrefs,
     FetchModels(Uuid),
     FetchWorkspaces(Uuid),
@@ -785,6 +792,13 @@ impl App {
                 self.error(format!("Could not turn plan mode {word}: {message}"));
                 vec![]
             }
+            Msg::WebOpened { url, outcome } => {
+                match outcome {
+                    Ok(()) => self.info(format!("Opened {url}")),
+                    Err(why) => self.info(format!("Open {url} ({why})")),
+                }
+                vec![]
+            }
             Msg::Submit(text) => self.submit(text),
             Msg::Command(cmd) => self.command(cmd),
             Msg::Interrupt => match self.chat_id {
@@ -1074,6 +1088,17 @@ impl App {
                 Some(id) => self.set_workspace(Some(id)),
                 None => {
                     self.error(format!("No workspace named {name:?}"));
+                    vec![]
+                }
+            },
+            Command::Web if self.creating.is_some() => {
+                self.info("The chat is still being created.");
+                vec![]
+            }
+            Command::Web => match self.chat_id {
+                Some(chat) => vec![Effect::OpenWeb(chat)],
+                None => {
+                    self.error("Start a chat first.");
                     vec![]
                 }
             },
@@ -1974,6 +1999,42 @@ mod tests {
         assert!(app.update(Msg::Command(Command::Clear)).is_empty());
         assert!(
             matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still being created"))
+        );
+    }
+
+    #[test]
+    fn web_opens_the_current_chat() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        assert!(app.update(Msg::Command(Command::Web)).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("Start a chat")));
+        app.update(Msg::Submit("hi".into()));
+        assert!(app.update(Msg::Command(Command::Web)).is_empty());
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("still being created"))
+        );
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatCreated(chat(id)));
+        assert_eq!(
+            app.update(Msg::Command(Command::Web)),
+            vec![Effect::OpenWeb(id)]
+        );
+        let url = format!("https://coder.example.com/agents/{id}");
+        app.update(Msg::WebOpened {
+            url: url.clone(),
+            outcome: Ok(()),
+        });
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(format!("Opened {url}")))
+        );
+        app.update(Msg::WebOpened {
+            url: url.clone(),
+            outcome: Err("over SSH".into()),
+        });
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Info(format!("Open {url} (over SSH)")))
         );
     }
 

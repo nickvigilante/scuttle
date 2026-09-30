@@ -59,6 +59,51 @@ fn plan_mode_value(on: bool) -> types::CodersdkChatPlanMode {
     types::CodersdkChatPlanMode(if on { "plan" } else { "" }.into())
 }
 
+/// The web UI page for `chat`, on the deployment's origin without any userinfo, path, or query.
+pub fn chat_web_url(base: &url::Url, chat: Uuid) -> url::Url {
+    let mut url = base.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path(&format!("/agents/{chat}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+/// Whether scuttle runs over SSH, where a browser would open on the wrong machine.
+fn over_ssh(is_set: impl Fn(&str) -> bool) -> bool {
+    is_set("SSH_CONNECTION") || is_set("SSH_TTY")
+}
+
+/// Opens `url` with the system browser. Every standard stream is closed, because the opener's
+/// output would land on top of the full-screen UI.
+async fn open_in_browser(url: &str) -> Result<(), String> {
+    if cfg!(test) {
+        return Err("not opened in tests".into());
+    }
+    if over_ssh(|k| std::env::var_os(k).is_some()) {
+        return Err("over SSH, so open it on your own machine".into());
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = tokio::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
+}
+
 /// The user-facing text of a generated-client error. Never includes the session token,
 /// which only travels in a request header.
 async fn err<E: serde::Serialize + std::fmt::Debug>(e: progenitor_client::Error<E>) -> String {
@@ -319,6 +364,13 @@ impl Runtime {
                     msg: Box::new(msg),
                 }
             })),
+            Effect::OpenWeb(chat) => {
+                let url = chat_web_url(client.base_url(), chat).to_string();
+                self.spawn(Box::pin(async move {
+                    let outcome = open_in_browser(&url).await;
+                    Msg::WebOpened { url, outcome }
+                }));
+            }
             Effect::FetchPrefs => self.spawn(Box::pin(async move {
                 match client.api().get_user_preference_settings("me").await {
                     Ok(p) => Msg::PrefsLoaded(DisplayPrefs::from(&p.into_inner())),
@@ -430,6 +482,39 @@ mod tests {
 
     fn api_error(status: u16, message: &str) -> ResponseTemplate {
         ResponseTemplate::new(status).set_body_json(serde_json::json!({ "message": message }))
+    }
+
+    #[tokio::test]
+    async fn open_web_reports_the_chat_url() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::OpenWeb(chat));
+        match next(&mut rx).await {
+            Msg::WebOpened { url, outcome } => {
+                assert_eq!(url, format!("{}/agents/{chat}", server.uri()));
+                assert!(outcome.is_err(), "tests never launch a browser");
+            }
+            other => panic!("expected WebOpened, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_web_url_keeps_only_the_origin() {
+        let base: url::Url = "https://user:pw@coder.example.com/some/path?x=1#f"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            chat_web_url(&base, Uuid::nil()).as_str(),
+            "https://coder.example.com/agents/00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn ssh_sessions_are_detected() {
+        assert!(over_ssh(|k| k == "SSH_CONNECTION"));
+        assert!(over_ssh(|k| k == "SSH_TTY"));
+        assert!(!over_ssh(|_| false));
     }
 
     #[tokio::test]
