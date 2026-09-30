@@ -127,6 +127,13 @@ pub enum Msg {
         org: Uuid,
         msg: Box<Msg>,
     },
+    /// A reply about `chat`, applied only while it is the open chat. The runtime wraps stream
+    /// events in this, so one already queued when the user leaves the chat cannot reach the
+    /// next one.
+    ForChat {
+        chat: Uuid,
+        msg: Box<Msg>,
+    },
     ChatLoaded {
         chat: Box<types::CodersdkChat>,
         messages: Vec<types::CodersdkChatMessage>,
@@ -191,6 +198,8 @@ pub enum Effect {
         after_id: Option<i64>,
         delay: Duration,
     },
+    /// Stops the chat stream without touching the chat on the server.
+    CloseStream,
     CreateChat {
         org: Uuid,
         text: String,
@@ -227,6 +236,9 @@ pub enum Effect {
     SaveOrganization(Uuid),
     /// Puts text back in the composer after a failed chat creation or send.
     RestoreComposer(String),
+    /// Clears what the UI keeps about the chat on screen: expanded blocks, the selection,
+    /// the scroll position, and the composer's place in its history.
+    ClearView,
     Quit,
 }
 
@@ -530,6 +542,13 @@ impl App {
             }
             Msg::ForOrg { org, msg } => {
                 if self.lists_org == Some(org) {
+                    self.update(*msg)
+                } else {
+                    vec![]
+                }
+            }
+            Msg::ForChat { chat, msg } => {
+                if self.chat_id == Some(chat) {
                     self.update(*msg)
                 } else {
                     vec![]
@@ -957,6 +976,40 @@ impl App {
         }
     }
 
+    /// Returns to the state of a launch with no chat ID. The old chat's stream closes, but the
+    /// chat itself, running or not, is left alone on the server. The composer text, the chosen
+    /// model, and the chosen effort stay, unless the organization for new chats changed.
+    fn new_chat(&mut self) -> Vec<Effect> {
+        // The reply to the create or load would reopen that chat.
+        if self.creating.is_some() || self.loading.is_some() {
+            self.info("Wait for this chat to finish starting, then use /new.");
+            return vec![];
+        }
+        if self.chat_id.is_none() && self.failed_load.is_none() {
+            self.info("This is already a new chat.");
+            return vec![];
+        }
+        self.chat_id = None;
+        self.chat = None;
+        self.failed_load = None;
+        self.pending_text = None;
+        self.transcript = Transcript::default();
+        self.connection = Connection::Idle;
+        self.last_stream_error = None;
+        self.reconnect_attempt = 0;
+        self.awaiting_reply = false;
+        self.sent_id = None;
+        // A new chat has no workspace and no plan mode until they are chosen, as on launch.
+        self.selected_workspace = None;
+        self.plan_mode = false;
+        let mut effects = vec![Effect::CloseStream, Effect::ClearView];
+        if let Some(org) = self.org_id {
+            effects.extend(self.load_lists_for(org));
+        }
+        self.info("New chat. Type a message to start it.");
+        effects
+    }
+
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         match cmd {
             Command::Model(_) | Command::Effort(_) if self.models_state == ModelsState::Loading => {
@@ -1031,6 +1084,7 @@ impl App {
                 vec![Effect::SetMouse(self.mouse)]
             }
             Command::Organization(name) => self.organization_command(name),
+            Command::New => self.new_chat(),
             Command::Help => vec![Effect::ShowHelp],
             Command::Quit => vec![Effect::Quit],
         }
@@ -2550,5 +2604,259 @@ mod tests {
         });
         assert!(!app.plan_mode);
         assert!(matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("plan mode on")));
+    }
+
+    #[test]
+    fn stream_events_from_the_old_chat_never_reach_a_new_one() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        let old = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(old),
+            messages: vec![message(1)],
+        });
+        app.update(ev(
+            json!({"type": "status", "status": {"status": "running"}}),
+        ));
+        let effects = app.update(Msg::Command(Command::New));
+        assert!(effects.contains(&Effect::CloseStream), "{effects:?}");
+        assert!(effects.contains(&Effect::ClearView), "{effects:?}");
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Interrupt(_))),
+            "/new leaves the old chat running"
+        );
+        assert_eq!(app.chat_id, None);
+        assert_eq!(app.transcript.messages().count(), 0);
+        let late = |msg: Msg| Msg::ForChat {
+            chat: old,
+            msg: Box::new(msg),
+        };
+        assert!(
+            app.update(late(ev(json!({"type": "message", "message": {"id": 2, "role": "assistant", "content": [{"type": "text", "text": "late"}]}}))))
+                .is_empty()
+        );
+        assert!(
+            app.update(late(Msg::StreamEnded { error: None }))
+                .is_empty(),
+            "no reconnect to the old chat"
+        );
+        assert_eq!(app.transcript.messages().count(), 0);
+        assert_eq!(app.connection, Connection::Idle);
+        assert_eq!(app.activity(), None);
+        let effects = app.update(Msg::Submit("fresh".into()));
+        assert!(
+            matches!(effects.as_slice(), [Effect::CreateChat { org: o, text, .. }] if *o == org && text == "fresh"),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn events_for_the_open_chat_still_apply() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let id = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(id),
+            messages: vec![],
+        });
+        app.update(Msg::ForChat {
+            chat: id,
+            msg: Box::new(ev(
+                json!({"type": "status", "status": {"status": "running"}}),
+            )),
+        });
+        assert_eq!(app.activity(), Some(Activity::Working));
+    }
+
+    #[test]
+    fn new_keeps_the_model_and_effort_and_resets_the_rest() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(thinker));
+        app.update(Msg::EffortChosen("high".into()));
+        let ws = Uuid::new_v4();
+        app.update(Msg::WorkspacesLoaded(vec![WorkspaceRef {
+            id: ws,
+            name: "dev".into(),
+        }]));
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_plan(Uuid::new_v4(), "plan"),
+            messages: vec![],
+        });
+        app.update(Msg::WorkspaceChosen(Some(ws)));
+        assert!(app.plan_mode);
+        app.update(Msg::Command(Command::New));
+        assert_eq!(app.selected_model, Some(thinker));
+        assert_eq!(app.selected_effort.as_deref(), Some("high"));
+        assert_eq!(
+            app.selected_workspace, None,
+            "a new chat has no workspace until chosen"
+        );
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn new_waits_while_a_chat_starts_and_says_when_it_is_already_new() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        assert!(app.update(Msg::Command(Command::New)).is_empty());
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("already a new chat"))
+        );
+        app.update(Msg::Submit("hi".into()));
+        assert!(app.update(Msg::Command(Command::New)).is_empty());
+        assert!(matches!(app.notices.last(), Some(Notice::Info(m)) if m.contains("Wait")));
+    }
+
+    #[test]
+    fn new_after_choosing_another_organization_loads_its_lists() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, _) = two_orgs(&mut app);
+        app.update(Msg::ChatLoaded {
+            chat: chat(Uuid::new_v4()),
+            messages: vec![],
+        });
+        app.update(Msg::OrganizationChosen(product.id));
+        let effects = app.update(Msg::Command(Command::New));
+        assert!(
+            effects.contains(&Effect::FetchModels(product.id)),
+            "{effects:?}"
+        );
+        assert!(effects.contains(&Effect::FetchWorkspaces(product.id)));
+    }
+
+    #[test]
+    fn new_stops_waiting_for_the_old_chats_reply() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let old = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat(old),
+            messages: vec![],
+        });
+        app.update(Msg::Submit("hi".into()));
+        app.update(ev(
+            json!({"type": "message", "message": {"id": 5, "role": "user", "content": []}}),
+        ));
+        assert_eq!(app.activity(), Some(Activity::Waiting));
+        assert_eq!(app.sent_id, Some(5));
+        app.update(Msg::Command(Command::New));
+        assert_eq!(
+            app.activity(),
+            None,
+            "the spinner does not carry into the new chat"
+        );
+        assert!(!app.awaiting_reply);
+        assert_eq!(app.sent_id, None);
+    }
+
+    #[test]
+    fn a_late_plan_mode_failure_from_the_old_chat_leaves_the_new_one_alone() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let old = Uuid::new_v4();
+        app.update(Msg::ChatLoaded {
+            chat: chat_with_plan(old, "plan"),
+            messages: vec![],
+        });
+        assert_eq!(
+            app.update(Msg::Command(Command::PlanMode(Some(false)))),
+            vec![Effect::SetPlanMode {
+                chat: old,
+                on: false
+            }]
+        );
+        app.update(Msg::Command(Command::New));
+        assert!(!app.plan_mode);
+        // Taking back the old chat's "off" would turn plan mode on for the new chat.
+        assert!(
+            app.update(Msg::ForChat {
+                chat: old,
+                msg: Box::new(Msg::PlanModeFailed {
+                    on: false,
+                    message: "nope".into(),
+                }),
+            })
+            .is_empty()
+        );
+        assert!(!app.plan_mode);
+        assert!(
+            !app.notices
+                .iter()
+                .any(|n| matches!(n, Notice::Error(m) if m.contains("plan mode")))
+        );
+    }
+
+    #[test]
+    fn new_in_another_organization_drops_the_old_model_and_effort() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = two_orgs(&mut app);
+        let (thinker, _) = with_efforts(&mut app);
+        app.update(Msg::ModelChosen(thinker));
+        app.update(Msg::EffortChosen("high".into()));
+        let mut open = chat(Uuid::new_v4());
+        open.organization_id = Some(coder.id);
+        app.update(Msg::ChatLoaded {
+            chat: open,
+            messages: vec![],
+        });
+        app.update(Msg::OrganizationChosen(product.id));
+        assert_eq!(
+            app.selected_model,
+            Some(thinker),
+            "the open chat keeps its model"
+        );
+        app.update(Msg::Command(Command::New));
+        assert_eq!(app.selected_model, None);
+        assert_eq!(app.selected_effort, None);
+        assert_eq!(app.current_org(), Some(product.id));
+        app.update(Msg::ForOrg {
+            org: product.id,
+            msg: Box::new(Msg::ModelsLoaded(vec![])),
+        });
+        let effects = app.update(Msg::Submit("hi".into()));
+        assert_eq!(effects, vec![Effect::RestoreComposer("hi".into())]);
+        assert!(
+            matches!(app.notices.last(), Some(Notice::Error(m)) if m.contains("No chat models are available in Product")),
+            "{:?}",
+            app.notices.last()
+        );
+    }
+
+    #[test]
+    fn new_in_the_same_organization_keeps_its_lists() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = started(&mut app);
+        let mut open = chat(Uuid::new_v4());
+        open.organization_id = Some(org);
+        app.update(Msg::ChatLoaded {
+            chat: open,
+            messages: vec![],
+        });
+        let effects = app.update(Msg::Command(Command::New));
+        assert_eq!(effects, vec![Effect::CloseStream, Effect::ClearView]);
+    }
+
+    #[test]
+    fn new_after_a_failed_load_starts_fresh_instead_of_retrying() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let org = Uuid::new_v4();
+        let missing = Uuid::new_v4();
+        app.update(Msg::Started {
+            org_id: org,
+            open_chat: Some(missing),
+        });
+        app.update(Msg::ChatLoadFailed {
+            chat_id: missing,
+            message: "gone".into(),
+        });
+        let effects = app.update(Msg::Command(Command::New));
+        assert!(effects.contains(&Effect::ClearView), "{effects:?}");
+        let effects = app.update(Msg::Submit("hi".into()));
+        assert!(
+            matches!(effects.as_slice(), [Effect::CreateChat { org: o, .. }] if *o == org),
+            "{effects:?}"
+        );
     }
 }

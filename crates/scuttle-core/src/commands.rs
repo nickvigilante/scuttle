@@ -2,6 +2,7 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    New,
     Model(Option<String>),
     Effort(Option<String>),
     Workspace(Option<String>),
@@ -37,6 +38,12 @@ impl CommandInfo {
 }
 
 pub const COMMANDS: &[CommandInfo] = &[
+    CommandInfo {
+        name: "/new",
+        aliases: &[],
+        usage: "/new",
+        description: "Start a new chat; the current one keeps running",
+    },
     CommandInfo {
         name: "/model",
         aliases: &[],
@@ -124,6 +131,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         None => (rest, None),
     };
     match canonical(name) {
+        "new" => Ok(Command::New),
         "model" => Ok(Command::Model(arg.map(str::to_owned))),
         "effort" => Ok(Command::Effort(arg.map(str::to_owned))),
         "workspace" => Ok(Command::Workspace(arg.map(str::to_owned))),
@@ -161,6 +169,11 @@ pub fn completions(prefix: &str) -> Vec<&'static CommandInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_new() {
+        assert_eq!(parse("/new"), Ok(Command::New));
+    }
 
     #[test]
     fn parses_effort() {

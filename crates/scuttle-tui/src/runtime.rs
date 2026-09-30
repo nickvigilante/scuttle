@@ -22,20 +22,26 @@ pub struct Runtime {
     stream_generation: Arc<AtomicU64>,
 }
 
-/// A stream task's sender, silenced once a newer stream replaces it.
+/// A stream task's sender, silenced once a newer stream replaces it or the stream closes.
 struct StreamSender {
     tx: UnboundedSender<Msg>,
     generation: Arc<AtomicU64>,
     mine: u64,
+    /// The chat this stream belongs to. Every message is tagged with it, because one already
+    /// in the channel when the stream is replaced still arrives.
+    chat: Uuid,
 }
 
 impl StreamSender {
-    /// Sends `msg` if this stream is still the current one. Returns whether it was current.
+    /// Sends `msg` for this stream's chat if the stream is still current. Returns whether it was.
     fn send(&self, msg: Msg) -> bool {
         if self.generation.load(Ordering::SeqCst) != self.mine {
             return false;
         }
-        let _ = self.tx.send(msg);
+        let _ = self.tx.send(Msg::ForChat {
+            chat: self.chat,
+            msg: Box::new(msg),
+        });
         true
     }
 }
@@ -100,6 +106,7 @@ impl Runtime {
             tx: self.tx.clone(),
             generation: self.stream_generation.clone(),
             mine,
+            chat,
         };
         self.stream = Some(tokio::spawn(async move {
             if !delay.is_zero() {
@@ -151,6 +158,13 @@ impl Runtime {
                 after_id,
                 delay,
             } => self.open_stream(chat, after_id, delay),
+            Effect::CloseStream => {
+                // The bump silences a task that is mid-send; the core drops what is queued.
+                self.stream_generation.fetch_add(1, Ordering::SeqCst);
+                if let Some(old) = self.stream.take() {
+                    old.abort();
+                }
+            }
             Effect::LoadChat(id) => self.spawn(Box::pin(async move {
                 let chat = match client.api().get_chat_by_id(&id).await {
                     Ok(c) => c.into_inner(),
@@ -273,12 +287,16 @@ impl Runtime {
                     plan_mode: Some(plan_mode_value(on)),
                     ..Default::default()
                 };
-                match client.api().update_chat(&chat, &body).await {
+                let msg = match client.api().update_chat(&chat, &body).await {
                     Ok(_) => Msg::Refresh,
                     Err(e) => Msg::PlanModeFailed {
                         on,
                         message: err(e).await,
                     },
+                };
+                Msg::ForChat {
+                    chat,
+                    msg: Box::new(msg),
                 }
             })),
             Effect::FetchPrefs => self.spawn(Box::pin(async move {
@@ -341,6 +359,7 @@ impl Runtime {
             | Effect::SetMouse(_)
             | Effect::SaveOrganization(_)
             | Effect::RestoreComposer(_)
+            | Effect::ClearView
             | Effect::Quit => {}
         }
     }
@@ -381,6 +400,14 @@ mod tests {
             .expect("the channel is open")
     }
 
+    /// The message inside a `Msg::ForChat`, or the message itself.
+    fn untag(msg: Msg) -> Msg {
+        match msg {
+            Msg::ForChat { msg, .. } => *msg,
+            other => other,
+        }
+    }
+
     fn api_error(status: u16, message: &str) -> ResponseTemplate {
         ResponseTemplate::new(status).set_body_json(serde_json::json!({ "message": message }))
     }
@@ -393,7 +420,7 @@ mod tests {
             chat: Uuid::new_v4(),
             after_id: None,
         });
-        match next(&mut rx).await {
+        match untag(next(&mut rx).await) {
             Msg::StreamEnded { error: Some(e) } => assert!(!e.contains(TOKEN), "{e}"),
             other => panic!("expected StreamEnded with an error, got {other:?}"),
         }
@@ -409,7 +436,7 @@ mod tests {
             delay: Duration::from_millis(1),
         });
         assert!(matches!(
-            next(&mut rx).await,
+            untag(next(&mut rx).await),
             Msg::StreamEnded { error: Some(_) }
         ));
     }
@@ -711,9 +738,9 @@ mod tests {
         }
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::SetPlanMode { chat, on: true });
-        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
         rt.run(Effect::SetPlanMode { chat, on: false });
-        assert!(matches!(next(&mut rx).await, Msg::Refresh));
+        assert!(matches!(untag(next(&mut rx).await), Msg::Refresh));
     }
 
     #[tokio::test]
@@ -724,7 +751,7 @@ mod tests {
             chat: Uuid::new_v4(),
             on: true,
         });
-        match next(&mut rx).await {
+        match untag(next(&mut rx).await) {
             Msg::PlanModeFailed { on, message } => {
                 assert!(on);
                 assert!(!message.contains(TOKEN), "{message}");
@@ -812,6 +839,7 @@ mod tests {
         let server = MockServer::start().await;
         let (mut rt, mut rx) = runtime(&server.uri());
         rt.run(Effect::ShowHelp);
+        rt.run(Effect::ClearView);
         rt.run(Effect::Quit);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
@@ -825,11 +853,12 @@ mod tests {
             tx,
             generation: generation.clone(),
             mine: 1,
+            chat: Uuid::new_v4(),
         };
         assert!(old.send(Msg::StreamEnded { error: None }));
         generation.store(2, Ordering::SeqCst);
         assert!(!old.send(Msg::StreamEnded { error: None }));
-        assert!(matches!(rx.try_recv(), Ok(Msg::StreamEnded { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Msg::ForChat { .. })));
         assert!(rx.try_recv().is_err());
     }
 
@@ -865,7 +894,10 @@ mod tests {
 
     fn conn_of(msg: &Msg) -> Option<u64> {
         match msg {
-            Msg::Stream(ev) => ev.raw["conn"].as_u64(),
+            Msg::ForChat { msg, .. } => match msg.as_ref() {
+                Msg::Stream(ev) => ev.raw["conn"].as_u64(),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -898,6 +930,65 @@ mod tests {
         for _ in 0..10 {
             let msg = next(&mut rx).await;
             assert_eq!(conn_of(&msg), Some(2), "{msg:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_messages_are_tagged_with_their_chat() {
+        let url = serve_tagged_streams().await;
+        let (mut rt, mut rx) = runtime(&url);
+        let chat = Uuid::new_v4();
+        rt.run(Effect::OpenStream {
+            chat,
+            after_id: None,
+        });
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(matches!(*msg, Msg::Stream(_)), "{msg:?}");
+            }
+            other => panic!("expected a tagged stream event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_the_stream_stops_it() {
+        let url = serve_tagged_streams().await;
+        let (mut rt, mut rx) = runtime(&url);
+        rt.run(Effect::OpenStream {
+            chat: Uuid::new_v4(),
+            after_id: None,
+        });
+        next(&mut rx).await;
+        rt.run(Effect::CloseStream);
+        // Whatever was queued before the close may still arrive; after that, silence. The
+        // server sends every 10 ms, so a stream that kept going would fill all 50 turns.
+        for _ in 0..50 {
+            if tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("the stream kept sending after CloseStream");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_results_are_tagged_with_their_chat() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx) = runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::SetPlanMode { chat, on: true });
+        match next(&mut rx).await {
+            Msg::ForChat { chat: tagged, msg } => {
+                assert_eq!(tagged, chat);
+                assert!(
+                    matches!(*msg, Msg::PlanModeFailed { on: true, .. }),
+                    "{msg:?}"
+                );
+            }
+            other => panic!("expected a tagged plan mode result, got {other:?}"),
         }
     }
 }

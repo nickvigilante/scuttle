@@ -335,6 +335,13 @@ impl Tui {
                     self.notice(Notice::Error(e.to_string()));
                 }
             }
+            Effect::ClearView => {
+                self.toggles.clear();
+                self.selection = None;
+                self.drag = None;
+                self.scroll_from_bottom = 0;
+                self.composer.reset_history_position();
+            }
             Effect::RestoreComposer(text) => {
                 // Keep anything typed since the failed request, after the restored text.
                 let current = self.composer.text();
@@ -1967,5 +1974,61 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(t.core.org_id, Some(product.id));
+    }
+
+    #[test]
+    fn slash_new_clears_the_view_and_keeps_the_draft() {
+        let mut t = tui();
+        t.core.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        loaded(
+            &mut t,
+            json!([{"id": 1, "role": "assistant", "content": [{"type": "text", "text": "old answer"}]}]),
+        );
+        t.toggles.insert((Some(1), 0));
+        assert!(screen(&mut t, 60, 16).contains("old answer"));
+        t.composer.set_text("draft to keep");
+        let effects = t.update(Msg::Command(scuttle_core::commands::Command::New));
+        for e in &effects {
+            t.apply_ui_effect(e);
+        }
+        assert!(effects.contains(&Effect::CloseStream));
+        assert!(t.toggles.is_empty());
+        assert_eq!(t.composer.text(), "draft to keep");
+        let shown = screen(&mut t, 60, 16);
+        assert!(!shown.contains("old answer"), "{shown}");
+        assert!(
+            shown.contains("scuttle"),
+            "the welcome screen is back: {shown}"
+        );
+    }
+
+    #[test]
+    fn slash_new_ends_a_held_drag_and_drops_the_selection_and_scroll() {
+        let mut t = tui();
+        t.core.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        numbered_rows(&mut t);
+        let shown = screen(&mut t, 40, 24);
+        let (x, y) = find(&shown, "row 26");
+        drag(&mut t, (x, y), (x + 5, y));
+        assert!(t.selection.is_some());
+        mouse(&mut t, MouseEventKind::ScrollUp, x, y);
+        assert!(t.scroll_from_bottom > 0);
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(t.drag.is_some(), "the button is held");
+        let effects = t.update(Msg::Command(scuttle_core::commands::Command::New));
+        for e in &effects {
+            t.apply_ui_effect(e);
+        }
+        assert!(t.drag.is_none());
+        assert!(t.selection.is_none());
+        assert_eq!(t.scroll_from_bottom, 0);
+        let shown = screen(&mut t, 40, 24);
+        assert!(!shown.contains("row 26"), "{shown}");
     }
 }

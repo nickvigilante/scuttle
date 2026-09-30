@@ -198,6 +198,12 @@ impl Composer {
         self.sync_gutter();
     }
 
+    /// Leaves history browsing without touching the text being typed.
+    pub fn reset_history_position(&mut self) {
+        self.history_pos = None;
+        self.draft.clear();
+    }
+
     /// The rows the text takes at `width` columns (the composer's full inner width, gutter
     /// included), never more than `max_lines`, plus the border.
     pub fn height(&self, width: u16) -> u16 {
@@ -488,6 +494,22 @@ mod tests {
         assert_eq!(
             c.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), SendShortcut::Enter),
             ComposerAction::None
+        );
+    }
+
+    #[test]
+    fn resetting_the_history_position_keeps_the_text() {
+        let mut c = Composer::new(10);
+        type_str(&mut c, "sent");
+        c.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), SendShortcut::Enter);
+        c.handle_key(key(KeyCode::Up, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(c.text(), "sent");
+        c.reset_history_position();
+        c.handle_key(key(KeyCode::Down, KeyModifiers::NONE), SendShortcut::Enter);
+        assert_eq!(
+            c.text(),
+            "sent",
+            "Down no longer walks back to the old draft"
         );
     }
 
