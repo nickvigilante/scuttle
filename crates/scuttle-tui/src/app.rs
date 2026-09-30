@@ -2087,6 +2087,7 @@ mod tests {
             name: name.to_lowercase(),
             display_name: name.into(),
             is_default,
+            can_create_chats: true,
         };
         let (product, coder) = (org("Product", false), org("Coder", true));
         t.core.update(Msg::OrganizationsLoaded(vec![

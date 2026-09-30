@@ -24,6 +24,9 @@ pub struct OrgRef {
     pub name: String,
     pub display_name: String,
     pub is_default: bool,
+    /// Whether the server lets the user create chats here. `true` when that could not be
+    /// checked, so a failed check never hides an organization.
+    pub can_create_chats: bool,
 }
 
 impl OrgRef {
@@ -38,13 +41,23 @@ impl OrgRef {
 }
 
 /// The organization new chats go to: the saved one while the user is still a member, else
-/// the default one, else the first. The server returns memberships in no stable order, so
-/// the first alone is not a choice. The web UI's Agents page picks in the same order.
+/// the default one, else the first, skipping organizations where the user cannot create chats
+/// unless that is all of them. The server returns memberships in no stable order, so the first
+/// alone is not a choice. The web UI's Agents page picks in the same order among the
+/// organizations it permits (`AgentCreateForm.tsx:257-265`). Unlike the web UI, which clears
+/// a stored choice that is no longer permitted, a saved organization without permission is
+/// only skipped here, so it applies again once the permission returns.
 pub fn pick_organization(saved: Option<Uuid>, orgs: &[OrgRef]) -> Option<Uuid> {
+    let allowed: Vec<&OrgRef> = orgs.iter().filter(|o| o.can_create_chats).collect();
+    let pool = if allowed.is_empty() {
+        orgs.iter().collect()
+    } else {
+        allowed
+    };
     saved
-        .filter(|id| orgs.iter().any(|o| o.id == *id))
-        .or_else(|| orgs.iter().find(|o| o.is_default).map(|o| o.id))
-        .or_else(|| orgs.first().map(|o| o.id))
+        .filter(|id| pool.iter().any(|o| o.id == *id))
+        .or_else(|| pool.iter().find(|o| o.is_default).map(|o| o.id))
+        .or_else(|| pool.first().map(|o| o.id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,14 +572,16 @@ impl App {
                 vec![Effect::FetchPrefs, Effect::LoadChat(id)]
             }
             Msg::OrganizationChosen(id) => {
-                let Some(label) = self
-                    .organizations
-                    .iter()
-                    .find(|o| o.id == id)
-                    .map(|o| o.label().to_owned())
-                else {
+                let Some(org) = self.organizations.iter().find(|o| o.id == id) else {
                     return vec![];
                 };
+                let label = org.label().to_owned();
+                if !org.can_create_chats {
+                    self.error(format!(
+                        "You do not have permission to create chats in {label}."
+                    ));
+                    return vec![];
+                }
                 self.org_id = Some(id);
                 let mut effects = vec![Effect::SaveOrganization(id)];
                 // An open chat, or one being created or loaded, keeps its own organization and
@@ -1463,6 +1478,7 @@ mod tests {
             name: label.to_lowercase(),
             display_name: label.into(),
             is_default,
+            can_create_chats: true,
         }
     }
 
@@ -1633,6 +1649,66 @@ mod tests {
         let no_default = vec![org("A", false), org("B", false)];
         assert_eq!(pick_organization(None, &no_default), Some(no_default[0].id));
         assert_eq!(pick_organization(None, &[]), None);
+    }
+
+    #[test]
+    fn an_organization_without_chat_permission_is_never_picked() {
+        let (mut product, mut coder, other) = (
+            org("Product", false),
+            org("Coder", true),
+            org("Other", false),
+        );
+        product.can_create_chats = false;
+        let orgs = vec![product.clone(), coder.clone(), other.clone()];
+        assert_eq!(
+            pick_organization(Some(product.id), &orgs),
+            Some(coder.id),
+            "a saved organization without permission is skipped"
+        );
+        coder.can_create_chats = false;
+        let orgs = vec![product.clone(), coder.clone(), other.clone()];
+        assert_eq!(
+            pick_organization(None, &orgs),
+            Some(other.id),
+            "a default without permission is skipped too"
+        );
+        let mut alone = other.clone();
+        alone.can_create_chats = false;
+        assert_eq!(
+            pick_organization(None, &[product, coder.clone(), alone]),
+            Some(coder.id),
+            "with none allowed, the usual order applies and the server explains"
+        );
+    }
+
+    #[test]
+    fn an_organization_without_chat_permission_is_refused_with_the_reason() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let mut product = org("Product", false);
+        product.can_create_chats = false;
+        let coder = org("Coder", true);
+        app.update(Msg::OrganizationsLoaded(vec![
+            product.clone(),
+            coder.clone(),
+        ]));
+        app.update(Msg::Started {
+            org_id: coder.id,
+            open_chat: None,
+        });
+        assert!(app.update(Msg::OrganizationChosen(product.id)).is_empty());
+        assert_eq!(app.org_id, Some(coder.id));
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "You do not have permission to create chats in Product.".into()
+            ))
+        );
+        assert!(
+            app.update(Msg::Command(Command::Organization(Some("product".into()))))
+                .is_empty(),
+            "choosing it by name is refused the same way"
+        );
+        assert_eq!(app.org_id, Some(coder.id));
     }
 
     #[test]

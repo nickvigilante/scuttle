@@ -1,5 +1,6 @@
 //! Executes API effects with coder-sdk and reports results back as `Msg`s.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -136,10 +137,11 @@ impl Runtime {
     }
 
     /// The user's organizations, in the server's order, which is not stable; pick one with
-    /// `scuttle_core::app::pick_organization`.
+    /// `scuttle_core::app::pick_organization`. With two or more, each is marked with whether
+    /// the user may create chats there.
     pub async fn organizations(&self) -> Result<Vec<OrgRef>, coder_sdk::Error> {
-        match self.client.api().get_organizations_by_user("me").await {
-            Ok(r) => Ok(r
+        let mut orgs: Vec<OrgRef> = match self.client.api().get_organizations_by_user("me").await {
+            Ok(r) => r
                 .into_inner()
                 .into_iter()
                 .map(|o| OrgRef {
@@ -147,9 +149,53 @@ impl Runtime {
                     name: o.name.unwrap_or_default(),
                     display_name: o.display_name.unwrap_or_default(),
                     is_default: o.is_default,
+                    can_create_chats: true,
                 })
-                .collect()),
-            Err(e) => Err(coder_sdk::Error::from_progenitor(e).await),
+                .collect(),
+            Err(e) => return Err(coder_sdk::Error::from_progenitor(e).await),
+        };
+        // With one organization there is nothing to choose between, so skip the request.
+        if orgs.len() > 1 {
+            let denied = self.chat_denied(&orgs).await;
+            for org in &mut orgs {
+                org.can_create_chats = !denied.contains(&org.id);
+            }
+        }
+        Ok(orgs)
+    }
+
+    /// The organizations where the server says the user may not create chats, from one
+    /// `POST /authcheck` with a check per organization: the check the web UI's
+    /// `permittedOrganizations` runs (`site/src/api/queries/organizations.ts:308-326`, called
+    /// from `AgentCreateForm.tsx:236-243`). Empty when the check fails, so it hides nothing.
+    async fn chat_denied(&self, orgs: &[OrgRef]) -> HashSet<Uuid> {
+        let checks = orgs
+            .iter()
+            .map(|o| {
+                (
+                    o.id.to_string(),
+                    types::CodersdkAuthorizationCheck {
+                        action: Some(types::CodersdkRbacAction("create".into())),
+                        object: Some(types::CodersdkAuthorizationObject {
+                            organization_id: Some(o.id.to_string()),
+                            owner_id: Some("me".into()),
+                            resource_type: Some(types::CodersdkRbacResource("chat".into())),
+                            ..Default::default()
+                        }),
+                    },
+                )
+            })
+            .collect();
+        let body = types::CodersdkAuthorizationRequest { checks };
+        match self.client.api().check_authorization(&body).await {
+            Ok(r) => r
+                .into_inner()
+                .0
+                .into_iter()
+                .filter(|(_, allowed)| !allowed)
+                .filter_map(|(id, _)| id.parse().ok())
+                .collect(),
+            Err(_) => HashSet::new(),
         }
     }
 
@@ -738,6 +784,114 @@ mod tests {
             scuttle_core::app::pick_organization(None, &orgs),
             Some(coder)
         );
+    }
+
+    #[tokio::test]
+    async fn organizations_where_chats_are_not_allowed_are_marked() {
+        let server = MockServer::start().await;
+        let (product, coder) = (Uuid::new_v4(), Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(product, "Product", false),
+                org_json(coder, "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        let mut checks = serde_json::Map::new();
+        checks.insert(
+            product.to_string(),
+            serde_json::json!({"action": "create", "object": {"resource_type": "chat", "owner_id": "me", "organization_id": product.to_string()}}),
+        );
+        let mut answers = serde_json::Map::new();
+        answers.insert(product.to_string(), false.into());
+        answers.insert(coder.to_string(), true.into());
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "checks": checks }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answers))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        let allowed: Vec<(&str, bool)> = orgs
+            .iter()
+            .map(|o| (o.label(), o.can_create_chats))
+            .collect();
+        assert_eq!(allowed, [("Product", false), ("Coder", true)]);
+        assert_eq!(
+            scuttle_core::app::pick_organization(Some(product), &orgs),
+            Some(coder)
+        );
+        assert_no_token_in_authcheck_bodies(&server).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_permission_check_hides_no_organization() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                org_json(Uuid::new_v4(), "Product", false),
+                org_json(Uuid::new_v4(), "Coder", true)
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .respond_with(api_error(500, "authorizer is down"))
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        assert!(orgs.iter().all(|o| o.can_create_chats), "{orgs:?}");
+        assert_no_token_in_authcheck_bodies(&server).await;
+    }
+
+    #[tokio::test]
+    async fn one_organization_skips_the_permission_check() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me/organizations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([org_json(
+                    Uuid::new_v4(),
+                    "Coder",
+                    true
+                )])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/authcheck"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (rt, _rx) = runtime(&server.uri());
+        let orgs = rt.organizations().await.unwrap();
+        assert!(orgs[0].can_create_chats);
+    }
+
+    /// Asserts that at least one `POST /authcheck` arrived and that none of their bodies carry
+    /// the session token, which belongs only in the auth header.
+    async fn assert_no_token_in_authcheck_bodies(server: &MockServer) {
+        let checks: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/v2/authcheck")
+            .collect();
+        assert!(!checks.is_empty(), "the permission check was sent");
+        for r in checks {
+            assert!(
+                !String::from_utf8_lossy(&r.body).contains(TOKEN),
+                "the session token is never in the request body"
+            );
+        }
     }
 
     #[tokio::test]

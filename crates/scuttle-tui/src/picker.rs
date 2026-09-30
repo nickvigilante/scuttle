@@ -25,6 +25,8 @@ pub struct PickerState {
     kind: Picker,
     items: Vec<(String, Option<Uuid>)>,
     selected: usize,
+    /// Items shown dimmed, one per item: organizations where the user cannot create chats.
+    dimmed: Vec<bool>,
 }
 
 impl PickerState {
@@ -55,6 +57,9 @@ impl PickerState {
                     if o.is_default {
                         marks.push("default");
                     }
+                    if !o.can_create_chats {
+                        marks.push("no permission to create chats");
+                    }
                     if Some(o.id) == app.org_id {
                         marks.push("current");
                     }
@@ -78,10 +83,19 @@ impl PickerState {
                 .unwrap_or(0),
             Picker::Model | Picker::Workspace => 0,
         };
+        let dimmed = match kind {
+            Picker::Organization => app
+                .organizations
+                .iter()
+                .map(|o| !o.can_create_chats)
+                .collect(),
+            _ => vec![false; items.len()],
+        };
         PickerState {
             kind,
             items,
             selected,
+            dimmed,
         }
     }
 
@@ -119,19 +133,20 @@ impl PickerState {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        if self.kind == Picker::Effort {
-            self.render_slider(frame, area, theme);
-            return;
-        }
         let title = match self.kind {
+            Picker::Effort => return self.render_slider(frame, area, theme),
             Picker::Model => " Model ",
             Picker::Workspace => " Workspace ",
-            Picker::Organization | Picker::Effort => " Organization ",
+            Picker::Organization => " Organization ",
         };
         let items: Vec<ListItem> = self
             .items
             .iter()
-            .map(|(name, _)| ListItem::new(name.clone()))
+            .zip(&self.dimmed)
+            .map(|((name, _), dim)| {
+                let item = ListItem::new(name.clone());
+                if *dim { item.style(theme.dim) } else { item }
+            })
             .collect();
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
@@ -351,12 +366,14 @@ mod tests {
                 name: "product".into(),
                 display_name: "Product".into(),
                 is_default: false,
+                can_create_chats: true,
             },
             OrgRef {
                 id: coder,
                 name: "coder".into(),
                 display_name: "Coder".into(),
                 is_default: true,
+                can_create_chats: true,
             },
         ]));
         app.update(Msg::Started {
@@ -371,6 +388,59 @@ mod tests {
             Some(PickerChoice::Organization(coder)),
             "the picker starts on the current organization"
         );
+    }
+
+    #[test]
+    fn an_organization_without_chat_permission_is_greyed_out_with_the_reason() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use scuttle_core::app::OrgRef;
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let (product, coder) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        app.update(Msg::OrganizationsLoaded(vec![
+            OrgRef {
+                id: product,
+                name: "product".into(),
+                display_name: "Product".into(),
+                is_default: false,
+                can_create_chats: false,
+            },
+            OrgRef {
+                id: coder,
+                name: "coder".into(),
+                display_name: "Coder".into(),
+                is_default: true,
+                can_create_chats: true,
+            },
+        ]));
+        app.update(Msg::Started {
+            org_id: coder,
+            open_chat: None,
+        });
+        let p = PickerState::open(Picker::Organization, &app);
+        let names: Vec<&str> = p.items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Product (no permission to create chats)",
+                "Coder (default, current)"
+            ]
+        );
+        assert_eq!(p.dimmed, [true, false]);
+        let theme = Theme::terminal(true);
+        let mut term = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        term.draw(|f| p.render(f, f.area(), &theme)).unwrap();
+        let buf = term.backend().buffer();
+        let row = (0..10u16)
+            .find(|&y| {
+                (0..50u16)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Product")
+            })
+            .unwrap();
+        let x = (0..50u16).find(|&x| buf[(x, row)].symbol() == "P").unwrap();
+        assert_eq!(Some(buf[(x, row)].fg), theme.dim.fg, "the row is dimmed");
     }
 
     #[test]

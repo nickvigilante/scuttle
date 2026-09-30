@@ -289,6 +289,7 @@ mod tests {
             name: name.to_lowercase(),
             display_name: name.into(),
             is_default,
+            can_create_chats: true,
         };
         let coder = org("Coder", true);
         let mut app = App::new(BusyBehavior::Queue, true);
@@ -314,6 +315,7 @@ mod tests {
                 name: name.to_lowercase(),
                 display_name: (*name).into(),
                 is_default: false,
+                can_create_chats: true,
             })
             .collect();
         app.update(Msg::OrganizationsLoaded(orgs.clone()));

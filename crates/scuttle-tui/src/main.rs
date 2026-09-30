@@ -335,6 +335,7 @@ mod tests {
             name: name.into(),
             display_name: String::new(),
             is_default: true,
+            can_create_chats: true,
         }
     }
 
