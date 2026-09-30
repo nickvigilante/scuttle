@@ -77,9 +77,12 @@ fn over_ssh(is_set: impl Fn(&str) -> bool) -> bool {
 
 /// Opens `url` with the system browser. Every standard stream is closed, because the opener's
 /// output would land on top of the full-screen UI.
+///
+/// `cfg!(test)` only holds for unit tests in this crate; `tests/pty.rs` spawns the real
+/// `scuttle` binary, so it sets `SCUTTLE_NO_BROWSER` to keep those tests from launching one too.
 async fn open_in_browser(url: &str) -> Result<(), String> {
-    if cfg!(test) {
-        return Err("not opened in tests".into());
+    if cfg!(test) || std::env::var_os("SCUTTLE_NO_BROWSER").is_some() {
+        return Err("not opened".into());
     }
     if over_ssh(|k| std::env::var_os(k).is_some()) {
         return Err("over SSH, so open it on your own machine".into());
@@ -501,12 +504,12 @@ mod tests {
 
     #[test]
     fn the_web_url_keeps_only_the_origin() {
-        let base: url::Url = "https://user:pw@coder.example.com/some/path?x=1#f"
+        let base: url::Url = "https://user:pw@coder.example.com:8443/coder/?q=1#f"
             .parse()
             .unwrap();
         assert_eq!(
             chat_web_url(&base, Uuid::nil()).as_str(),
-            "https://coder.example.com/agents/00000000-0000-0000-0000-000000000000"
+            "https://coder.example.com:8443/agents/00000000-0000-0000-0000-000000000000"
         );
     }
 

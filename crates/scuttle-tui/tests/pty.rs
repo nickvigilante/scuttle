@@ -63,6 +63,7 @@ fn spawn(name: &str, envs: &[(&str, String)]) -> Session {
     cmd.env("XDG_CONFIG_HOME", home.join("config"));
     cmd.env("CODER_CONFIG_DIR", home.join("coder"));
     cmd.env("SCUTTLE_NO_TERMINAL_QUERY", "1");
+    cmd.env("SCUTTLE_NO_BROWSER", "1");
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("CODER_URL");
     cmd.env_remove("CODER_SESSION_TOKEN");
@@ -249,6 +250,23 @@ async fn exit_restores_terminal_modes() {
         "mouse capture disabled"
     );
     assert!(tail.contains("\x1b[?2004l"), "bracketed paste disabled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_without_a_chat_asks_to_start_one() {
+    let server = fake_coder().await;
+    let mut s = spawn(
+        "web-without-a-chat",
+        &[
+            ("CODER_URL", server.uri()),
+            ("CODER_SESSION_TOKEN", "test-token-not-real".into()),
+        ],
+    );
+    s.wait_for("scuttle");
+    s.writer.write_all(b"/web\r").unwrap();
+    s.wait_for("Start a chat first.");
+    s.writer.write_all(b"/quit\r").unwrap();
+    assert_eq!(s.exit_code(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

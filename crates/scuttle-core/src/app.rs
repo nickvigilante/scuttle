@@ -1091,26 +1091,15 @@ impl App {
                     vec![]
                 }
             },
-            Command::Web if self.creating.is_some() => {
+            Command::Web | Command::Compact | Command::Clear if self.creating.is_some() => {
                 self.info("The chat is still being created.");
                 vec![]
             }
-            Command::Web => match self.chat_id {
-                Some(chat) => vec![Effect::OpenWeb(chat)],
-                None => {
-                    self.error("Start a chat first.");
-                    vec![]
-                }
-            },
-            Command::Compact | Command::Clear if self.creating.is_some() => {
-                self.info("The chat is still being created.");
-                vec![]
-            }
-            Command::Compact | Command::Clear => match self.chat_id {
-                Some(chat) => vec![if cmd == Command::Compact {
-                    Effect::Compact(chat)
-                } else {
-                    Effect::Clear(chat)
+            Command::Web | Command::Compact | Command::Clear => match self.chat_id {
+                Some(chat) => vec![match cmd {
+                    Command::Web => Effect::OpenWeb(chat),
+                    Command::Compact => Effect::Compact(chat),
+                    _ => Effect::Clear(chat),
                 }],
                 None => {
                     self.error("Start a chat first.");
