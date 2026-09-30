@@ -119,6 +119,12 @@ pub enum Msg {
     },
     /// The user's organizations, sent once at startup, before `Started`.
     OrganizationsLoaded(Vec<OrgRef>),
+    /// Sent at startup instead of `Started` when the organizations could not be loaded or
+    /// there are none. A requested chat still loads, and its own organization scopes the lists.
+    OrganizationsFailed {
+        message: String,
+        open_chat: Option<Uuid>,
+    },
     /// An organization picked for new chats, from `/organization <name>` or the picker.
     OrganizationChosen(Uuid),
     /// A reply about the model or workspace list of `org`, applied only while those lists still
@@ -516,6 +522,15 @@ impl App {
             Msg::OrganizationsLoaded(organizations) => {
                 self.organizations = organizations;
                 vec![]
+            }
+            Msg::OrganizationsFailed { message, open_chat } => {
+                self.error(format!("Could not load your organization: {message}"));
+                let Some(id) = open_chat else {
+                    return vec![];
+                };
+                self.connection = Connection::Connecting;
+                self.loading = Some(id);
+                vec![Effect::FetchPrefs, Effect::LoadChat(id)]
             }
             Msg::OrganizationChosen(id) => {
                 let Some(label) = self
@@ -3158,5 +3173,49 @@ mod tests {
             ))
         );
         assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn a_failed_organization_load_still_loads_the_requested_chat() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let id = Uuid::new_v4();
+        let effects = app.update(Msg::OrganizationsFailed {
+            message: "HTTP 500".into(),
+            open_chat: Some(id),
+        });
+        assert!(effects.contains(&Effect::LoadChat(id)), "{effects:?}");
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "Could not load your organization: HTTP 500".into()
+            ))
+        );
+        let org = Uuid::new_v4();
+        let mut open = chat(id);
+        open.organization_id = Some(org);
+        let effects = app.update(Msg::ChatLoaded {
+            chat: open,
+            messages: vec![],
+        });
+        assert!(effects.contains(&Effect::FetchModels(org)), "{effects:?}");
+        assert!(effects.contains(&Effect::FetchWorkspaces(org)));
+    }
+
+    #[test]
+    fn a_failed_organization_load_on_a_blank_chat_only_explains() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        assert!(
+            app.update(Msg::OrganizationsFailed {
+                message: "HTTP 500".into(),
+                open_chat: None,
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            app.notices.last(),
+            Some(&Notice::Error(
+                "Could not load your organization: HTTP 500".into()
+            ))
+        );
     }
 }

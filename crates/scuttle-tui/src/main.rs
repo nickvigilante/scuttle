@@ -20,7 +20,7 @@ use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use futures::StreamExt;
-use scuttle_core::app::{Effect, Msg, Notice};
+use scuttle_core::app::{Effect, Msg, Notice, OrgRef};
 use scuttle_core::config;
 
 fn detect_dark() -> bool {
@@ -86,6 +86,34 @@ fn next_input(
         Some(Ok(event)) => ControlFlow::Continue(event),
         Some(Err(e)) => ControlFlow::Break(Some(e.to_string())),
         None => ControlFlow::Break(None),
+    }
+}
+
+/// Starts the app from the startup organization lookup, picking the organization new chats
+/// use.
+fn startup(
+    tui: &mut app::Tui,
+    organizations: Result<Vec<OrgRef>, String>,
+    saved: Option<uuid::Uuid>,
+    open_chat: Option<uuid::Uuid>,
+) -> Vec<Effect> {
+    let organizations = match organizations {
+        Ok(organizations) => organizations,
+        Err(message) => return tui.update(Msg::OrganizationsFailed { message, open_chat }),
+    };
+    match scuttle_core::app::pick_organization(saved, &organizations) {
+        Some(org) => {
+            let mut effects = tui.update(Msg::OrganizationsLoaded(organizations));
+            effects.extend(tui.update(Msg::Started {
+                org_id: org,
+                open_chat,
+            }));
+            effects
+        }
+        None => tui.update(Msg::OrganizationsFailed {
+            message: "you are not a member of any organization".into(),
+            open_chat,
+        }),
     }
 }
 
@@ -162,34 +190,12 @@ async fn main() -> ExitCode {
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
         Err(_) => {}
     }
-    let first = match runtime.organizations().await {
-        Ok(organizations) => {
-            match scuttle_core::app::pick_organization(local.organization, &organizations) {
-                Some(org) => {
-                    let mut effects = tui.update(Msg::OrganizationsLoaded(organizations));
-                    effects.extend(tui.update(Msg::Started {
-                        org_id: org,
-                        open_chat,
-                    }));
-                    effects
-                }
-                None => {
-                    tui.core.notices.push(Notice::Error(
-                        "Could not load your organization: you are not a member of any organization"
-                            .into(),
-                    ));
-                    vec![]
-                }
-            }
-        }
+    let organizations = match runtime.organizations().await {
+        Ok(organizations) => Ok(organizations),
         Err(coder_sdk::Error::Unauthorized) => return rejected(),
-        Err(e) => {
-            tui.core.notices.push(Notice::Error(format!(
-                "Could not load your organization: {e}"
-            )));
-            vec![]
-        }
+        Err(e) => Err(e.to_string()),
     };
+    let first = startup(&mut tui, organizations, local.organization, open_chat);
 
     let mut term = match terminal::enter(local.mouse) {
         Ok(t) => t,
@@ -320,5 +326,62 @@ mod tests {
         assert_eq!(earliest(None, Some(later)), Some(later));
         assert_eq!(earliest(Some(now), None), Some(now));
         assert_eq!(earliest(None, None), None);
+    }
+
+    fn org(name: &str) -> OrgRef {
+        OrgRef {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            display_name: String::new(),
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn a_failed_organization_load_with_a_chat_id_still_loads_the_chat() {
+        let mut t = tui();
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Err("HTTP 500".into()), None, Some(id));
+        assert!(effects.contains(&Effect::LoadChat(id)), "{effects:?}");
+        assert_eq!(
+            t.core.notices.last(),
+            Some(&Notice::Error(
+                "Could not load your organization: HTTP 500".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn no_organization_with_a_chat_id_still_loads_the_chat() {
+        let mut t = tui();
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Ok(vec![]), None, Some(id));
+        assert!(effects.contains(&Effect::LoadChat(id)), "{effects:?}");
+        assert!(
+            matches!(t.core.notices.last(), Some(Notice::Error(m)) if m.contains("not a member of any organization"))
+        );
+    }
+
+    #[test]
+    fn a_failed_organization_load_on_a_blank_chat_only_explains() {
+        let mut t = tui();
+        assert!(startup(&mut t, Err("HTTP 500".into()), None, None).is_empty());
+        assert!(
+            matches!(t.core.notices.last(), Some(Notice::Error(m)) if m.starts_with("Could not load your organization"))
+        );
+    }
+
+    #[test]
+    fn a_loaded_organization_starts_the_app_in_it() {
+        let mut t = tui();
+        let coder = org("coder");
+        let id = uuid::Uuid::new_v4();
+        let effects = startup(&mut t, Ok(vec![coder.clone()]), None, Some(id));
+        assert!(
+            effects.contains(&Effect::FetchModels(coder.id)),
+            "{effects:?}"
+        );
+        assert!(effects.contains(&Effect::LoadChat(id)));
+        assert_eq!(t.core.org_id, Some(coder.id));
     }
 }
