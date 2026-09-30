@@ -209,12 +209,13 @@ impl Runtime {
                 busy,
                 turn,
             } => self.spawn(Box::pin(async move {
+                let plan_mode = turn.plan_mode;
                 let body = types::CodersdkCreateChatMessageRequest {
                     content: vec![text_part(&text)],
                     model_config_id: model,
                     busy_behavior: Some(types::CodersdkChatBusyBehavior(busy.as_str().into())),
                     reasoning_effort: turn.effort,
-                    plan_mode: turn.plan_mode.map(plan_mode_value),
+                    plan_mode: plan_mode.map(plan_mode_value),
                     ..Default::default()
                 };
                 match client.api().send_chat_message(&chat, &body).await {
@@ -222,6 +223,7 @@ impl Runtime {
                     Err(e) => Msg::SendFailed {
                         text,
                         message: err(e).await,
+                        plan_mode,
                     },
                 }
             })),
@@ -629,7 +631,12 @@ mod tests {
             turn: TurnOptions::default(),
         });
         match next(&mut rx).await {
-            Msg::SendFailed { text, message } => {
+            Msg::SendFailed {
+                text,
+                message,
+                plan_mode,
+            } => {
+                assert_eq!(plan_mode, None);
                 assert_eq!(text, "keep this");
                 assert!(message.contains("cannot accept"), "{message}");
                 assert!(!message.contains(TOKEN), "{message}");
@@ -771,6 +778,32 @@ mod tests {
             },
         });
         assert!(matches!(next(&mut rx).await, Msg::Refresh));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_echoes_the_plan_mode_it_carried() {
+        let server = MockServer::start().await;
+        let chat = Uuid::new_v4();
+        let (mut rt, mut rx) = runtime(&server.uri());
+        rt.run(Effect::SendMessage {
+            chat,
+            text: "plan it".into(),
+            model: None,
+            busy: scuttle_core::config::BusyBehavior::Queue,
+            turn: TurnOptions {
+                plan_mode: Some(true),
+                ..Default::default()
+            },
+        });
+        match next(&mut rx).await {
+            Msg::SendFailed {
+                text, plan_mode, ..
+            } => {
+                assert_eq!(text, "plan it");
+                assert_eq!(plan_mode, Some(true));
+            }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

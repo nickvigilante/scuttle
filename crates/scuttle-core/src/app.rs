@@ -138,10 +138,12 @@ pub enum Msg {
     CreateFailed {
         message: String,
     },
-    /// The runtime sends this when `Effect::SendMessage` fails, with the text it tried to send.
+    /// The runtime sends this when `Effect::SendMessage` fails, with the text it tried to send
+    /// and the plan mode change it carried, which therefore did not happen.
     SendFailed {
         text: String,
         message: String,
+        plan_mode: Option<bool>,
     },
     Stream(StreamEvent),
     StreamEnded {
@@ -268,9 +270,6 @@ pub struct App {
     failed_load: Option<Uuid>,
     /// Text submitted while a chat is being created or loaded, sent once it exists.
     pending_text: Option<String>,
-    /// The queued message that carries a plan mode change to a new chat, with the state it
-    /// asks for, so a failed send can take the change back.
-    plan_carrier: Option<(String, bool)>,
     /// Set by a submit that sends or queues a message, and cleared once the chat reports a
     /// status other than `waiting`, an error, or a failed send.
     awaiting_reply: bool,
@@ -564,21 +563,16 @@ impl App {
                 }
                 match self.pending_text.take() {
                     // The queued message carries the plan mode change, so the two cannot race.
-                    Some(text) => {
-                        if plan_mismatch {
-                            self.plan_carrier = Some((text.clone(), self.plan_mode));
-                        }
-                        effects.push(Effect::SendMessage {
-                            chat: id,
-                            text,
-                            model: self.selected_model,
-                            busy: self.busy,
-                            turn: TurnOptions {
-                                plan_mode: plan_mismatch.then_some(self.plan_mode),
-                                ..self.turn()
-                            },
-                        });
-                    }
+                    Some(text) => effects.push(Effect::SendMessage {
+                        chat: id,
+                        text,
+                        model: self.selected_model,
+                        busy: self.busy,
+                        turn: TurnOptions {
+                            plan_mode: plan_mismatch.then_some(self.plan_mode),
+                            ..self.turn()
+                        },
+                    }),
                     None if plan_mismatch => effects.push(Effect::SetPlanMode {
                         chat: id,
                         on: self.plan_mode,
@@ -588,10 +582,14 @@ impl App {
                 effects
             }
             Msg::CreateFailed { message } => self.fail_create(message),
-            Msg::SendFailed { text, message } => {
+            Msg::SendFailed {
+                text,
+                message,
+                plan_mode,
+            } => {
                 self.awaiting_reply = false;
                 let mut error = format!("Could not send the message: {message}");
-                if let Some((_, on)) = self.plan_carrier.take_if(|(carried, _)| *carried == text) {
+                if let Some(on) = plan_mode {
                     self.revert_plan_mode(on);
                     let state = if self.plan_mode { "on" } else { "off" };
                     error.push_str(&format!(" Plan mode is still {state}."));
@@ -874,8 +872,6 @@ impl App {
             return vec![];
         }
         self.plan_mode = on;
-        // This change supersedes whatever an earlier queued message carried.
-        self.plan_carrier = None;
         match self.chat_id {
             Some(chat) => {
                 self.info(format!("Plan mode {word}."));
@@ -1892,6 +1888,7 @@ mod tests {
         let effects = app.update(Msg::SendFailed {
             text: "hello".into(),
             message: "HTTP 409".into(),
+            plan_mode: None,
         });
         assert_eq!(effects, vec![Effect::RestoreComposer("hello".into())]);
         assert!(
@@ -1998,6 +1995,7 @@ mod tests {
         app.update(Msg::SendFailed {
             text: "again".into(),
             message: "HTTP 409".into(),
+            plan_mode: None,
         });
         assert_eq!(app.activity(), None);
         app.update(Msg::Submit("third".into()));
@@ -2244,6 +2242,7 @@ mod tests {
         let effects = app.update(Msg::SendFailed {
             text: "two".into(),
             message: "HTTP 500".into(),
+            plan_mode: Some(true),
         });
         assert_eq!(effects, vec![Effect::RestoreComposer("two".into())]);
         assert!(!app.plan_mode);
@@ -2252,6 +2251,25 @@ mod tests {
             "{:?}",
             app.notices.last()
         );
+    }
+
+    #[test]
+    fn a_later_failed_send_with_the_same_text_leaves_plan_mode_alone() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        app.update(Msg::Submit("one".into()));
+        app.update(Msg::Submit("continue".into()));
+        app.update(Msg::Command(Command::PlanMode(Some(true))));
+        app.update(Msg::ChatCreated(chat(Uuid::new_v4())));
+        // The carrying send succeeded.
+        app.update(Msg::Refresh);
+        app.update(Msg::Submit("continue".into()));
+        app.update(Msg::SendFailed {
+            text: "continue".into(),
+            message: "HTTP 500".into(),
+            plan_mode: None,
+        });
+        assert!(app.plan_mode);
     }
 
     #[test]
@@ -2267,6 +2285,7 @@ mod tests {
         app.update(Msg::SendFailed {
             text: "two".into(),
             message: "HTTP 500".into(),
+            plan_mode: None,
         });
         assert!(app.plan_mode);
     }
