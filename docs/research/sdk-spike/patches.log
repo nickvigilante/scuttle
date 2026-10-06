@@ -1,0 +1,73 @@
+swagger2: drop header example POST /api/v2/chats/files Content-Disposition
+swagger2: drop header example POST /oauth2/revoke Authorization
+swagger2: rename enum varname '_' to Unspecified in workspacesdk.WatchErrorCode
+swagger2: drop undeclared path param organization from GET /api/v2/settings/idpsync/available-fields
+swagger2: drop undeclared path param organization from GET /api/v2/settings/idpsync/field-values
+oas3: collapse 10 request media types to application/octet-stream for upload-chat-file
+oas3: request */* -> application/octet-stream for upload-a-file-to-a-chats-workspace
+oas3: response 413 */* -> application/octet-stream for report-csp-violations
+oas3: response 404 */* -> application/octet-stream for expire-api-key
+oas3: response 500 */* -> application/octet-stream for expire-api-key
+oas3: response 200 text/event-stream -> application/octet-stream for watch-workspace-by-id
+oas3: response 200 application/scim+json -> application/json for scim-replace-user-status
+oas3: response 200 application/scim+json -> application/json for scim-update-user-status
+oas3: move array format 'uuid' to items at $.paths./api/v2/organizations/{organization}/provisionerdaemons.get.parameters[2].schema
+oas3: move array format 'uuid' to items at $.paths./api/v2/organizations/{organization}/provisionerjobs.get.parameters[2].schema
+oas3: dedupe enum (13 -> 7) at $.paths./api/v2/organizations/{organization}/provisionerdaemons.get.parameters[3].schema
+oas3: dedupe enum (13 -> 7) at $.paths./api/v2/organizations/{organization}/provisionerjobs.get.parameters[3].schema
+oas3: drop narrowing enum ['password', 'github', 'oidc', 'token'] over codersdk.LoginType at $.components.schemas.codersdk.APIKey.properties.login_type
+oas3: drop narrowing enum ['all', 'application_connect'] over codersdk.APIKeyScope at $.components.schemas.codersdk.APIKey.properties.scope
+oas3: drop narrowing enum ['create', 'read', 'update', 'delete'] over codersdk.RBACAction at $.components.schemas.codersdk.AuthorizationCheck.properties.action
+oas3: drop narrowing enum ['read'] over codersdk.ChatRole at $.components.schemas.codersdk.ChatGroup.properties.role
+oas3: drop narrowing enum ['read'] over codersdk.ChatRole at $.components.schemas.codersdk.ChatUser.properties.role
+oas3: drop narrowing enum ['queue', 'interrupt'] over codersdk.ChatBusyBehavior at $.components.schemas.codersdk.CreateChatMessageRequest.properties.busy_behavior
+oas3: drop narrowing enum ['file'] over codersdk.ProvisionerStorageMethod at $.components.schemas.codersdk.CreateTemplateVersionRequest.properties.storage_method
+oas3: drop narrowing enum ['create', 'write', 'delete', 'start', 'stop'] over codersdk.AuditAction at $.components.schemas.codersdk.CreateTestAuditLogRequest.properties.action
+oas3: drop narrowing enum ['autostart', 'autostop', 'initiator'] over codersdk.BuildReason at $.components.schemas.codersdk.CreateTestAuditLogRequest.properties.build_reason
+oas3: drop narrowing enum ['template', 'template_version', 'user', 'workspace', 'workspace_build', 'git_ssh_key', 'auditable_group'] over codersdk.ResourceType at $.components.schemas.codersdk.CreateTestAuditLogRequest.properties.resource_type
+oas3: drop narrowing enum ['start'] over codersdk.WorkspaceTransition at $.components.schemas.codersdk.CreateWorkspaceBuildOnSuccessRequest.properties.transition
+oas3: drop narrowing enum ['debug'] over codersdk.ProvisionerLogLevel at $.components.schemas.codersdk.CreateWorkspaceBuildRequest.properties.log_level
+oas3: drop narrowing enum ['dashboard', 'cli', 'ssh_connection', 'vscode_connection', 'jetbrains_connection'] over codersdk.CreateWorkspaceBuildReason at $.components.schemas.codersdk.CreateWorkspaceBuildRequest.properties.reason
+oas3: drop narrowing enum ['start', 'stop', 'delete'] over codersdk.WorkspaceTransition at $.components.schemas.codersdk.CreateWorkspaceBuildRequest.properties.transition
+oas3: drop narrowing enum ['read'] over codersdk.MCPServerConfigRole at $.components.schemas.codersdk.MCPServerConfigGroup.properties.role
+oas3: drop narrowing enum ['read'] over codersdk.MCPServerConfigRole at $.components.schemas.codersdk.MCPServerConfigUser.properties.role
+oas3: drop narrowing enum ['active', 'suspended'] over codersdk.UserStatus at $.components.schemas.codersdk.OrganizationMemberWithUserData.properties.status
+oas3: drop narrowing enum ['offline', 'idle', 'busy'] over codersdk.ProvisionerDaemonStatus at $.components.schemas.codersdk.ProvisionerDaemon.properties.status
+oas3: drop narrowing enum ['pending', 'running', 'succeeded', 'canceling', 'canceled', 'failed'] over codersdk.ProvisionerJobStatus at $.components.schemas.codersdk.ProvisionerDaemonJob.properties.status
+oas3: drop narrowing enum ['REQUIRED_TEMPLATE_VARIABLES', 'INSUFFICIENT_QUOTA'] over codersdk.JobErrorCode at $.components.schemas.codersdk.ProvisionerJob.properties.error_code
+oas3: drop narrowing enum ['pending', 'running', 'succeeded', 'canceling', 'canceled', 'failed'] over codersdk.ProvisionerJobStatus at $.components.schemas.codersdk.ProvisionerJob.properties.status
+oas3: drop narrowing enum ['trace', 'debug', 'info', 'warn', 'error'] over codersdk.LogLevel at $.components.schemas.codersdk.ProvisionerJobLog.properties.log_level
+oas3: drop narrowing enum ['active', 'suspended'] over codersdk.UserStatus at $.components.schemas.codersdk.ReducedUser.properties.status
+oas3: drop narrowing enum ['group', 'user'] over codersdk.SharedWorkspaceActorType at $.components.schemas.codersdk.SharedWorkspaceActor.properties.actor_type
+oas3: drop narrowing enum ['wizard_entry', 'compose_completion'] over codersdk.TemplateBuilderSessionEventType at $.components.schemas.codersdk.TemplateBuilderSessionRequest.properties.event_type
+oas3: drop narrowing enum ['admin', 'use'] over codersdk.TemplateRole at $.components.schemas.codersdk.TemplateGroup.properties.role
+oas3: drop narrowing enum ['admin', 'use'] over codersdk.TemplateRole at $.components.schemas.codersdk.TemplateUser.properties.role
+oas3: drop narrowing enum ['active', 'suspended'] over codersdk.UserStatus at $.components.schemas.codersdk.TemplateUser.properties.status
+oas3: drop narrowing enum ['increasing', 'decreasing'] over codersdk.ValidationMonotonicOrder at $.components.schemas.codersdk.TemplateVersionParameter.properties.validation_monotonic
+oas3: drop narrowing enum ['sync', 'single'] over codersdk.ThemeMode at $.components.schemas.codersdk.UpdateUserAppearanceSettingsRequest.properties.theme_mode
+oas3: drop narrowing enum ['none', 'everyone', 'service_accounts'] over codersdk.ShareableWorkspaceOwners at $.components.schemas.codersdk.UpdateWorkspaceSharingSettingsRequest.properties.shareable_workspace_owners
+oas3: drop narrowing enum ['http', 'https'] over codersdk.WorkspaceAgentPortShareProtocol at $.components.schemas.codersdk.UpsertWorkspaceAgentPortShareRequest.properties.protocol
+oas3: drop narrowing enum ['owner', 'authenticated', 'organization', 'public'] over codersdk.WorkspaceAgentPortShareLevel at $.components.schemas.codersdk.UpsertWorkspaceAgentPortShareRequest.properties.share_level
+oas3: drop narrowing enum ['active', 'suspended'] over codersdk.UserStatus at $.components.schemas.codersdk.User.properties.status
+oas3: drop narrowing enum ['always', 'never'] over codersdk.AutomaticUpdates at $.components.schemas.codersdk.Workspace.properties.automatic_updates
+oas3: drop narrowing enum ['http', 'https'] over codersdk.WorkspaceAgentPortShareProtocol at $.components.schemas.codersdk.WorkspaceAgentPortShare.properties.protocol
+oas3: drop narrowing enum ['owner', 'authenticated', 'organization', 'public'] over codersdk.WorkspaceAgentPortShareLevel at $.components.schemas.codersdk.WorkspaceAgentPortShare.properties.share_level
+oas3: drop narrowing enum ['owner', 'authenticated', 'organization', 'public'] over codersdk.WorkspaceAppSharingLevel at $.components.schemas.codersdk.WorkspaceApp.properties.sharing_level
+oas3: drop narrowing enum ['initiator', 'autostart', 'autostop'] over codersdk.BuildReason at $.components.schemas.codersdk.WorkspaceBuild.properties.reason
+oas3: drop narrowing enum ['pending', 'starting', 'running', 'stopping', 'stopped', 'failed', 'canceling', 'canceled', 'deleting', 'deleted'] over codersdk.WorkspaceStatus at $.components.schemas.codersdk.WorkspaceBuild.properties.status
+oas3: drop narrowing enum ['start', 'stop', 'delete'] over codersdk.WorkspaceTransition at $.components.schemas.codersdk.WorkspaceBuild.properties.transition
+oas3: drop narrowing enum ['admin', 'use'] over codersdk.WorkspaceRole at $.components.schemas.codersdk.WorkspaceGroup.properties.role
+oas3: drop narrowing enum ['start', 'stop', 'delete'] over codersdk.WorkspaceTransition at $.components.schemas.codersdk.WorkspaceResource.properties.workspace_transition
+oas3: drop narrowing enum ['none', 'everyone', 'service_accounts'] over codersdk.ShareableWorkspaceOwners at $.components.schemas.codersdk.WorkspaceSharingSettings.properties.shareable_workspace_owners
+oas3: drop narrowing enum ['admin', 'use'] over codersdk.WorkspaceRole at $.components.schemas.codersdk.WorkspaceUser.properties.role
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.AccessURLReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.DERPHealthReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.DERPNodeReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.DERPRegionReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.DatabaseReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.HealthcheckReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.ProvisionerDaemonsReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.WebsocketReport.properties.severity
+oas3: drop narrowing enum ['ok', 'warning', 'error'] over health.Severity at $.components.schemas.healthsdk.WorkspaceProxyReport.properties.severity
+oas3: merge identical ['200', '201'] into 2XX for POST /api/v2/files
+oas3: keep only 200 of ['200', '204'] (LOSSY) for GET /api/v2/organizations/{organization}/templates/{templatename}/versions/{templateversionname}/previous

@@ -1,0 +1,49 @@
+[package]
+name = "scuttle-tui"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scuttle"
+path = "src/main.rs"
+
+[dependencies]
+arboard = "3.6"
+base64 = "0.22"
+# The local UTC offset for `/info` times, which the core is given rather than reading itself.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+coder-sdk.workspace = true
+crossterm = "0.29"
+futures.workspace = true
+progenitor-client = "0.15"
+pulldown-cmark = "0.13"
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+scuttle-core = { path = "../scuttle-core" }
+# Reads the session token only to redact it out of error text the server echoes back.
+secrecy = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+syntect = "5.3"
+terminal-colorsaurus = "1.0"
+tokio.workspace = true
+two-face = "0.5"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+url = "2"
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Keeps Ctrl+C and Ctrl+\ typed in the pager or $EDITOR from killing scuttle. Already in
+# Cargo.lock through crossterm, so it adds no code to the build.
+signal-hook = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+insta = "1"
+portable-pty = "0.9"
+tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-tungstenite = "0.30"
+vt100 = "0.15"
+wiremock = "0.6"

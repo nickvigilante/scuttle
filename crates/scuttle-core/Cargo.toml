@@ -1,0 +1,21 @@
+[package]
+name = "scuttle-core"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+coder-sdk.workspace = true
+# Local times in `/info`. Already in the build through coder-api-gen; the TUI supplies the
+# offset, so the core needs no clock or time zone lookup.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+nucleo-matcher = "0.3.1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+# Grapheme-correct line editing in line_edit.rs.
+unicode-segmentation = "1"
+uuid.workspace = true

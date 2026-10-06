@@ -1,0 +1,18 @@
+---
+source: crates/scuttle-tui/src/transcript_view.rs
+expression: "draw(&view, 40, 14).backend()"
+---
+"                                        "
+"scuttle                                 "
+"An unofficial terminal client for Coder "
+"Agents                                  "
+"                                        "
+"Signed in as nick                       "
+"Deployment https://dogfood.example      "
+"                                        "
+"Type a message to start. /help lists    "
+"commands.                               "
+"                                        "
+"scuttle works better with a Nerd Font!  "
+"                                        "
+"                                        "
