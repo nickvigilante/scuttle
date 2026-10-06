@@ -3,7 +3,53 @@
 scuttle is an unofficial, full-screen terminal client for Coder Agents, written in Rust on Ratatui.
 It is a personal project, and it is not built, supported, or endorsed by Coder.
 
+## Quickstart
+
+You need:
+
+- A Coder deployment with Coder Agents enabled, and an account on it.
+- The [`coder` CLI](https://coder.com/docs/install/cli), logged in to that deployment.
+- A Rust toolchain from [rustup](https://rustup.rs), on a recent stable release.
+- Optionally, a [Nerd Font](https://www.nerdfonts.com/) in your terminal, for icons.
+
+1. Log in with the Coder CLI, if you have not already:
+
+   ```sh
+   coder login https://coder.example.com
+   ```
+
+1. Install scuttle from this repository:
+
+   ```sh
+   cargo install --git https://github.com/nickvigilante/scuttle --locked scuttle-tui
+   ```
+
+   This builds the `scuttle` binary into `~/.cargo/bin`, which rustup adds to your `PATH`.
+   The first build takes a minute or two.
+
+1. Run it:
+
+   ```sh
+   scuttle
+   ```
+
+   To open a chat you already have, pass its ID: `scuttle <chat-id>`.
+
+1. If your terminal uses a Nerd Font, tell scuttle so it draws icons, by adding this to your shell profile:
+
+   ```sh
+   export NERD_FONT=1
+   ```
+
+   You can also set `icons = "nerd"` in `~/.config/scuttle/config.toml`, which `/settings` opens.
+
+Type `/help` inside scuttle for every command and key.
+To update, run the `cargo install` command again with `--force`.
+To remove it, run `cargo uninstall scuttle-tui`.
+
 ## Building and running
+
+To build from a clone instead, run this in the repository:
 
 ```sh
 cargo run --release
