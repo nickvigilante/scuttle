@@ -803,6 +803,14 @@ pub fn render(text: &str, width: u16) -> Rendered {
     while b.out.lines.last().is_some_and(|l| l.spans.is_empty()) {
         b.out.lines.pop();
     }
+    // The trim can cut lines a code block's range was recorded against, such as a block that
+    // is empty or ends in blank rows; a range past the end would index out of bounds in the
+    // transcript.
+    let len = b.out.lines.len();
+    for block in &mut b.out.code_blocks {
+        block.start = block.start.min(len);
+        block.end = block.end.min(len);
+    }
     b.out
 }
 
@@ -1275,5 +1283,28 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::UNDERLINED)
         );
+    }
+
+    #[test]
+    fn code_block_ranges_stay_inside_the_rendered_lines() {
+        for text in [
+            "```\ncode\n\n\n```\n",
+            "```rust\nfn main() {}\n\n```",
+            "text\n\n```\n```\n",
+            "```\n\n```\n",
+            "```\nunclosed\n\n",
+            "> ```\n> a\n>\n> ```\n",
+        ] {
+            let r = render(text, 80);
+            for b in &r.code_blocks {
+                assert!(
+                    b.start <= b.end && b.end <= r.lines.len(),
+                    "{text:?}: block {}..{} outside {} lines",
+                    b.start,
+                    b.end,
+                    r.lines.len()
+                );
+            }
+        }
     }
 }
