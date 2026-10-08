@@ -5952,7 +5952,7 @@ mod tests {
             (120, true, true),
         ] {
             let text = screen(&mut t, width, 20);
-            assert_eq!(text.contains("PR #12"), pr, "pull request at {width}");
+            assert_eq!(text.contains("#12"), pr, "pull request at {width}");
             assert_eq!(
                 text.contains("Fixing the CI"),
                 summary,
