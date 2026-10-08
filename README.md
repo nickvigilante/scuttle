@@ -228,7 +228,7 @@ If the server refuses a change, scuttle says why and shows the value the server 
 | /usage | AI spend, budget, workspace quota, chat cost, context. | Up and Down scroll. |
 | /info | ID, parent, organization, owner, model and effort, plan mode, workspace, created and updated times, context, cost, warnings. | Up and Down scroll. |
 | /statusline | Every footer field with shown or hidden state, and warning thresholds. | Space or Enter toggles. `[` and `]`, Alt+Up and Alt+Down, or Shift+Up and Shift+Down move. Left and Right set the warning on context, spend, and quota. |
-| /mcp | MCP servers for this chat, or for a new chat's first message. | Enter turns an organization server on or off for the next message. |
+| /mcp | MCP servers for this chat, or for a new chat's first message. | Enter or Space turns an organization server on or off for the next message. |
 | /subagents | Live list with a preview below. | Up and Down preview, Enter opens, PageUp and PageDown scroll the preview. |
 | /git | Branch, pull request, local changes. | Enter on Open pull request or View diff. |
 | /workspace | Workspace details. | Enter on Copy SSH command, Open in web, Detach, or Switch workspace. |

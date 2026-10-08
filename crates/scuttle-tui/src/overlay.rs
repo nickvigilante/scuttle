@@ -615,7 +615,9 @@ fn mcp_view(ctx: &ViewCtx) -> TableView {
         ],
         rows,
         status: note,
-        hint: Some("Enter turns a server on or off for the next message, Esc closes".into()),
+        hint: Some(
+            "Enter or Space turns a server on or off for the next message, Esc closes".into(),
+        ),
         filterable: false,
         ..Default::default()
     }
@@ -2112,6 +2114,10 @@ impl Overlay {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 match (state.selected_row(&view).map(|r| r.key.clone()), key.code) {
+                    // Space acts as Enter does. The panel has no filter, so a space is never text.
+                    (Some(RowKey::Mcp(id)), KeyCode::Char(' ')) => {
+                        OverlayOutcome::Send(Msg::ToggleMcp(id))
+                    }
                     (Some(RowKey::File(id)), KeyCode::Char('s')) => {
                         OverlayOutcome::Send(Msg::FileAction(FileAction::SaveAs(id)))
                     }
@@ -3221,7 +3227,7 @@ mod tests {
         );
         assert_eq!(
             view.hint.as_deref(),
-            Some("Enter turns a server on or off for the next message, Esc closes")
+            Some("Enter or Space turns a server on or off for the next message, Esc closes")
         );
         assert!(matches!(
             press(&mut o, &app, KeyCode::Enter),
@@ -3231,6 +3237,89 @@ mod tests {
             press(&mut o, &app, KeyCode::Esc),
             OverlayOutcome::CloseWith(Msg::McpClosed)
         ));
+    }
+
+    /// An app with one organization server and the `/mcp` panel loaded; `open_chat` opens a chat
+    /// that carries `inline` servers, and false leaves the blank pre-create chat.
+    fn mcp_app(open_chat: bool, inline: bool) -> (App, uuid::Uuid) {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        let github = uuid::Uuid::new_v4();
+        if open_chat {
+            let inline_servers = if inline {
+                json!([{"slug": "local-tools", "url": "http://localhost:9000/mcp",
+                    "tool_allow_list": [], "tool_deny_list": []}])
+            } else {
+                json!([])
+            };
+            let chat = serde_json::from_value(json!({
+                "id": uuid::Uuid::new_v4(), "mcp_server_ids": [],
+                "inline_mcp_servers": inline_servers,
+                "children": [], "files": [], "labels": {}
+            }))
+            .unwrap();
+            app.update(Msg::ChatLoaded {
+                has_more: None,
+                chat: Box::new(chat),
+                messages: vec![],
+            });
+        }
+        // With inline servers there is no organization row, so the panel has only text rows.
+        let servers = if inline {
+            vec![]
+        } else {
+            vec![
+                serde_json::from_value(json!({"id": github, "display_name": "GitHub",
+                "url": "https://github.example/mcp", "tool_allow_list": [], "tool_deny_list": []}))
+                .unwrap(),
+            ]
+        };
+        app.mcp_panel = Some(scuttle_core::panels::McpPanel {
+            servers: scuttle_core::panels::Fetched::Loaded(servers),
+            health: scuttle_core::panels::Fetched::Loaded(None),
+        });
+        (app, github)
+    }
+
+    #[test]
+    fn space_toggles_an_organization_server_in_an_open_chat() {
+        let (app, github) = mcp_app(true, false);
+        let mut o = Overlay::Mcp(TableState::default());
+        assert!(matches!(
+            press(&mut o, &app, KeyCode::Char(' ')),
+            OverlayOutcome::Send(Msg::ToggleMcp(id)) if id == github
+        ));
+    }
+
+    #[test]
+    fn space_toggles_an_organization_server_on_a_blank_chat() {
+        let (app, github) = mcp_app(false, false);
+        let mut o = Overlay::Mcp(TableState::default());
+        assert!(matches!(
+            press(&mut o, &app, KeyCode::Char(' ')),
+            OverlayOutcome::Send(Msg::ToggleMcp(id)) if id == github
+        ));
+    }
+
+    #[test]
+    fn space_does_nothing_on_inline_server_rows() {
+        let (app, _) = mcp_app(true, true);
+        let mut o = Overlay::Mcp(TableState::default());
+        assert!(matches!(
+            press(&mut o, &app, KeyCode::Char(' ')),
+            OverlayOutcome::Stay
+        ));
+    }
+
+    #[test]
+    fn the_mcp_hint_names_enter_and_space() {
+        let (app, _) = mcp_app(true, false);
+        let o = Overlay::Mcp(TableState::default());
+        let theme = Theme::terminal(true);
+        let view = o.view(&ctx_for(&app, &theme));
+        assert_eq!(
+            view.hint.as_deref(),
+            Some("Enter or Space turns a server on or off for the next message, Esc closes")
+        );
     }
 
     #[test]
@@ -3285,7 +3374,7 @@ mod tests {
             "an untouched row is not marked: {linear_row}"
         );
         line("Your next message sends the organization servers shown as on.");
-        line("Enter turns a server on or off for the next message, Esc closes");
+        line("Enter or Space turns a server on or off for the next message, Esc closes");
     }
 
     #[test]
