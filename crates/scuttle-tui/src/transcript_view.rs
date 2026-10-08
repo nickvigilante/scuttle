@@ -239,6 +239,8 @@ pub struct Welcome {
     pub url: String,
     pub user: String,
     pub art: Vec<String>,
+    /// Whether a user's own `art` draws in the brand accent; the bundled wordmark always does.
+    pub art_accent: bool,
     pub show: bool,
     /// Whether the welcome may suggest a Nerd Font, which it does only with text icons.
     pub tip: bool,
@@ -1329,8 +1331,9 @@ fn welcome_lines(w: &Welcome, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     let fits = w.art.iter().all(|l| cells_width(l) <= usize::from(width));
     if !w.art.is_empty() && fits {
-        // A user's own art keeps the normal style; the credit shows under any art.
-        let style = if crate::art::is_wordmark(&w.art) {
+        // A user's own art takes the accent unless `welcome.art_color` says plain; the credit
+        // shows under any art, and `theme.brand` is already plain under `NO_COLOR`.
+        let style = if w.art_accent || crate::art::is_wordmark(&w.art) {
             theme.brand
         } else {
             Style::default()
@@ -1620,6 +1623,7 @@ mod tests {
             url: "https://dogfood.example".into(),
             user: "nick".into(),
             art: vec![],
+            art_accent: true,
             show: true,
             tip: true,
         }
@@ -1669,13 +1673,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_bundled_wordmark_draws_in_the_brand_accent() {
+    fn plain_custom_art_draws_in_the_normal_style_and_the_wordmark_in_the_accent() {
         let app = App::new(BusyBehavior::Queue, true);
         let theme = Theme::terminal(true);
         let art_style = |art: Vec<String>| {
             let rows = art.len();
             let welcome = Welcome {
                 art: art.clone(),
+                art_accent: false,
                 ..welcome()
             };
             let view = build(
@@ -1699,7 +1704,53 @@ mod tests {
         assert_eq!(
             art_style(vec!["~~ my art ~~".into(), "~~~~~~~~~~~~".into()]),
             Style::default(),
-            "a user's own art draws in the normal style"
+            "a user's own plain art draws in the normal style"
+        );
+    }
+
+    #[test]
+    fn a_users_art_draws_in_the_accent_unless_plain_or_no_color() {
+        let app = App::new(BusyBehavior::Queue, true);
+        let art: Vec<String> = vec!["~~ my art ~~".into(), "~~~~~~~~~~~~".into()];
+        let style = |theme: &Theme, art: &[String], art_accent: bool| {
+            let welcome = Welcome {
+                art: art.to_vec(),
+                art_accent,
+                ..welcome()
+            };
+            let view = build(
+                &app,
+                &Default::default(),
+                &Default::default(),
+                &welcome,
+                theme,
+                80,
+            );
+            let at = texts(&view).iter().position(|l| *l == art[0]).unwrap();
+            view.lines[at].spans[0].style
+        };
+        let theme = Theme::terminal(true);
+        assert_ne!(theme.brand, Style::default());
+        assert_eq!(
+            style(&theme, &art, true),
+            theme.brand,
+            "custom art takes the accent by default"
+        );
+        assert_eq!(
+            style(&theme, &art, false),
+            Style::default(),
+            "art_color = plain keeps the normal style"
+        );
+        let plain = Theme::terminal_with(true, crate::theme::Colors::None);
+        assert_eq!(
+            style(&plain, &art, true),
+            Style::default(),
+            "NO_COLOR draws custom art plain"
+        );
+        assert_eq!(
+            style(&theme, &crate::art::wordmark_lines(), false),
+            theme.brand,
+            "the wordmark is the accent whatever art_color says"
         );
     }
 

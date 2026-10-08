@@ -34,6 +34,7 @@ fn tui() -> Tui {
             url: "https://x".into(),
             user: String::new(),
             art: vec![],
+            art_accent: true,
             show: true,
             tip: true,
         },
