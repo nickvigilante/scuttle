@@ -1690,21 +1690,25 @@ impl App {
                 name: self.disabled_models.get(&id).cloned(),
             });
         };
-        // With no provider list, nothing says a provider is off.
-        if self.providers.is_empty() {
-            return None;
-        }
-        let usable = model
-            .ai_provider_id
-            .and_then(|p| self.providers.iter().find(|d| d.id == Some(p)))
-            .is_some_and(|d| d.available != Some(false));
-        (!usable).then(|| UnavailableModel {
+        self.provider_off(model).then(|| UnavailableModel {
             name: model
                 .display_name
                 .clone()
                 .filter(|n| !n.is_empty())
                 .or_else(|| model.model.clone()),
         })
+    }
+
+    /// Whether the provider list says `model` cannot be used: its provider is missing from
+    /// the list or marked unavailable. With no provider list, nothing says a provider is off.
+    fn provider_off(&self, model: &types::CodersdkChatModel) -> bool {
+        if self.providers.is_empty() {
+            return false;
+        }
+        !model
+            .ai_provider_id
+            .and_then(|p| self.providers.iter().find(|d| d.id == Some(p)))
+            .is_some_and(|d| d.available != Some(false))
     }
 
     /// Warns once per chat and model when the open chat's model is unavailable, so the user
@@ -5140,11 +5144,23 @@ impl App {
         // chat names no model, so the server applies the user's own default or the
         // deployment's.
         if let Some(gone) = self.unavailable_model() {
-            self.error(format!(
-                "{} The new chat uses your default model.",
-                gone.sentence()
-            ));
             self.selected_model = None;
+            // Only the default the model list names can be checked; the user's own default
+            // is known to the server alone, so the notice promises nothing about it.
+            let next = match self
+                .current_model()
+                .filter(|m| self.provider_off(m))
+                .map(|m| m.display_name.clone().or_else(|| m.model.clone()))
+            {
+                Some(Some(name)) => format!(
+                    "The default model, {name}, is not available either. Pick one with /model."
+                ),
+                Some(None) => {
+                    "The default model is not available either. Pick one with /model.".to_owned()
+                }
+                None => "The server picks the new chat's model.".to_owned(),
+            };
+            self.error(format!("{} {next}", gone.sentence()));
         }
         let mut effects = self.reset_chat_state();
         if let Some(org) = self.org_id {
@@ -15629,7 +15645,7 @@ mod tests {
         );
         assert!(
             app.notices[before..].contains(&Notice::Error(
-                "This chat's model, Old, is not available. The new chat uses your default model."
+                "This chat's model, Old, is not available. The server picks the new chat's model."
                     .into()
             )),
             "{:?}",
@@ -15642,6 +15658,34 @@ mod tests {
             ),
             other => panic!("expected a create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_new_chat_says_so_when_the_default_models_provider_is_unavailable() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        chat_on_a_disabled_model(&mut app);
+        let off = Uuid::new_v4();
+        app.providers = serde_json::from_value(json!([
+            {"id": off, "display_name": "Off", "available": false}
+        ]))
+        .unwrap();
+        app.update(Msg::ModelsLoaded(
+            serde_json::from_value(json!([
+                {"id": Uuid::new_v4(), "display_name": "Fresh", "ai_provider_id": off, "enabled": true, "is_default": true, "reasoning_efforts": []}
+            ]))
+            .unwrap(),
+        ));
+        let before = app.notices.len();
+        app.update(Msg::Command(Command::New));
+        assert_eq!(
+            app.notices[before..].first(),
+            Some(&Notice::Error(
+                "This chat's model is not available. The default model, Fresh, is not available either. Pick one with /model."
+                    .into()
+            )),
+            "{:?}",
+            &app.notices[before..]
+        );
     }
 
     #[test]
