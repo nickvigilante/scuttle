@@ -281,6 +281,16 @@ the spend reset text first, then `workspace`, `organization`, `queue`, `mcp`, `c
 A field that is warning, or an unavailable model, drops only after every field that is not.
 `status` never drops, and is only cut when nothing else is left.
 
+## Notifications
+
+When a chat other than the open one finishes, fails, or needs an answer, a toast names it in the top-right corner for five seconds.
+It reads `✓ <title>`, `? <title> needs an answer`, or `✗ <title> failed`, and with Nerd Font icons the Octicons question and alert glyphs replace `?` and `✗`.
+A newer toast replaces the one showing.
+The toast covers that corner of the transcript, above any overlay, and never moves the transcript or the composer.
+Subagents raise none.
+A plan-mode question ends the turn the way a finished reply does, so it reads as finished.
+`toast = false` in config.toml turns toasts off.
+
 ## Config
 
 Path: `$XDG_CONFIG_HOME/scuttle/config.toml`, else `~/.config/scuttle/config.toml`.
@@ -294,6 +304,7 @@ A missing file means all defaults.
 | `composer_max_lines` | `10` | The most rows the composer grows to. |
 | `spinner` | `"random"` | Or `"braille"`, `"line"`, `"arc"`, `"bounce"`, `"bar"`. |
 | `icons` | unset | `"nerd"` or `"text"`. Unset follows `NERD_FONT`, then text. |
+| `toast` | `true` | A toast when another chat finishes, fails, or needs an answer. `false` turns it off. |
 | `statusline.fields` | model, effort, context, workspace, organization, plan-mode, spend, status | Repeats keep their first place. |
 | `statusline.thresholds.context` | unset | Percent, 1 to 100. Unset means no warning. |
 | `statusline.thresholds.spend` | unset | Same. |

@@ -1368,6 +1368,10 @@ pub struct App {
     /// Progress through the plan-mode questions the agent is waiting on.
     answering: Option<Answering>,
     pub notices: Vec<Notice>,
+    /// Chats whose turn ended, from the watch, for the UI to take and show.
+    pub alerts: Vec<crate::alerts::ChatAlert>,
+    /// The last status the watch reported for each chat, which decides `alerts`.
+    detector: crate::alerts::Detector,
     pub connection: Connection,
     pub busy: BusyBehavior,
     pub mouse: bool,
@@ -2157,6 +2161,10 @@ impl App {
                 chats,
             } => {
                 // A refetch, such as the one after the watch reconnects, keeps the open chat.
+                // Its statuses count as seen, so the watch's next change of one alerts.
+                for chat in &chats {
+                    self.detector.seed(chat);
+                }
                 self.chats
                     .apply_page_keeping(&query, offset, chats, self.chat_id);
                 // The open chat's stream keeps it read on the server.
@@ -2588,6 +2596,7 @@ impl App {
                 if !self.load_reply_applies(id) {
                     return vec![];
                 }
+                self.detector.seed(&chat);
                 self.loading = None;
                 self.failed_load = None;
                 self.returning_to = None;
@@ -4954,6 +4963,9 @@ impl App {
         let Some(chat) = ev.event.and_then(|e| e.chat) else {
             return vec![];
         };
+        if let Some(alert) = self.detector.observe(&ev.kind, &chat, self.chat_id) {
+            self.alerts.push(alert);
+        }
         self.chats.apply_watch(&ev.kind, &chat, self.chat_id);
         let Some(open) = self.chat_id else {
             return vec![];
@@ -9525,6 +9537,55 @@ mod tests {
             }),
             raw: serde_json::Value::Null,
         })
+    }
+
+    #[test]
+    fn watch_transitions_queue_alerts_and_a_list_page_seeds_without_alerting() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        started(&mut app);
+        let (listed_id, fresh, sub) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let with = |id, status: &str, at: &str| types::CodersdkChat {
+            status: Some(types::CodersdkChatStatus(status.into())),
+            ..listed(id, "Background", at)
+        };
+        app.update(Msg::ChatsLoaded {
+            query: ListQuery::Default,
+            offset: 0,
+            chats: vec![with(listed_id, "running", "2026-10-08T10:00:00Z")],
+        });
+        assert!(app.alerts.is_empty(), "a list page never alerts");
+        app.update(watch(
+            "status_change",
+            with(listed_id, "waiting", "2026-10-08T10:01:00Z"),
+        ));
+        app.update(watch(
+            "status_change",
+            with(fresh, "waiting", "2026-10-08T10:01:00Z"),
+        ));
+        app.update(watch(
+            "status_change",
+            types::CodersdkChat {
+                parent_chat_id: Some(listed_id),
+                ..with(sub, "running", "2026-10-08T10:00:00Z")
+            },
+        ));
+        app.update(watch(
+            "status_change",
+            types::CodersdkChat {
+                parent_chat_id: Some(listed_id),
+                ..with(sub, "error", "2026-10-08T10:01:00Z")
+            },
+        ));
+        assert_eq!(
+            std::mem::take(&mut app.alerts),
+            vec![crate::alerts::ChatAlert {
+                chat_id: listed_id,
+                title: "Background".into(),
+                outcome: crate::alerts::Outcome::Finished,
+                open: false,
+            }],
+            "the first status seen and a subagent raise none"
+        );
     }
 
     #[test]

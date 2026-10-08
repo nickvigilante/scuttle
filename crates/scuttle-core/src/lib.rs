@@ -1,5 +1,6 @@
 //! Headless chat engine for scuttle: state, the stream reducer, commands, and settings.
 
+pub mod alerts;
 pub mod app;
 pub mod attachments;
 pub mod chat_list;

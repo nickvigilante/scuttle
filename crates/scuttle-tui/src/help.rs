@@ -271,6 +271,7 @@ pub const CHATS_MARKERS: &[&str] = &[
     "From 120 columns, a column after the age shows the chat's pull request and its state, such as coder/coder#123 merged, for open, draft, merged, or closed.",
     "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
     "When the column is tight, the owner is dropped first, then the repository is cut short.",
+    "When a chat other than the open one finishes, fails, or needs an answer, a toast in the top-right corner names it for five seconds, unless toast = false in config.toml.",
 ];
 
 /// `CHATS_MARKERS` for Nerd Font icons, naming the glyphs `/chats` draws in their place.
@@ -284,6 +285,7 @@ pub const CHATS_MARKERS_NERD: &[&str] = &[
     "The glyph before it names the forge: \u{f09b} GitHub, \u{f296} GitLab, \u{f339} Gitea or Forgejo, \u{f171} Bitbucket, or \u{ebe8} Azure DevOps.",
     "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
     "When the column is tight, the owner is dropped first, then the repository is cut short.",
+    "When a chat other than the open one finishes, fails, or needs an answer, a toast in the top-right corner names it for five seconds, unless toast = false in config.toml.",
 ];
 
 /// Where to get a Nerd Font and how to turn icons on, which `/help` shows in text mode

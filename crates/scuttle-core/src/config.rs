@@ -398,6 +398,8 @@ pub struct LocalConfig {
     /// The footer's fields and their warnings, which `/statusline` edits.
     pub statusline: StatuslineConfig,
     pub density: BTreeMap<String, Density>,
+    /// Whether another chat finishing, failing, or needing an answer shows a toast.
+    pub toast: bool,
     /// The organization new chats go to, saved by `/organization`. An ID, not a secret.
     /// A value that is not a valid ID is ignored, so startup falls back to the default.
     #[serde(deserialize_with = "lenient_uuid")]
@@ -423,6 +425,7 @@ impl Default for LocalConfig {
             files: FilesConfig::default(),
             statusline: StatuslineConfig::default(),
             density: BTreeMap::new(),
+            toast: true,
             organization: None,
             efforts: BTreeMap::new(),
         }
@@ -563,6 +566,9 @@ pub const TEMPLATE: &str = r##"# scuttle settings. Remove the "# " in front of a
 # "text" keeps plain text and emoji. Left out, NERD_FONT=1 in the environment picks "nerd",
 # and otherwise scuttle uses "text". Get a font at https://www.nerdfonts.com/.
 # icons = "text"
+
+# Show a toast in the top-right corner when another chat finishes, fails, or needs an answer.
+# toast = true
 
 # [statusline]
 # The footer's fields, in order; /statusline edits this list. A field with nothing to show
@@ -930,6 +936,14 @@ mod tests {
     fn defaults_apply_to_an_empty_file() {
         assert_eq!(load_from_str("").unwrap(), LocalConfig::default());
         assert!(LocalConfig::default().mouse);
+    }
+
+    #[test]
+    fn the_toast_is_on_by_default_and_false_turns_it_off() {
+        assert!(LocalConfig::default().toast);
+        assert!(load_from_str("").unwrap().toast);
+        assert!(!load_from_str("toast = false\n").unwrap().toast);
+        assert!(load_from_str("toast = \"no\"\n").is_err());
     }
 
     #[test]
