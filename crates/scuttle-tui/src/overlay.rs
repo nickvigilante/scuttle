@@ -1303,16 +1303,46 @@ fn pr_reference_budget(width: u16) -> usize {
     usize::from(width) / 6
 }
 
+/// How `/chats` fits its pull request references: at most `max` cells each, and with owners
+/// only while every listed reference fits whole, so the rows never mix the two forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrFit {
+    max: usize,
+    owners: bool,
+}
+
+impl PrFit {
+    /// The fit for `rows` in a terminal `width` columns wide.
+    fn for_rows(rows: &[ChatRow], width: u16) -> PrFit {
+        let max = pr_reference_budget(width);
+        let owners = rows
+            .iter()
+            .filter_map(|r| r.pr.as_ref()?.reference.as_ref())
+            .all(|r| r.text(usize::MAX).len() <= max);
+        PrFit { max, owners }
+    }
+
+    /// `reference` as this fit shows it.
+    fn text(self, reference: &scuttle_core::forge::PrRef) -> String {
+        if self.owners {
+            return reference.text(self.max);
+        }
+        // One cell short of the whole form leaves no room for the owner.
+        let whole = reference.text(usize::MAX).len();
+        reference.text(self.max.min(whole.saturating_sub(1)))
+    }
+}
+
 /// A chat's pull request reference cell, empty for a chat without a pull request: with Nerd
 /// Font icons, the forge's glyph, or a blank slot as wide for a forge without one, then the
-/// dim reference in at most `max` cells; with text icons, the reference alone. A URL that
-/// names no forge leaves the bare `#123`.
-fn pr_cell(pr: Option<&PrBadge>, ctx: &ViewCtx, max: usize) -> Line<'static> {
+/// dim reference as `fit` shows it; with text icons, the reference alone. A URL that names no
+/// forge leaves the bare `#123`.
+fn pr_cell(pr: Option<&PrBadge>, ctx: &ViewCtx, fit: PrFit) -> Line<'static> {
     let Some(pr) = pr else {
         return Line::default();
     };
     let reference = match &pr.reference {
-        Some(r) => r.text(max),
+        Some(r) => fit.text(r),
         None => pr.number.map(|n| format!("#{n}")).unwrap_or_default(),
     };
     let mut spans = Vec::new();
@@ -1379,12 +1409,12 @@ fn family_cell(r: &ChatRow, ctx: &ViewCtx) -> Line<'static> {
 }
 
 /// A chat row's cells: the pin, the status, the title, the subagent count, the archived tag,
-/// and the age; `prs` adds the pull request's reference in at most that many cells and its
-/// state, and `summaries` adds the dim summary as the last.
+/// and the age; `prs` adds the pull request's reference, fitted, and its state, and
+/// `summaries` adds the dim summary as the last.
 fn chat_cells(
     r: &ChatRow,
     ctx: &ViewCtx,
-    prs: Option<usize>,
+    prs: Option<PrFit>,
     summaries: bool,
 ) -> Vec<Line<'static>> {
     // A subagent is indented inside the title cell, so the pin and status columns stay put.
@@ -1410,9 +1440,9 @@ fn chat_cells(
         )),
         Line::from(Span::styled(when, ctx.theme.dim)),
     ];
-    if let Some(max) = prs {
+    if let Some(fit) = prs {
         debug_assert_eq!(cells.len(), PR_COLUMN);
-        cells.push(pr_cell(r.pr.as_ref(), ctx, max));
+        cells.push(pr_cell(r.pr.as_ref(), ctx, fit));
         cells.push(pr_state_cell(r.pr.as_ref(), ctx));
     }
     if summaries {
@@ -1463,12 +1493,12 @@ fn chats_view(state: &ChatsState, ctx: &ViewCtx) -> TableView {
         .unwrap_or(0) as u16;
     // From `PR_MIN_WIDTH`, while a listed chat has a pull request; the reference column is as
     // wide as its widest cell.
-    let budget = pr_reference_budget(ctx.width);
+    let fit = PrFit::for_rows(&chat_rows, ctx.width);
     let prs =
-        (ctx.width >= PR_MIN_WIDTH && chat_rows.iter().any(|r| r.pr.is_some())).then_some(budget);
+        (ctx.width >= PR_MIN_WIDTH && chat_rows.iter().any(|r| r.pr.is_some())).then_some(fit);
     let pr_width = chat_rows
         .iter()
-        .map(|r| pr_cell(r.pr.as_ref(), ctx, budget).width())
+        .map(|r| pr_cell(r.pr.as_ref(), ctx, fit).width())
         .max()
         .unwrap_or(0) as u16;
     let spinners = chat_rows
@@ -3931,7 +3961,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tight_pr_column_drops_the_owner_first() {
+    fn a_tight_pr_column_drops_every_rows_owner_first() {
         let app = pr_app();
         let theme = Theme {
             icons: IconSet::Nerd,
@@ -3950,10 +3980,11 @@ mod tests {
         );
         assert_eq!(
             pr("t-merged"),
-            "\u{f09b} coder/coder#12",
-            "a short one stays whole"
+            "\u{f09b} coder#12",
+            "one reference too long drops every row's owner, so the forms never mix"
         );
-        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(2 + 14));
+        assert_eq!(pr("t-draft"), "\u{f339} tea#56");
+        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(2 + 10));
     }
 
     #[test]
