@@ -39,7 +39,7 @@ pub struct PrRef {
 
 impl PrRef {
     /// The reference in at most `max` cells: `owner/repo#N` when it fits, then `repo#N`, then
-    /// the repository cut short with an ellipsis, then `#N` (or `!N`), which is never cut.
+    /// the repository cut short with an ellipsis, then `#N` (or `!N`) as `bare` fits it.
     pub fn text(&self, max: usize) -> String {
         let tail = format!("{}{}", self.forge.sigil(), self.number);
         let full = format!("{}/{}{tail}", self.owner, self.repo);
@@ -53,10 +53,21 @@ impl PrRef {
         // At least one character of the repository before the ellipsis, or nothing of it.
         let room = max.saturating_sub(tail.len() + 1);
         if room == 0 {
-            return tail;
+            return bare(self.forge.sigil(), self.number, max);
         }
         format!("{}\u{2026}{tail}", &self.repo[..room])
     }
+}
+
+/// A bare pull request number with its sigil, such as `#123`, in at most `max` cells: a number
+/// too long is cut with an ellipsis, which alone stands in when `max` leaves no room at all.
+pub fn bare(sigil: char, number: i64, max: usize) -> String {
+    let whole = format!("{sigil}{number}");
+    if whole.len() <= max {
+        return whole;
+    }
+    // ASCII throughout, so a byte is a cell.
+    format!("{}\u{2026}", &whole[..max.saturating_sub(1)])
 }
 
 /// Whether `s` is a path segment the parser accepts: the characters the server's GitHub
@@ -81,10 +92,10 @@ fn number(s: &str) -> Option<i64> {
 /// (`/pulls/N`), GitHub Enterprise (`/pull/N`), and Azure DevOps Server
 /// (`/_git/repo/pullrequest/N`) are read too.
 pub fn parse_pr_url(url: &str) -> Option<PrRef> {
-    let rest = url.trim();
-    let rest = rest
-        .strip_prefix("https://")
-        .or_else(|| rest.strip_prefix("http://"))?;
+    let (scheme, rest) = url.trim().split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")) {
+        return None;
+    }
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let (authority, path) = rest.split_once('/')?;
     let host = authority
@@ -262,6 +273,32 @@ mod tests {
     }
 
     #[test]
+    fn a_long_number_is_cut_to_the_budget() {
+        assert_eq!(bare('#', 1_234_567_890, 11), "#1234567890");
+        assert_eq!(bare('#', 1_234_567_890, 6), "#1234\u{2026}");
+        assert_eq!(bare('!', 4, 2), "!4");
+        assert_eq!(bare('!', 42, 1), "\u{2026}");
+        let r = parse_pr_url("https://github.com/o/r/pull/123456789").unwrap();
+        assert_eq!(
+            r.text(6),
+            "#1234\u{2026}",
+            "a reference's number is cut the same way"
+        );
+    }
+
+    #[test]
+    fn the_scheme_matches_in_any_case() {
+        assert_eq!(
+            parse_pr_url("HTTPS://github.com/coder/coder/pull/1"),
+            pr(Forge::GitHub, "coder", "coder", 1)
+        );
+        assert_eq!(
+            parse_pr_url("Http://gitea.example.com/me/repo/pulls/2"),
+            pr(Forge::Gitea, "me", "repo", 2)
+        );
+    }
+
+    #[test]
     fn a_tight_reference_drops_the_owner_then_cuts_the_repository() {
         let r = parse_pr_url("https://github.com/nickvigilante/scuttle/pull/5").unwrap();
         assert_eq!(r.text(23), "nickvigilante/scuttle#5");
@@ -269,8 +306,9 @@ mod tests {
         assert_eq!(r.text(9), "scuttle#5");
         assert_eq!(r.text(8), "scutt\u{2026}#5", "then the repository is cut");
         assert_eq!(r.text(4), "s\u{2026}#5");
-        assert_eq!(r.text(3), "#5", "the number is never cut");
-        assert_eq!(r.text(0), "#5");
+        assert_eq!(r.text(3), "#5");
+        assert_eq!(r.text(2), "#5");
+        assert_eq!(r.text(1), "\u{2026}", "a number that cannot fit is cut too");
         let mr = parse_pr_url("https://gitlab.com/a/b/project/-/merge_requests/4").unwrap();
         assert_eq!(
             mr.text(10),

@@ -1289,7 +1289,7 @@ fn family_prefix(children: usize) -> String {
 const SUMMARY_MIN_WIDTH: u16 = 100;
 
 /// The column of `chat_cells` that holds the pull request's reference, when the overlay
-/// shows it; its state is the next column.
+/// shows it; its state is the next column, or this one when no row has a reference.
 const PR_COLUMN: usize = 6;
 
 /// The narrowest terminal whose `/chats` shows the pull request column. It is wider than
@@ -1309,6 +1309,9 @@ fn pr_reference_budget(width: u16) -> usize {
 struct PrFit {
     max: usize,
     owners: bool,
+    /// Whether any row has a reference to show; with none, the reference column stays out
+    /// and the state takes its place.
+    references: bool,
 }
 
 impl PrFit {
@@ -1319,7 +1322,11 @@ impl PrFit {
             .iter()
             .filter_map(|r| r.pr.as_ref()?.reference.as_ref())
             .all(|r| r.text(usize::MAX).len() <= max);
-        PrFit { max, owners }
+        PrFit {
+            max,
+            owners,
+            references: true,
+        }
     }
 
     /// `reference` as this fit shows it.
@@ -1343,7 +1350,10 @@ fn pr_cell(pr: Option<&PrBadge>, ctx: &ViewCtx, fit: PrFit) -> Line<'static> {
     };
     let reference = match &pr.reference {
         Some(r) => fit.text(r),
-        None => pr.number.map(|n| format!("#{n}")).unwrap_or_default(),
+        None => pr
+            .number
+            .map(|n| scuttle_core::forge::bare('#', n, fit.max))
+            .unwrap_or_default(),
     };
     let mut spans = Vec::new();
     if ctx.theme.icons == IconSet::Nerd {
@@ -1442,7 +1452,9 @@ fn chat_cells(
     ];
     if let Some(fit) = prs {
         debug_assert_eq!(cells.len(), PR_COLUMN);
-        cells.push(pr_cell(r.pr.as_ref(), ctx, fit));
+        if fit.references {
+            cells.push(pr_cell(r.pr.as_ref(), ctx, fit));
+        }
         cells.push(pr_state_cell(r.pr.as_ref(), ctx));
     }
     if summaries {
@@ -1493,14 +1505,15 @@ fn chats_view(state: &ChatsState, ctx: &ViewCtx) -> TableView {
         .unwrap_or(0) as u16;
     // From `PR_MIN_WIDTH`, while a listed chat has a pull request; the reference column is as
     // wide as its widest cell.
-    let fit = PrFit::for_rows(&chat_rows, ctx.width);
-    let prs =
-        (ctx.width >= PR_MIN_WIDTH && chat_rows.iter().any(|r| r.pr.is_some())).then_some(fit);
+    let mut fit = PrFit::for_rows(&chat_rows, ctx.width);
     let pr_width = chat_rows
         .iter()
         .map(|r| pr_cell(r.pr.as_ref(), ctx, fit).width())
         .max()
         .unwrap_or(0) as u16;
+    fit.references = pr_width > 0;
+    let prs =
+        (ctx.width >= PR_MIN_WIDTH && chat_rows.iter().any(|r| r.pr.is_some())).then_some(fit);
     let spinners = chat_rows
         .iter()
         .enumerate()
@@ -1569,7 +1582,9 @@ fn chats_view(state: &ChatsState, ctx: &ViewCtx) -> TableView {
         Constraint::Length(4),
     ];
     if prs.is_some() {
-        widths.push(Constraint::Length(pr_width));
+        if fit.references {
+            widths.push(Constraint::Length(pr_width));
+        }
         widths.push(Constraint::Length(pr_state_width(ctx.theme.icons)));
     }
     if summaries {
@@ -3985,6 +4000,35 @@ mod tests {
         );
         assert_eq!(pr("t-draft"), "\u{f339} tea#56");
         assert_eq!(view.widths[PR_COLUMN], Constraint::Length(2 + 10));
+    }
+
+    #[test]
+    fn text_icons_leave_out_a_reference_column_with_nothing_in_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::ChatsLoaded {
+            query: ListQuery::Default,
+            offset: 0,
+            chats: serde_json::from_value(json!([{"id": uuid::Uuid::new_v4(),
+                "title": "t-bare", "status": "waiting", "updated_at": "2026-09-30T10:00:00Z",
+                "children": [], "last_turn_summary": "Fixing the CI",
+                "diff_status": {"pull_request_state": "open", "pull_request_draft": false},
+                "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}}]))
+            .unwrap(),
+        });
+        let theme = Theme::terminal(true);
+        let view = Overlay::chats(String::new(), &app).view(&ViewCtx {
+            width: ROOMY,
+            ..ctx_for(&app, &theme)
+        });
+        assert_eq!(
+            view.widths.len(),
+            8,
+            "no number and no URL leave no reference column, only the state"
+        );
+        let row = chat_row(&view, "t-bare");
+        assert_eq!(cell_text(&view, row, PR_COLUMN), "open");
+        assert_eq!(cell_text(&view, row, PR_COLUMN + 1), "Fixing the CI");
+        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(7));
     }
 
     #[test]
