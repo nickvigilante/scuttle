@@ -56,8 +56,20 @@ fn tag_for(slot: Slot) -> fn(Uuid, u64, Msg) -> Msg {
     }
 }
 
+/// Opens a URL for the user. The runtime holds one so tests can record the URL instead of
+/// launching a browser.
+pub type Opener =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
+
+/// The opener the app runs with: the system browser.
+pub fn system_opener() -> Opener {
+    Arc::new(|url| Box::pin(async move { open_in_browser(&url).await }))
+}
+
 pub struct Runtime {
     client: Client,
+    /// How a link or web page is opened; tests swap in a recorder.
+    pub(crate) opener: Opener,
     redact: Redactor,
     tx: UnboundedSender<Msg>,
     stream: Option<JoinHandle<()>>,
@@ -417,10 +429,10 @@ fn jitter() -> Duration {
 /// Opens `url` with the system browser. Every standard stream is closed, because the opener's
 /// output would land on top of the full-screen UI.
 ///
-/// `cfg!(test)` only holds for unit tests in this crate; `tests/pty.rs` spawns the real
-/// `scuttle` binary, so it sets `SCUTTLE_NO_BROWSER` to keep those tests from launching one too.
+/// `tests/pty.rs` spawns the real `scuttle` binary, so it sets `SCUTTLE_NO_BROWSER` to keep
+/// those tests from launching a browser. Unit tests inject their own [`Opener`] instead.
 async fn open_in_browser(url: &str) -> Result<(), String> {
-    if cfg!(test) || std::env::var_os("SCUTTLE_NO_BROWSER").is_some() {
+    if std::env::var_os("SCUTTLE_NO_BROWSER").is_some() {
         return Err("not opened".into());
     }
     if over_ssh(|k| std::env::var_os(k).is_some()) {
@@ -536,9 +548,9 @@ pub fn page(text: &str) -> std::io::Result<()> {
 }
 
 /// Opens a link from the transcript. Only web links open, and in normalized form.
-async fn open_link(url: &str) -> Result<(), String> {
+async fn open_link(opener: &Opener, url: &str) -> Result<(), String> {
     match links::web_link(url) {
-        Some(parsed) => open_in_browser(parsed.as_str()).await,
+        Some(parsed) => opener(parsed.to_string()).await,
         None => Err("only http and https links open in a browser".into()),
     }
 }
@@ -757,6 +769,7 @@ impl Runtime {
     pub fn new(client: Client, token: SecretString, tx: UnboundedSender<Msg>) -> Runtime {
         Runtime {
             client,
+            opener: system_opener(),
             redact: Redactor(Arc::new(token)),
             tx,
             stream: None,
@@ -1486,24 +1499,29 @@ impl Runtime {
             })),
             Effect::OpenWeb(chat) => {
                 let url = chat_web_url(client.base_url(), chat).to_string();
+                let opener = self.opener.clone();
                 self.spawn(Box::pin(async move {
-                    let outcome = open_in_browser(&url).await;
+                    let outcome = opener(url.clone()).await;
                     Msg::WebOpened { url, outcome }
                 }));
             }
-            Effect::OpenLink(url) => self.spawn(Box::pin(async move {
-                // Report a web link in the normalized form the opener gets, so the notice names
-                // the real destination, such as the punycode form of a lookalike host. Any other
-                // text never reaches the opener and is copied as written.
-                let url = links::web_link(&url).map_or(url, |u| u.to_string());
-                let outcome = open_link(&url).await;
-                Msg::LinkOpened { url, outcome }
-            })),
+            Effect::OpenLink(url) => {
+                let opener = self.opener.clone();
+                self.spawn(Box::pin(async move {
+                    // Report a web link in the normalized form the opener gets, so the notice names
+                    // the real destination, such as the punycode form of a lookalike host. Any other
+                    // text never reaches the opener and is copied as written.
+                    let url = links::web_link(&url).map_or(url, |u| u.to_string());
+                    let outcome = open_link(&opener, &url).await;
+                    Msg::LinkOpened { url, outcome }
+                }));
+            }
             Effect::OpenWorkspaceWeb { owner, workspace } => {
                 let url = workspace_web_url(client.base_url(), &owner, &workspace).to_string();
+                let opener = self.opener.clone();
                 // Answered as a link, so the fallback copy never calls it the chat URL.
                 self.spawn(Box::pin(async move {
-                    let outcome = open_in_browser(&url).await;
+                    let outcome = opener(url.clone()).await;
                     Msg::LinkOpened { url, outcome }
                 }));
             }
@@ -1905,7 +1923,27 @@ mod tests {
 
     fn runtime(url: &str) -> (Runtime, UnboundedReceiver<Msg>) {
         let (tx, rx) = unbounded_channel();
-        (Runtime::new(client(url), SecretString::from(TOKEN), tx), rx)
+        let mut rt = Runtime::new(client(url), SecretString::from(TOKEN), tx);
+        rt.opener = Arc::new(|_| Box::pin(async { Err("not opened".to_string()) }));
+        (rt, rx)
+    }
+
+    /// A runtime whose opener records every URL it is given and reports success.
+    fn recording_runtime(
+        url: &str,
+    ) -> (
+        Runtime,
+        UnboundedReceiver<Msg>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (mut rt, rx) = runtime(url);
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = opened.clone();
+        rt.opener = Arc::new(move |url| {
+            seen.lock().unwrap().push(url);
+            Box::pin(async { Ok(()) })
+        });
+        (rt, rx, opened)
     }
 
     async fn next(rx: &mut UnboundedReceiver<Msg>) -> Msg {
@@ -2723,6 +2761,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_injected_opener_gets_the_url_and_never_the_token() {
+        let server = MockServer::start().await;
+        let (mut rt, mut rx, opened) = recording_runtime(&server.uri());
+        let chat = Uuid::new_v4();
+        rt.run(Effect::OpenWeb(chat));
+        rt.run(Effect::OpenLink("https://coder.com/docs".into()));
+        rt.run(Effect::OpenWorkspaceWeb {
+            owner: "nick".into(),
+            workspace: "dev".into(),
+        });
+        for _ in 0..3 {
+            match next(&mut rx).await {
+                Msg::WebOpened { outcome, .. } | Msg::LinkOpened { outcome, .. } => {
+                    assert_eq!(outcome, Ok(()), "the opener's result is reported");
+                }
+                other => panic!("expected an opened message, got {other:?}"),
+            }
+        }
+        let mut urls = opened.lock().unwrap().clone();
+        urls.sort();
+        let mut expected = vec![
+            format!("{}/agents/{chat}", server.uri()),
+            "https://coder.com/docs".to_string(),
+            format!("{}/@nick/dev", server.uri()),
+        ];
+        expected.sort();
+        assert_eq!(urls, expected);
+        for url in urls {
+            assert!(!url.contains(TOKEN), "{url} carries the session token");
+        }
+    }
+
+    #[tokio::test]
     async fn open_link_reports_the_link() {
         let server = MockServer::start().await;
         let (mut rt, mut rx) = runtime(&server.uri());
@@ -2765,6 +2836,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_web_links_reach_the_browser() {
+        let opener: Opener = Arc::new(|_| Box::pin(async { Err("not opened".to_string()) }));
         for url in [
             "file:///etc/passwd",
             "javascript:alert(1)",
@@ -2772,13 +2844,13 @@ mod tests {
             "docs/setup.md",
         ] {
             assert_eq!(
-                open_link(url).await,
+                open_link(&opener, url).await,
                 Err("only http and https links open in a browser".into()),
                 "{url}"
             );
         }
         assert_eq!(
-            open_link("https://coder.com").await,
+            open_link(&opener, "https://coder.com").await,
             Err("not opened".into()),
             "a web link gets as far as the opener"
         );
