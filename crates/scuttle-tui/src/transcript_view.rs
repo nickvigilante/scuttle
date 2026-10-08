@@ -786,12 +786,12 @@ enum Run {
 /// Adds a text part the way the web UI does: a whitespace-only part is dropped, and a part
 /// directly after text of the same kind continues that item with no separator, so one reply
 /// the server split into several parts renders as one Markdown document.
-fn push_text<'a>(items: &mut Vec<Item<'a>>, run: Run, text: Option<&'a str>) {
+fn push_text<'a>(items: &mut Vec<Item<'a>>, run: Run, text: Option<&'a str>, join: bool) {
     let text = text.unwrap_or_default();
     if text.trim().is_empty() {
         return;
     }
-    let last = match (items.last_mut(), run) {
+    let last = match (items.last_mut().filter(|_| join), run) {
         (Some(Item::UserText(t)), Run::User)
         | (Some(Item::AssistantText(t)), Run::Assistant)
         | (Some(Item::Reasoning(t)), Run::Reasoning) => Some(t),
@@ -845,11 +845,19 @@ fn items_for_message<'a>(
     }
     let user = role == Some("user");
     let mut items = Vec::new();
+    let mut split = false;
     for p in &m.content {
         match p.type_.as_ref().map(|t| t.as_str()).unwrap_or_default() {
-            "text" if user => push_text(&mut items, Run::User, p.text.as_deref()),
-            "text" => push_text(&mut items, Run::Assistant, p.text.as_deref()),
-            "reasoning" => push_text(&mut items, Run::Reasoning, p.text.as_deref()),
+            "text" if user => push_text(&mut items, Run::User, p.text.as_deref(), !split),
+            "text" => push_text(&mut items, Run::Assistant, p.text.as_deref(), !split),
+            "reasoning" => push_text(&mut items, Run::Reasoning, p.text.as_deref(), !split),
+            // A source draws nothing, but like the live stream's source block it ends a run.
+            "source" => {
+                split = true;
+                continue;
+            }
+            // The provider runs these itself, so they neither draw nor end a run.
+            "tool-call" if p.provider_executed == Some(true) => continue,
             "file" => items.push(Item::File {
                 label: file_label(p),
                 file: p.file_id,
@@ -889,6 +897,7 @@ fn items_for_message<'a>(
             }
             _ => {}
         }
+        split = false;
     }
     items
 }
@@ -2417,6 +2426,32 @@ mod tests {
             copied.contains("• You can create a Linear issue, but someone."),
             "{copied:?}"
         );
+    }
+
+    #[test]
+    fn a_source_between_text_parts_splits_them_like_the_live_stream() {
+        let parts = [
+            text_part("before"),
+            json!({"type": "source", "url": "https://example.com", "title": "Example"}),
+            text_part("after"),
+        ];
+        let saved = split_reply(json!(parts));
+        let live = live_app(&parts);
+        assert_eq!(shown(&saved), shown(&live));
+        assert!(!shown(&saved).iter().any(|l| l.contains("beforeafter")));
+    }
+
+    #[test]
+    fn a_provider_executed_call_between_text_parts_does_not_split_them() {
+        let parts = [
+            text_part("before "),
+            json!({"type": "tool-call", "tool_call_id": "p1", "tool_name": "web_search", "provider_executed": true}),
+            text_part("after"),
+        ];
+        let saved = split_reply(json!(parts));
+        let live = live_app(&parts);
+        assert_eq!(shown(&saved), vec!["before after".to_owned()]);
+        assert_eq!(shown(&live), shown(&saved));
     }
 
     fn rule_rows(lines: &[String]) -> Vec<usize> {
