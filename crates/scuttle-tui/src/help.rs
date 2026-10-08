@@ -272,6 +272,7 @@ pub const CHATS_MARKERS: &[&str] = &[
     "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
     "When the column is tight, the owner is dropped first, then the repository is cut short.",
     "When a chat other than the open one finishes, fails, or needs an answer, a toast in the top-right corner names it for five seconds, unless toast = false in config.toml.",
+    "While scuttle is not the focused window, any chat ending that way, the open one included, also raises a desktop notification or rings the bell, as notifications in config.toml says.",
 ];
 
 /// `CHATS_MARKERS` for Nerd Font icons, naming the glyphs `/chats` draws in their place.
@@ -286,6 +287,7 @@ pub const CHATS_MARKERS_NERD: &[&str] = &[
     "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
     "When the column is tight, the owner is dropped first, then the repository is cut short.",
     "When a chat other than the open one finishes, fails, or needs an answer, a toast in the top-right corner names it for five seconds, unless toast = false in config.toml.",
+    "While scuttle is not the focused window, any chat ending that way, the open one included, also raises a desktop notification or rings the bell, as notifications in config.toml says.",
 ];
 
 /// Where to get a Nerd Font and how to turn icons on, which `/help` shows in text mode

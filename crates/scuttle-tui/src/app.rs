@@ -381,6 +381,10 @@ pub struct Tui {
     copied: Option<CopyNote>,
     /// The toast naming a background chat whose turn ended, drawn over the transcript.
     toast: Option<crate::toast::Toast>,
+    /// Whether the terminal last reported scuttle focused; `None` until it reports either.
+    focused: Option<bool>,
+    /// Alerts for the main loop to send as desktop notifications or the bell.
+    desktop: Vec<scuttle_core::alerts::ChatAlert>,
     /// Set when the screen may hold foreign output, for example after the external editor.
     needs_full_redraw: bool,
     /// Whether keyboard enhancement flags are active, which decides the send and newline keys.
@@ -523,6 +527,8 @@ impl Tui {
             startup_notices: None,
             copied: None,
             toast: None,
+            focused: None,
+            desktop: Vec::new(),
             needs_full_redraw: false,
             keyboard_enhanced: true,
             fatal: None,
@@ -765,13 +771,28 @@ impl Tui {
     }
 
     /// Takes the core's alerts. A chat other than the open one shows a toast, unless
-    /// `toast = false`; the newest alert replaces any toast already showing.
+    /// `toast = false`; the newest alert replaces any toast already showing. While scuttle is
+    /// not known to be focused, any chat's alert, the open one's included, also goes to the
+    /// main loop as a desktop notification or the bell, unless `notifications = "off"`.
     fn take_alerts(&mut self) {
         for alert in std::mem::take(&mut self.core.alerts) {
+            if crate::notify::should_notify(self.config.notifications, self.focused) {
+                self.desktop.push(alert.clone());
+            }
             if !alert.open && self.config.toast {
                 self.toast = Some(crate::toast::Toast::new(alert));
             }
         }
+    }
+
+    /// The alerts to announce outside the terminal, for the main loop to write between draws.
+    pub fn take_desktop_alerts(&mut self) -> Vec<scuttle_core::alerts::ChatAlert> {
+        std::mem::take(&mut self.desktop)
+    }
+
+    /// How alerts are announced outside the terminal, from config.toml.
+    pub fn notifications(&self) -> config::NotificationMode {
+        self.config.notifications
     }
 
     /// Hands the composer the argument entries for the command its text is completing, so the
@@ -1439,6 +1460,11 @@ impl Tui {
         // hover follows it even where no move is reported.
         if let Event::Mouse(m) = &event {
             self.pointer = Some((m.column, m.row));
+        }
+        match event {
+            Event::FocusGained => self.focused = Some(true),
+            Event::FocusLost => self.focused = Some(false),
+            _ => {}
         }
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key, now),
@@ -3228,6 +3254,39 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("\u{2713}"), "{shown}");
+    }
+
+    #[test]
+    fn desktop_alerts_go_out_only_while_scuttle_is_unfocused() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        let mut minute = 0;
+        let mut end_turn = |t: &mut Tui| {
+            t.update(watched("status_change", id, "running", minute + 1));
+            t.update(watched("status_change", id, "waiting", minute + 2));
+            minute += 2;
+            t.take_desktop_alerts().len()
+        };
+        assert_eq!(
+            end_turn(&mut t),
+            1,
+            "focus is unknown until the terminal reports it"
+        );
+        t.handle(Event::FocusGained);
+        assert_eq!(end_turn(&mut t), 0, "focused relies on the toast");
+        t.handle(Event::FocusLost);
+        assert_eq!(end_turn(&mut t), 1);
+        t.core.chat_id = Some(id);
+        assert_eq!(
+            end_turn(&mut t),
+            1,
+            "the open chat notifies while unfocused"
+        );
+        t.config.notifications = config::NotificationMode::Off;
+        assert_eq!(end_turn(&mut t), 0, "off sends nothing");
+        t.config.notifications = config::NotificationMode::Bell;
+        assert_eq!(end_turn(&mut t), 1);
+        assert_eq!(t.notifications(), config::NotificationMode::Bell);
     }
 
     #[test]

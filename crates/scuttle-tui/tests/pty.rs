@@ -284,6 +284,8 @@ async fn exit_restores_terminal_modes() {
         "mouse capture disabled"
     );
     assert!(tail.contains("\x1b[?2004l"), "bracketed paste disabled");
+    assert!(raw.contains("\x1b[?1004h"), "focus reporting enabled");
+    assert!(tail.contains("\x1b[?1004l"), "focus reporting disabled");
     assert!(
         tail.contains("\x1b[?1007h"),
         "alternate scroll mode restored"

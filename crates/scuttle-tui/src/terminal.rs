@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -79,7 +80,7 @@ pub fn enter(mouse: bool) -> std::io::Result<DefaultTerminal> {
 pub fn resume(mouse: bool) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    enter_modes(&mut out)?;
     // Only push flags the terminal understands, so `leave` never pops a stack it did not push.
     let skip_query = std::env::var_os("SCUTTLE_NO_TERMINAL_QUERY").is_some();
     if enhancement_supported(skip_query, || {
@@ -93,6 +94,30 @@ pub fn resume(mouse: bool) -> std::io::Result<()> {
         ENHANCED.store(true, Ordering::SeqCst);
     }
     set_mouse(mouse)
+}
+
+/// Switches `out` to the alternate screen with bracketed paste and focus reporting, which
+/// tells scuttle whether its window is focused, so a desktop notification goes out only
+/// while it is not.
+fn enter_modes(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )
+}
+
+/// Turns off on `out` what `enter_modes` and `set_mouse` turned on, and shows the cursor.
+fn leave_modes(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        out,
+        DisableFocusChange,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )
 }
 
 /// Whether to push keyboard enhancement flags. `skip_query` (from `SCUTTLE_NO_TERMINAL_QUERY`)
@@ -131,13 +156,7 @@ pub fn leave() -> std::io::Result<()> {
     if ENHANCED.swap(false, Ordering::SeqCst) {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(
-        out,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
+    let _ = leave_modes(&mut out);
     let _ = disable_raw_mode();
     // Most terminals start with alternate scroll mode on, so the shell gets it back.
     let _ = out.write_all(alternate_scroll(true).as_bytes());
@@ -694,6 +713,22 @@ mod tests {
                 "a SIGINT outside a handoff exits with 130"
             );
         });
+    }
+
+    #[test]
+    fn focus_reporting_is_on_while_scuttle_runs_and_off_once_it_leaves() {
+        let mut on = Vec::new();
+        enter_modes(&mut on).unwrap();
+        let on = String::from_utf8(on).unwrap();
+        assert!(on.contains("\x1b[?1004h"), "{on:?}");
+        let mut off = Vec::new();
+        leave_modes(&mut off).unwrap();
+        let off = String::from_utf8(off).unwrap();
+        assert!(off.contains("\x1b[?1004l"), "{off:?}");
+        assert!(
+            off.contains("\x1b[?2004l") && off.contains("\x1b[?1049l"),
+            "{off:?}"
+        );
     }
 
     #[test]

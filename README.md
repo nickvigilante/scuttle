@@ -291,6 +291,29 @@ Subagents raise none.
 A plan-mode question ends the turn the way a finished reply does, so it reads as finished.
 `toast = false` in config.toml turns toasts off.
 
+While scuttle is not the focused window, the same events, the open chat's included, also reach you outside the terminal.
+scuttle turns on the terminal's focus reporting to know, and until the terminal reports focus it treats the window as unfocused.
+`notifications` in config.toml picks how:
+
+| Value | What happens |
+|---|---|
+| `"desktop"` (default) | A desktop notification, titled scuttle, whose body names the chat and how it ended. Only terminals known to show one get a notification sequence, and every other terminal gets the bell. |
+| `"bell"` | The bell, which the terminal may turn into a sound, a flash, or a notification. |
+| `"off"` | Nothing. |
+
+| Terminal | Sequence |
+|---|---|
+| Warp | OSC 777 `notify` |
+| iTerm2 | OSC 9 |
+| Ghostty | OSC 777 `notify` |
+| kitty | OSC 99, shown only while its window is unfocused |
+| tmux | The outer terminal's sequence through tmux passthrough when `allow-passthrough` is `on` or `all`, else the bell |
+| Zellij, GNU screen, and any other terminal | The bell |
+
+scuttle finds the terminal from `TERM_PROGRAM`, and inside tmux or over SSH from variables such as `LC_TERMINAL`, `KITTY_WINDOW_ID`, and `WARP_CLIENT_VERSION`.
+The chat title is sent without control characters or semicolons, cut to 100 characters, and nothing else from the chat or the session goes into a notification.
+Your operating system must allow notifications from the terminal, and iTerm2 must allow escape-sequence alerts in the profile's Terminal settings.
+
 ## Config
 
 Path: `$XDG_CONFIG_HOME/scuttle/config.toml`, else `~/.config/scuttle/config.toml`.
@@ -305,6 +328,7 @@ A missing file means all defaults.
 | `spinner` | `"random"` | Or `"braille"`, `"line"`, `"arc"`, `"bounce"`, `"bar"`. |
 | `icons` | unset | `"nerd"` or `"text"`. Unset follows `NERD_FONT`, then text. |
 | `toast` | `true` | A toast when another chat finishes, fails, or needs an answer. `false` turns it off. |
+| `notifications` | `"desktop"` | While scuttle is unfocused: `"desktop"`, `"bell"`, or `"off"`. See [Notifications](#notifications). |
 | `statusline.fields` | model, effort, context, workspace, organization, plan-mode, spend, status | Repeats keep their first place. |
 | `statusline.thresholds.context` | unset | Percent, 1 to 100. Unset means no warning. |
 | `statusline.thresholds.spend` | unset | Same. |
