@@ -268,7 +268,9 @@ pub const CHATS_MARKERS: &[&str] = &[
     "The status shows the most important of these: a spinner while the agent works, ! after an error, ? while it waits on you, then 🔵 for unread messages.",
     "A working chat that is also unread keeps its spinner, and the 🔵 shows once it stops.",
     "+N after a title counts its subagents, followed by the busiest one's marker, and a subagent is indented under its parent.",
-    "From 120 columns, a column after the age shows the chat's pull request and its state, such as PR #123 merged, for open, draft, merged, or closed.",
+    "From 120 columns, a column after the age shows the chat's pull request and its state, such as coder/coder#123 merged, for open, draft, merged, or closed.",
+    "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
+    "When the column is tight, the owner is dropped first, then the repository is cut short.",
 ];
 
 /// `CHATS_MARKERS` for Nerd Font icons, naming the glyphs `/chats` draws in their place.
@@ -278,7 +280,10 @@ pub const CHATS_MARKERS_NERD: &[&str] = &[
     "A working chat that is also unread keeps its spinner, and the \u{f111} shows once it stops.",
     "\u{f411} after the title marks an archived chat.",
     "+N after a title counts its subagents, followed by the busiest one's marker, and a subagent is indented under its parent.",
-    "From 120 columns, a column after the age shows the chat's pull request: \u{f407} open, \u{f4dd} draft, \u{f419} merged, or \u{f4dc} closed, then its number.",
+    "From 120 columns, a column after the age shows the chat's pull request, such as \u{f09b} coder/coder#123, then its state: \u{f407} open, \u{f4dd} draft, \u{f419} merged, or \u{f4dc} closed.",
+    "The glyph before it names the forge: \u{f09b} GitHub, \u{f296} GitLab, \u{f339} Gitea or Forgejo, \u{f171} Bitbucket, or \u{ebe8} Azure DevOps.",
+    "The pull request reads as its forge writes it: owner/repo#123 on GitHub, Gitea, Forgejo, and Bitbucket, group/project!123 on GitLab, and project/repo!123 on Azure DevOps, or #123 when the URL names no forge.",
+    "When the column is tight, the owner is dropped first, then the repository is cut short.",
 ];
 
 /// Where to get a Nerd Font and how to turn icons on, which `/help` shows in text mode
@@ -924,8 +929,10 @@ mod tests {
         let shown = text(&help_lines(&Theme::terminal(true), 300)).join("\n");
         for needle in [
             "From 120 columns",
-            "PR #123 merged",
+            "coder/coder#123 merged",
             "open, draft, merged, or closed",
+            "group/project!123",
+            "the owner is dropped first",
         ] {
             assert!(shown.contains(needle), "{needle} is missing from:\n{shown}");
         }
@@ -940,6 +947,9 @@ mod tests {
             "\u{f4dd} draft",
             "\u{f419} merged",
             "\u{f4dc} closed",
+            "\u{f09b} coder/coder#123",
+            "\u{f296} GitLab",
+            "the owner is dropped first",
         ] {
             assert!(shown.contains(needle), "{needle} is missing from:\n{shown}");
         }

@@ -11,7 +11,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use scuttle_core::app::{App, ChatAction, GitAction, Msg, Picker, QueueAction, WorkspaceAction};
 use scuttle_core::attachments::size_label;
-use scuttle_core::chat_list::{ChatRow, Filter, ListQuery, Load, PrBadge, chat_status, pr_badge};
+use scuttle_core::chat_list::{
+    ChatRow, Filter, ListQuery, Load, PrBadge, PrState, chat_status, pr_badge,
+};
 use scuttle_core::compaction::{self, Shown};
 use scuttle_core::config::{FieldList, StatuslineConfig, Thresholds};
 use scuttle_core::files::{self, ConflictChoice, FileAction, Place, SaveConflict, Sender};
@@ -1288,38 +1290,121 @@ fn family_prefix(children: usize) -> String {
 /// column before any other.
 const SUMMARY_MIN_WIDTH: u16 = 100;
 
-/// The column of `chat_cells` that holds the pull request, when the overlay shows it.
+/// The column of `chat_cells` that holds the pull request's reference, when the overlay
+/// shows it; its state is the next column, or this one when no row has a reference.
 const PR_COLUMN: usize = 6;
 
 /// The narrowest terminal whose `/chats` shows the pull request column. It is wider than
 /// `SUMMARY_MIN_WIDTH`, so a narrowing overlay drops the pull requests before the summaries.
 const PR_MIN_WIDTH: u16 = 120;
 
-/// A chat's pull request cell: with Nerd Font icons, the state's glyph in its color and the
-/// dim `#123`; with text icons, the dim `PR #123 ` and the state's word in its color. Empty
+/// The most cells a pull request's reference takes in a terminal `width` columns wide: a
+/// sixth of it, so `owner/repo#123` shows on wide terminals and the owner goes first as it
+/// narrows.
+fn pr_reference_budget(width: u16) -> usize {
+    usize::from(width) / 6
+}
+
+/// How `/chats` fits its pull request references: at most `max` cells each, and with owners
+/// only while every listed reference fits whole, so the rows never mix the two forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrFit {
+    max: usize,
+    owners: bool,
+    /// Whether any row has a reference to show; with none, the reference column stays out
+    /// and the state takes its place.
+    references: bool,
+}
+
+impl PrFit {
+    /// The fit for `rows` in a terminal `width` columns wide.
+    fn for_rows(rows: &[ChatRow], width: u16) -> PrFit {
+        let max = pr_reference_budget(width);
+        let owners = rows
+            .iter()
+            .filter_map(|r| r.pr.as_ref()?.reference.as_ref())
+            .all(|r| r.text(usize::MAX).len() <= max);
+        PrFit {
+            max,
+            owners,
+            references: true,
+        }
+    }
+
+    /// `reference` as this fit shows it.
+    fn text(self, reference: &scuttle_core::forge::PrRef) -> String {
+        if self.owners {
+            return reference.text(self.max);
+        }
+        // One cell short of the whole form leaves no room for the owner.
+        let whole = reference.text(usize::MAX).len();
+        reference.text(self.max.min(whole.saturating_sub(1)))
+    }
+}
+
+/// A chat's pull request reference cell, empty for a chat without a pull request: with Nerd
+/// Font icons, the forge's glyph, or a blank slot as wide for a forge without one, then the
+/// dim reference as `fit` shows it; with text icons, the reference alone. A URL that names no
+/// forge leaves the bare `#123`.
+fn pr_cell(pr: Option<&PrBadge>, ctx: &ViewCtx, fit: PrFit) -> Line<'static> {
+    let Some(pr) = pr else {
+        return Line::default();
+    };
+    let reference = match &pr.reference {
+        Some(r) => fit.text(r),
+        None => pr
+            .number
+            .map(|n| scuttle_core::forge::bare('#', n, fit.max))
+            .unwrap_or_default(),
+    };
+    let mut spans = Vec::new();
+    if ctx.theme.icons == IconSet::Nerd {
+        let forge = pr.reference.as_ref().map(|r| icons::forge_icon(r.forge));
+        spans.push(match forge {
+            Some(icon) => Span::styled(
+                icons::slot(IconSet::Nerd, icon).text,
+                icons::style(ctx.theme, ctx.theme.dim),
+            ),
+            None => {
+                Span::raw(" ".repeat(usize::from(icons::slot(IconSet::Nerd, Icon::GitHub).width)))
+            }
+        });
+    }
+    spans.push(Span::styled(reference, ctx.theme.dim));
+    Line::from(spans)
+}
+
+/// The width of the pull request state column: a glyph's slot, or the longest state word and
+/// a cell that keeps it off the summary.
+fn pr_state_width(set: IconSet) -> u16 {
+    match set {
+        IconSet::Nerd => icons::slot(IconSet::Nerd, Icon::PrOpen).width,
+        IconSet::Text => {
+            let longest = [
+                PrState::Open,
+                PrState::Draft,
+                PrState::Merged,
+                PrState::Closed,
+            ]
+            .map(|s| s.label().len())
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            longest as u16 + 1
+        }
+    }
+}
+
+/// A chat's pull request state, in its color: its glyph, or with text icons its word. Empty
 /// for a chat without a pull request.
-fn pr_cell(pr: Option<&PrBadge>, ctx: &ViewCtx) -> Line<'static> {
+fn pr_state_cell(pr: Option<&PrBadge>, ctx: &ViewCtx) -> Line<'static> {
     let Some(pr) = pr else {
         return Line::default();
     };
     let style = ctx.theme.pr(pr.state);
-    let number = pr.number.map(|n| format!("#{n}"));
     match icons::lead(ctx.theme, icons::pr_icon(pr.state), style) {
-        Some(glyph) => {
-            let mut spans = vec![glyph];
-            spans.extend(number.map(|n| Span::styled(n, ctx.theme.dim)));
-            Line::from(spans)
-        }
-        None => {
-            let prefix = match number {
-                Some(number) => format!("PR {number} "),
-                None => "PR ".to_owned(),
-            };
-            Line::from(vec![
-                Span::styled(prefix, ctx.theme.dim),
-                Span::styled(pr.state.label(), style),
-            ])
-        }
+        Some(glyph) => Line::from(glyph),
+        None => Line::from(Span::styled(pr.state.label(), style)),
     }
 }
 
@@ -1336,8 +1421,14 @@ fn family_cell(r: &ChatRow, ctx: &ViewCtx) -> Line<'static> {
 }
 
 /// A chat row's cells: the pin, the status, the title, the subagent count, the archived tag,
-/// and the age; `prs` adds the pull request, and `summaries` adds the dim summary as the last.
-fn chat_cells(r: &ChatRow, ctx: &ViewCtx, prs: bool, summaries: bool) -> Vec<Line<'static>> {
+/// and the age; `prs` adds the pull request's reference, fitted, and its state, and
+/// `summaries` adds the dim summary as the last.
+fn chat_cells(
+    r: &ChatRow,
+    ctx: &ViewCtx,
+    prs: Option<PrFit>,
+    summaries: bool,
+) -> Vec<Line<'static>> {
     // A subagent is indented inside the title cell, so the pin and status columns stay put.
     let indent = if r.depth > 0 { "   " } else { "" };
     let pin = if r.pinned { ctx.pin_icon } else { "" };
@@ -1361,9 +1452,12 @@ fn chat_cells(r: &ChatRow, ctx: &ViewCtx, prs: bool, summaries: bool) -> Vec<Lin
         )),
         Line::from(Span::styled(when, ctx.theme.dim)),
     ];
-    if prs {
+    if let Some(fit) = prs {
         debug_assert_eq!(cells.len(), PR_COLUMN);
-        cells.push(pr_cell(r.pr.as_ref(), ctx));
+        if fit.references {
+            cells.push(pr_cell(r.pr.as_ref(), ctx, fit));
+        }
+        cells.push(pr_state_cell(r.pr.as_ref(), ctx));
     }
     if summaries {
         cells.push(Line::from(Span::styled(
@@ -1411,13 +1505,17 @@ fn chats_view(state: &ChatsState, ctx: &ViewCtx) -> TableView {
         .map(|r| family_cell(r, ctx).width())
         .max()
         .unwrap_or(0) as u16;
-    // From `PR_MIN_WIDTH`, while a listed chat has a pull request, as wide as the widest cell.
+    // From `PR_MIN_WIDTH`, while a listed chat has a pull request; the reference column is as
+    // wide as its widest cell.
+    let mut fit = PrFit::for_rows(&chat_rows, ctx.width);
     let pr_width = chat_rows
         .iter()
-        .map(|r| pr_cell(r.pr.as_ref(), ctx).width())
+        .map(|r| pr_cell(r.pr.as_ref(), ctx, fit).width())
         .max()
         .unwrap_or(0) as u16;
-    let prs = ctx.width >= PR_MIN_WIDTH && pr_width > 0;
+    fit.references = pr_width > 0;
+    let prs =
+        (ctx.width >= PR_MIN_WIDTH && chat_rows.iter().any(|r| r.pr.is_some())).then_some(fit);
     let spinners = chat_rows
         .iter()
         .enumerate()
@@ -1485,10 +1583,11 @@ fn chats_view(state: &ChatsState, ctx: &ViewCtx) -> TableView {
         // Fits `now` through `999d`.
         Constraint::Length(4),
     ];
-    if prs {
-        // Text mode's words would run into the summary, so one more cell keeps them apart.
-        let pad = u16::from(ctx.theme.icons == IconSet::Text);
-        widths.push(Constraint::Length(pr_width + pad));
+    if prs.is_some() {
+        if fit.references {
+            widths.push(Constraint::Length(pr_width));
+        }
+        widths.push(Constraint::Length(pr_state_width(ctx.theme.icons)));
     }
     if summaries {
         widths.push(Constraint::Fill(2));
@@ -3840,7 +3939,9 @@ mod tests {
     }
 
     /// An app listing one chat per pull request state and one with no pull request, each with
-    /// a summary, titled by what it shows.
+    /// a summary, titled by what it shows. The merged one is on GitHub, the open one on a
+    /// self-hosted GitLab with a subgroup, the draft on Gitea, and the closed one's URL names
+    /// no forge.
     fn pr_app() -> App {
         let chat = |title: &str, minute: u32, pr: serde_json::Value| {
             json!({"id": uuid::Uuid::new_v4(), "title": title, "status": "waiting",
@@ -3857,25 +3958,28 @@ mod tests {
                     "t-merged",
                     50,
                     json!({"pr_number": 12, "pull_request_state": "merged",
-                    "pull_request_draft": false})
+                    "pull_request_draft": false,
+                    "url": "https://github.com/coder/coder/pull/12"})
                 ),
                 chat(
                     "t-open",
                     49,
                     json!({"pr_number": 34, "pull_request_state": "open",
-                    "pull_request_draft": false})
+                    "pull_request_draft": false,
+                    "url": "https://gitlab.example.com/gitlab-org/sub/project/-/merge_requests/34"})
                 ),
                 chat(
                     "t-draft",
                     48,
                     json!({"pr_number": 56, "pull_request_state": "open",
-                    "pull_request_draft": true})
+                    "pull_request_draft": true,
+                    "url": "https://gitea.com/gitea/tea/pulls/56"})
                 ),
                 chat(
                     "t-closed",
                     47,
-                    json!({"pr_number": 78, "pull_request_state": "closed",
-                    "pull_request_draft": false})
+                    json!({"pr_number": 7800, "pull_request_state": "closed",
+                    "pull_request_draft": false, "url": "https://example.com/elsewhere/7800"})
                 ),
                 chat("t-none", 46, json!({"pull_request_draft": false})),
             ]))
@@ -3884,8 +3988,84 @@ mod tests {
         app
     }
 
+    /// Wide enough that every reference in `pr_app` keeps its owner.
+    const ROOMY: u16 = 150;
+
     #[test]
-    fn a_wide_chats_list_shows_each_pull_request_state_and_number() {
+    fn a_wide_chats_list_shows_each_forge_reference_then_its_state() {
+        let app = pr_app();
+        let theme = Theme {
+            icons: IconSet::Nerd,
+            ..Theme::terminal(true)
+        };
+        let ctx = ViewCtx {
+            width: ROOMY,
+            ..ctx_for(&app, &theme)
+        };
+        let view = Overlay::chats(String::new(), &app).view(&ctx);
+        assert_eq!(
+            view.widths.len(),
+            9,
+            "pin, status, title, family, archived, age, reference, state, summary"
+        );
+        let pr = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN);
+        let state = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN + 1);
+        assert_eq!(pr("t-merged"), "\u{f09b} coder/coder#12");
+        assert_eq!(pr("t-open"), "\u{f296} gitlab-org/sub/project!34");
+        assert_eq!(pr("t-draft"), "\u{f339} gitea/tea#56");
+        assert_eq!(
+            pr("t-closed"),
+            "  #7800",
+            "an unknown forge keeps a blank slot"
+        );
+        assert_eq!(pr("t-none"), "");
+        assert_eq!(state("t-merged"), "\u{f419} ");
+        assert_eq!(state("t-open"), "\u{f407} ");
+        assert_eq!(state("t-draft"), "\u{f4dd} ");
+        assert_eq!(state("t-closed"), "\u{f4dc} ");
+        assert_eq!(state("t-none"), "");
+        assert_eq!(
+            cell_text(&view, chat_row(&view, "t-open"), PR_COLUMN + 2),
+            "Fixing the CI",
+            "the summary stays last"
+        );
+        assert_eq!(
+            view.widths[PR_COLUMN],
+            Constraint::Length(2 + 25),
+            "the slot and the widest reference"
+        );
+        assert_eq!(view.widths[PR_COLUMN + 1], Constraint::Length(2));
+    }
+
+    #[test]
+    fn text_icons_drop_the_forge_slot_and_spell_out_the_pr_state() {
+        let app = pr_app();
+        let theme = Theme::terminal(true);
+        let ctx = ViewCtx {
+            width: ROOMY,
+            ..ctx_for(&app, &theme)
+        };
+        let view = Overlay::chats(String::new(), &app).view(&ctx);
+        let pr = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN);
+        let state = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN + 1);
+        assert_eq!(pr("t-merged"), "coder/coder#12");
+        assert_eq!(pr("t-open"), "gitlab-org/sub/project!34");
+        assert_eq!(pr("t-draft"), "gitea/tea#56");
+        assert_eq!(pr("t-closed"), "#7800");
+        assert_eq!(state("t-merged"), "merged");
+        assert_eq!(state("t-open"), "open");
+        assert_eq!(state("t-draft"), "draft");
+        assert_eq!(state("t-closed"), "closed");
+        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(25));
+        assert_eq!(
+            view.widths[PR_COLUMN + 1],
+            Constraint::Length(7),
+            "a cell past the longest word keeps the words off the summary"
+        );
+    }
+
+    #[test]
+    fn a_tight_pr_column_drops_every_rows_owner_first() {
         let app = pr_app();
         let theme = Theme {
             icons: IconSet::Nerd,
@@ -3896,48 +4076,96 @@ mod tests {
             ..ctx_for(&app, &theme)
         };
         let view = Overlay::chats(String::new(), &app).view(&ctx);
-        assert_eq!(
-            view.widths.len(),
-            8,
-            "pin, status, title, family, archived, age, pull request, summary"
-        );
         let pr = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN);
-        assert_eq!(pr("t-merged"), "\u{f419} #12");
-        assert_eq!(pr("t-open"), "\u{f407} #34");
-        assert_eq!(pr("t-draft"), "\u{f4dd} #56");
-        assert_eq!(pr("t-closed"), "\u{f4dc} #78");
-        assert_eq!(pr("t-none"), "");
         assert_eq!(
-            cell_text(&view, chat_row(&view, "t-open"), PR_COLUMN + 1),
-            "Fixing the CI",
-            "the summary stays last"
+            pr("t-open"),
+            "\u{f296} project!34",
+            "the group path goes at {PR_MIN_WIDTH} columns"
         );
         assert_eq!(
-            view.widths[PR_COLUMN],
-            Constraint::Length(5),
-            "as wide as the widest cell"
+            pr("t-merged"),
+            "\u{f09b} coder#12",
+            "one reference too long drops every row's owner, so the forms never mix"
         );
+        assert_eq!(pr("t-draft"), "\u{f339} tea#56");
+        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(2 + 10));
     }
 
     #[test]
-    fn text_icons_spell_out_the_pr_state() {
-        let app = pr_app();
+    fn text_icons_leave_out_a_reference_column_with_nothing_in_it() {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        app.update(Msg::ChatsLoaded {
+            query: ListQuery::Default,
+            offset: 0,
+            chats: serde_json::from_value(json!([{"id": uuid::Uuid::new_v4(),
+                "title": "t-bare", "status": "waiting", "updated_at": "2026-09-30T10:00:00Z",
+                "children": [], "last_turn_summary": "Fixing the CI",
+                "diff_status": {"pull_request_state": "open", "pull_request_draft": false},
+                "files": [], "mcp_server_ids": [], "inline_mcp_servers": [], "labels": {}}]))
+            .unwrap(),
+        });
         let theme = Theme::terminal(true);
-        let ctx = ViewCtx {
-            width: PR_MIN_WIDTH,
+        let view = Overlay::chats(String::new(), &app).view(&ViewCtx {
+            width: ROOMY,
             ..ctx_for(&app, &theme)
-        };
-        let view = Overlay::chats(String::new(), &app).view(&ctx);
-        let pr = |title| cell_text(&view, chat_row(&view, title), PR_COLUMN);
-        assert_eq!(pr("t-merged"), "PR #12 merged");
-        assert_eq!(pr("t-open"), "PR #34 open");
-        assert_eq!(pr("t-draft"), "PR #56 draft");
-        assert_eq!(pr("t-closed"), "PR #78 closed");
+        });
         assert_eq!(
-            view.widths[PR_COLUMN],
-            Constraint::Length(14),
-            "a cell past the widest keeps the words off the summary"
+            view.widths.len(),
+            8,
+            "no number and no URL leave no reference column, only the state"
         );
+        let row = chat_row(&view, "t-bare");
+        assert_eq!(cell_text(&view, row, PR_COLUMN), "open");
+        assert_eq!(cell_text(&view, row, PR_COLUMN + 1), "Fixing the CI");
+        assert_eq!(view.widths[PR_COLUMN], Constraint::Length(7));
+    }
+
+    #[test]
+    fn the_pr_state_lines_up_whatever_the_reference_length() {
+        let app = pr_app();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-30T11:00:00Z")
+            .unwrap()
+            .timestamp();
+        let o = Overlay::chats(String::new(), &app);
+        for icons in [IconSet::Nerd, IconSet::Text] {
+            let theme = Theme {
+                icons,
+                ..Theme::terminal(true)
+            };
+            for width in [PR_MIN_WIDTH, ROOMY, 200] {
+                let ctx = ViewCtx {
+                    width,
+                    now_unix: now,
+                    ..ctx_for(&app, &theme)
+                };
+                let buf = drawn_chats(&o, &ctx, None);
+                let states: Vec<u16> = [
+                    ("t-merged", "\u{f419}", "merged"),
+                    ("t-open", "\u{f407}", "open"),
+                    ("t-draft", "\u{f4dd}", "draft"),
+                    ("t-closed", "\u{f4dc}", "closed"),
+                ]
+                .into_iter()
+                .map(|(title, glyph, word)| {
+                    let y = start_of(&buf, title).1;
+                    let mark = if icons == IconSet::Nerd { glyph } else { word };
+                    (0..width)
+                        .rev()
+                        .find(|&x| {
+                            (x..width)
+                                .map(|x| buf[(x, y)].symbol())
+                                .collect::<String>()
+                                .starts_with(mark)
+                        })
+                        .unwrap_or_else(|| panic!("{title}'s state at width {width}"))
+                })
+                .collect();
+                assert!(
+                    states.windows(2).all(|w| w[0] == w[1]),
+                    "{icons:?} at width {width}: {states:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3959,11 +4187,10 @@ mod tests {
                     ..ctx_for(&app, &theme)
                 };
                 let view = Overlay::chats(String::new(), &app).view(&ctx);
-                // The glyph is the first span; in words, the state follows the dim number.
                 let state = |title| {
-                    let cell = &view.rows[chat_row(&view, title)].cells[PR_COLUMN];
-                    let at = if icons == IconSet::Nerd { 0 } else { 1 };
-                    cell.spans[at].style.fg
+                    view.rows[chat_row(&view, title)].cells[PR_COLUMN + 1].spans[0]
+                        .style
+                        .fg
                 };
                 assert_eq!(state("t-merged"), merged, "{colors:?} {icons:?}");
                 assert_eq!(state("t-closed"), closed, "{colors:?} {icons:?}");
@@ -3982,7 +4209,7 @@ mod tests {
                 ..ctx_for(&app, &theme)
             })
         };
-        assert_eq!(at(PR_MIN_WIDTH).widths.len(), 8);
+        assert_eq!(at(PR_MIN_WIDTH).widths.len(), 9);
         let view = at(PR_MIN_WIDTH - 1);
         assert_eq!(view.widths.len(), 7, "the pull requests go first");
         assert_eq!(

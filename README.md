@@ -181,7 +181,7 @@ Wheel moves like Up and Down in tables.
 | Typing | Filters loaded chats by title. The last row, "Search all chats", asks the server. |
 | Server search operators | `status:`, `archived:`, `has_unread:`, `pr_status:`, `pr:`, `pr_title:`, `title:`, `repo:`, `source:created_by_me`, `source:shared_with_me`, `diff_url:`. Quote values with spaces. |
 | Subagents | Right shows and Left hides a chat's subagents. They are indented under the parent, and `+N` counts them. |
-| Columns | Pin, status, title, family count, archived marker, age. From 100 columns, a summary column. From 120 columns, a pull request column with its state. |
+| Columns | Pin, status, title, family count, archived marker, age. From 100 columns, a summary column. From 120 columns, the pull request in its forge's form, such as `coder/coder#123` on GitHub and Gitea or `group/project!123` on GitLab, then its state in a column of its own. Bitbucket writes `owner/repo#123` and Azure DevOps `project/repo!123`, and a URL that names no forge shows `#123`. When the column is tight, the owner is dropped first. With Nerd Font icons, the forge's logo leads the reference. |
 | Status | Spinner while working, error, waiting on you, then unread. Nerd Font icons replace the text and emoji. |
 | Pin (Ctrl+P) | Pins or unpins. The marker comes from `chats.pin_icon`. |
 | Rename (Ctrl+E) | Renames the chat. |

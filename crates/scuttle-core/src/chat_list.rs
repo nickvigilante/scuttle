@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use coder_sdk::{ChatStatus, types};
 use uuid::Uuid;
 
+use crate::forge::PrRef;
+
 /// Chats asked for per page, which is also the server's default.
 pub const PAGE_SIZE: i64 = 50;
 
@@ -197,11 +199,13 @@ impl PrState {
     }
 }
 
-/// The pull request attached to a chat: its number, when the server knows it, and its state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The pull request attached to a chat: its number, when the server knows it, its state, and
+/// its forge and repository, when its URL names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrBadge {
     pub number: Option<i64>,
     pub state: PrState,
+    pub reference: Option<PrRef>,
 }
 
 /// The pull request `chat`'s diff status names, read as the web UI's `getPRIconConfig` reads
@@ -223,6 +227,7 @@ pub fn pr_badge(chat: &types::CodersdkChat) -> Option<PrBadge> {
     Some(PrBadge {
         number: status.pr_number,
         state,
+        reference: status.url.as_deref().and_then(crate::forge::parse_pr_url),
     })
 }
 
@@ -1609,7 +1614,13 @@ mod tests {
             });
             pr_badge(&c)
         };
-        let badge = |number, state| Some(PrBadge { number, state });
+        let badge = |number, state| {
+            Some(PrBadge {
+                number,
+                state,
+                reference: None,
+            })
+        };
         assert_eq!(
             pr(Some("merged"), true, Some(12)),
             badge(Some(12), PrState::Merged),
@@ -1673,6 +1684,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_reads_its_forge_and_repository_from_its_url() {
+        let with_url = |url: Option<&str>| {
+            let mut c = listed(Uuid::new_v4(), "t", "2026-09-30T10:00:00Z");
+            c.diff_status = Some(types::CodersdkChatDiffStatus {
+                pull_request_state: Some("open".into()),
+                pr_number: Some(5),
+                url: url.map(str::to_owned),
+                ..Default::default()
+            });
+            pr_badge(&c).unwrap().reference
+        };
+        assert_eq!(
+            with_url(Some(
+                "https://gitlab.example.com/g/sub/p/-/merge_requests/5"
+            )),
+            Some(PrRef {
+                forge: crate::forge::Forge::GitLab,
+                owner: "g/sub".into(),
+                repo: "p".into(),
+                number: 5,
+            })
+        );
+        assert_eq!(with_url(Some("https://example.com/somewhere")), None);
+        assert_eq!(with_url(None), None);
+    }
+
+    #[test]
     fn a_diff_status_change_updates_the_rows_pull_request() {
         let id = Uuid::new_v4();
         let mut list = ChatList::default();
@@ -1681,7 +1719,7 @@ mod tests {
             0,
             vec![listed(id, "t", "2026-09-30T10:00:00Z")],
         );
-        let pr = |list: &ChatList| list.rows(Filter::All, "", &HashSet::new())[0].pr;
+        let pr = |list: &ChatList| list.rows(Filter::All, "", &HashSet::new())[0].pr.clone();
         assert_eq!(pr(&list), None);
         let mut event = listed(id, "t", "2026-09-30T10:01:00Z");
         event.diff_status = Some(types::CodersdkChatDiffStatus {
@@ -1694,7 +1732,8 @@ mod tests {
             pr(&list),
             Some(PrBadge {
                 number: Some(7),
-                state: PrState::Open
+                state: PrState::Open,
+                reference: None,
             })
         );
         event.diff_status = Some(types::CodersdkChatDiffStatus {

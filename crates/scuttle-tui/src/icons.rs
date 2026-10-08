@@ -11,6 +11,7 @@
 use ratatui::style::Style;
 use ratatui::text::Span;
 use scuttle_core::chat_list::PrState;
+use scuttle_core::forge::Forge;
 
 pub use scuttle_core::config::IconSet;
 
@@ -22,7 +23,8 @@ pub const NERD_FONTS_URL: &str = "https://www.nerdfonts.com/";
 
 /// Something scuttle marks with an icon. The transcript, the composer, the footer,
 /// `/workspace`, and `/mcp` use Codicons (nf-cod), and `/chats` and `/subagents` use
-/// Octicons (nf-oct), so each surface keeps to one family.
+/// Octicons (nf-oct), so each surface keeps to one family. The forges are brand logos, which
+/// no one family has all of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     /// A shell call: `execute` and the `process_*` tools. nf-cod-terminal.
@@ -90,11 +92,22 @@ pub enum Icon {
     PrMerged,
     /// A closed pull request. nf-oct-git_pull_request_closed.
     PrClosed,
+    /// A pull request on GitHub. nf-fa-github.
+    GitHub,
+    /// A merge request on GitLab. nf-fa-gitlab.
+    GitLab,
+    /// A pull request on Gitea or Forgejo. nf-linux-gitea.
+    Gitea,
+    /// A pull request on Bitbucket. nf-fa-bitbucket.
+    Bitbucket,
+    /// A pull request on Azure DevOps. nf-dev-azure, as nf-md-microsoft_azure_devops sits
+    /// outside the Basic Multilingual Plane.
+    AzureDevOps,
 }
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Icon; 32] = [
+    pub const ALL: [Icon; 37] = [
         Icon::Terminal,
         Icon::File,
         Icon::Edit,
@@ -127,6 +140,11 @@ impl Icon {
         Icon::PrDraft,
         Icon::PrMerged,
         Icon::PrClosed,
+        Icon::GitHub,
+        Icon::GitLab,
+        Icon::Gitea,
+        Icon::Bitbucket,
+        Icon::AzureDevOps,
     ];
 
     /// The glyph and the space that ends its slot.
@@ -163,6 +181,11 @@ impl Icon {
             Icon::PrDraft => "\u{f4dd} ",
             Icon::PrMerged => "\u{f419} ",
             Icon::PrClosed => "\u{f4dc} ",
+            Icon::GitHub => "\u{f09b} ",
+            Icon::GitLab => "\u{f296} ",
+            Icon::Gitea => "\u{f339} ",
+            Icon::Bitbucket => "\u{f171} ",
+            Icon::AzureDevOps => "\u{ebe8} ",
         }
     }
 
@@ -287,6 +310,17 @@ pub fn pr_icon(state: PrState) -> Icon {
         PrState::Draft => Icon::PrDraft,
         PrState::Merged => Icon::PrMerged,
         PrState::Closed => Icon::PrClosed,
+    }
+}
+
+/// The icon for a pull request's forge, before its reference in `/chats`.
+pub fn forge_icon(forge: Forge) -> Icon {
+    match forge {
+        Forge::GitHub => Icon::GitHub,
+        Forge::GitLab => Icon::GitLab,
+        Forge::Gitea => Icon::Gitea,
+        Forge::Bitbucket => Icon::Bitbucket,
+        Forge::AzureDevOps => Icon::AzureDevOps,
     }
 }
 
@@ -459,6 +493,35 @@ mod tests {
                 slot(IconSet::Text, pr_icon(state)).text,
                 "",
                 "text mode spells {state:?} out in the cell instead"
+            );
+        }
+    }
+
+    #[test]
+    fn each_forge_has_its_glyph_and_copies_as_text_mode_shows_it() {
+        for (forge, glyph) in [
+            (Forge::GitHub, "\u{f09b}"),
+            (Forge::GitLab, "\u{f296}"),
+            (Forge::Gitea, "\u{f339}"),
+            (Forge::Bitbucket, "\u{f171}"),
+            // nf-dev-azure, in the Basic Multilingual Plane, unlike nf-md-microsoft_azure_devops.
+            (Forge::AzureDevOps, "\u{ebe8}"),
+        ] {
+            let icon = forge_icon(forge);
+            assert_eq!(
+                slot(IconSet::Nerd, icon).text,
+                format!("{glyph} "),
+                "{forge:?}"
+            );
+            assert_eq!(
+                slot(IconSet::Text, icon).text,
+                "",
+                "{forge:?} drops in text mode"
+            );
+            assert_eq!(
+                text_for_glyph(glyph),
+                Some(""),
+                "a copied {forge:?} glyph reads as text mode shows it"
             );
         }
     }

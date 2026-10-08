@@ -8,6 +8,7 @@ pub mod compaction;
 pub mod config;
 pub mod density;
 pub mod files;
+pub mod forge;
 pub mod fuzzy;
 pub mod line_edit;
 pub mod live;
