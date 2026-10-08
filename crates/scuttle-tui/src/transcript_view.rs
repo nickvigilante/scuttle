@@ -249,9 +249,9 @@ const SAVE_HINT: &str = " · click to save";
 
 /// A renderable unit before wrapping.
 enum Item<'a> {
-    UserText(&'a str),
-    AssistantText(&'a str),
-    Reasoning(&'a str),
+    UserText(Cow<'a, str>),
+    AssistantText(Cow<'a, str>),
+    Reasoning(Cow<'a, str>),
     /// A file sent with a message, by name, or by type when it has none, with the id a
     /// click saves it by.
     File {
@@ -775,6 +775,41 @@ fn file_label(p: &types::CodersdkChatMessagePart) -> String {
     }
 }
 
+/// The kind of text a part adds to the item before it.
+#[derive(Clone, Copy)]
+enum Run {
+    User,
+    Assistant,
+    Reasoning,
+}
+
+/// Adds a text part the way the web UI does: a whitespace-only part is dropped, and a part
+/// directly after text of the same kind continues that item with no separator, so one reply
+/// the server split into several parts renders as one Markdown document.
+fn push_text<'a>(items: &mut Vec<Item<'a>>, run: Run, text: Option<&'a str>) {
+    let text = text.unwrap_or_default();
+    if text.trim().is_empty() {
+        return;
+    }
+    let last = match (items.last_mut(), run) {
+        (Some(Item::UserText(t)), Run::User)
+        | (Some(Item::AssistantText(t)), Run::Assistant)
+        | (Some(Item::Reasoning(t)), Run::Reasoning) => Some(t),
+        _ => None,
+    };
+    match last {
+        Some(t) => t.to_mut().push_str(text),
+        None => {
+            let text = Cow::Borrowed(text);
+            items.push(match run {
+                Run::User => Item::UserText(text),
+                Run::Assistant => Item::AssistantText(text),
+                Run::Reasoning => Item::Reasoning(text),
+            });
+        }
+    }
+}
+
 fn items_for_message<'a>(
     m: &'a types::CodersdkChatMessage,
     results: &BTreeMap<String, ToolResultInfo<'_>>,
@@ -812,9 +847,9 @@ fn items_for_message<'a>(
     let mut items = Vec::new();
     for p in &m.content {
         match p.type_.as_ref().map(|t| t.as_str()).unwrap_or_default() {
-            "text" if user => items.push(Item::UserText(p.text.as_deref().unwrap_or_default())),
-            "text" => items.push(Item::AssistantText(p.text.as_deref().unwrap_or_default())),
-            "reasoning" => items.push(Item::Reasoning(p.text.as_deref().unwrap_or_default())),
+            "text" if user => push_text(&mut items, Run::User, p.text.as_deref()),
+            "text" => push_text(&mut items, Run::Assistant, p.text.as_deref()),
+            "reasoning" => push_text(&mut items, Run::Reasoning, p.text.as_deref()),
             "file" => items.push(Item::File {
                 label: file_label(p),
                 file: p.file_id,
@@ -867,8 +902,8 @@ fn items_for_live<'a>(
     let mut items = Vec::new();
     for b in blocks {
         match b {
-            LiveBlock::Text(t) => items.push(Item::AssistantText(t)),
-            LiveBlock::Reasoning(t) => items.push(Item::Reasoning(t)),
+            LiveBlock::Text(t) => items.push(Item::AssistantText(Cow::Borrowed(t))),
+            LiveBlock::Reasoning(t) => items.push(Item::Reasoning(Cow::Borrowed(t))),
             LiveBlock::ToolCall {
                 id,
                 name,
@@ -1035,7 +1070,7 @@ fn render_items(
             Item::UserText(text) => {
                 out.gap();
                 // A message of only files has no text to show, so it draws no empty `›` line.
-                let text = if text.trim().is_empty() { "" } else { text };
+                let text = if text.trim().is_empty() { "" } else { &text };
                 let lines = text
                     .lines()
                     .map(|l| {
@@ -1054,9 +1089,9 @@ fn render_items(
                 }
                 out.gap();
                 let rendered = if live {
-                    markdown::render(text, out.width)
+                    markdown::render(&text, out.width)
                 } else {
-                    markdown::render_cached(text, out.width)
+                    markdown::render_cached(&text, out.width)
                 };
                 // Each rendered line is wrapped once; its rows place the code blocks and links
                 // and are then pushed as they are.
@@ -1133,7 +1168,7 @@ fn render_items(
                     };
                 }
                 let lines = match density {
-                    Density::Expanded => markdown::drawable(text)
+                    Density::Expanded => markdown::drawable(&text)
                         .lines()
                         .map(|l| Line::from(Span::styled(l.to_owned(), out.theme.dim)))
                         .collect(),
@@ -2253,6 +2288,137 @@ mod tests {
         )
     }
 
+    fn split_reply(parts: serde_json::Value) -> App {
+        app_with(json!([
+            {"id": 1, "role": "assistant", "content": parts}
+        ]))
+    }
+
+    fn live_app(parts: &[serde_json::Value]) -> App {
+        let mut app = App::new(BusyBehavior::Queue, true);
+        for (i, part) in parts.iter().enumerate() {
+            let mp = serde_json::from_value(json!({"seq": i + 1, "part": part})).unwrap();
+            app.transcript.live.apply(&mp);
+        }
+        app
+    }
+
+    fn shown(app: &App) -> Vec<String> {
+        texts(&build_at(app, 100))
+            .into_iter()
+            .map(|l| l.trim_end().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn text_part(t: &str) -> serde_json::Value {
+        json!({"type": "text", "text": t})
+    }
+
+    #[test]
+    fn consecutive_text_parts_render_as_one_bullet() {
+        let app = split_reply(json!([
+            text_part("- You can "),
+            text_part("create a Linear issue"),
+            text_part(", but someone has to open each response."),
+        ]));
+        let lines = texts(&build_at(&app, 100));
+        let at = lines
+            .iter()
+            .position(|l| l.contains("create a Linear issue"))
+            .unwrap_or_else(|| panic!("the reply is missing: {lines:#?}"));
+        assert!(
+            lines[at]
+                .contains("You can create a Linear issue, but someone has to open each response."),
+            "one bullet line: {lines:#?}"
+        );
+        assert!(lines[at].contains('•'), "a bullet: {lines:#?}");
+        assert!(lines[at + 1..].iter().all(|l| !l.contains("someone")));
+    }
+
+    #[test]
+    fn a_whitespace_only_text_part_is_skipped() {
+        let split = split_reply(json!([
+            text_part("one"),
+            text_part("  \n"),
+            text_part(" two")
+        ]));
+        let whole = split_reply(json!([text_part("one two")]));
+        assert_eq!(shown(&split), shown(&whole));
+    }
+
+    #[test]
+    fn a_tool_call_between_text_parts_still_splits_them() {
+        let app = split_reply(json!([
+            text_part("before"),
+            {"type": "tool-call", "tool_call_id": "c1", "tool_name": "execute", "args": {"command": "ls"}},
+            text_part("after"),
+        ]));
+        let lines = shown(&app);
+        let before = lines.iter().position(|l| l.contains("before")).unwrap();
+        let after = lines.iter().position(|l| l.contains("after")).unwrap();
+        assert!(after > before + 1, "the tool sits between: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("beforeafter")));
+    }
+
+    #[test]
+    fn consecutive_reasoning_parts_render_as_one_block() {
+        let app = split_reply(json!([
+            {"type": "reasoning", "text": "think"},
+            {"type": "reasoning", "text": "ing hard"},
+        ]));
+        let lines = texts(&build_at(&app, 100));
+        let thinking = lines.iter().filter(|l| l.contains("∴ Thinking")).count();
+        assert_eq!(thinking, 1, "one reasoning block: {lines:#?}");
+    }
+
+    #[test]
+    fn consecutive_user_text_parts_render_as_one_line() {
+        let app = app_with(json!([
+            {"id": 1, "role": "user", "content": [text_part("hello "), text_part("world")]}
+        ]));
+        let lines = texts(&build_at(&app, 100));
+        assert!(
+            lines.iter().any(|l| l.contains("› hello world")),
+            "one user line: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_reply_renders_like_the_saved_one() {
+        let parts = [
+            text_part("- You can "),
+            text_part("create a Linear issue"),
+            text_part(", but someone has to open each response."),
+        ];
+        let saved = split_reply(json!(parts));
+        let live = live_app(&parts);
+        assert_eq!(shown(&live), shown(&saved));
+    }
+
+    #[test]
+    fn copying_a_merged_reply_gives_what_is_displayed() {
+        use crate::selection::{Pos, Selection, selected_text};
+        let app = split_reply(json!([
+            text_part("- You can "),
+            text_part("create a Linear issue"),
+            text_part(", but someone."),
+        ]));
+        let view = build_at(&app, 60);
+        let all = Selection {
+            anchor: Pos { line: 0, col: 0 },
+            head: Pos {
+                line: view.lines.len() - 1,
+                col: 59,
+            },
+        };
+        let copied = selected_text(&view, &all);
+        assert!(
+            copied.contains("• You can create a Linear issue, but someone."),
+            "{copied:?}"
+        );
+    }
+
     fn rule_rows(lines: &[String]) -> Vec<usize> {
         lines
             .iter()
@@ -2321,7 +2487,9 @@ mod tests {
                 {"type": "tool-result", "tool_call_id": "a", "tool_name": "execute", "result": {"output": "ok"}}
             ]},
             {"id": 3, "role": "assistant", "content": [
-                {"type": "text", "text": "First part."},
+                {"type": "text", "text": "First part."}
+            ]},
+            {"id": 4, "role": "assistant", "content": [
                 {"type": "text", "text": "Second part."}
             ]}
         ]));
