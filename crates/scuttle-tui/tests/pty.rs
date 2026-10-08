@@ -429,6 +429,19 @@ async fn the_pager_gets_the_keys_typed_while_it_runs() {
     // The repaint after the handoff asks where the cursor is, which a real terminal answers.
     s.wait_for_after("PAGER-READY", "\x1b[6n");
     s.writer.write_all(b"\x1b[1;1R").unwrap();
+    // Focus reports would reach the pager as keys, so they are off while it runs and back on
+    // after it.
+    let raw = String::from_utf8_lossy(&s.raw()).to_string();
+    let ready = raw.find("PAGER-READY").expect("the pager ran");
+    let (before, after) = raw.split_at(ready);
+    assert!(
+        before.rfind("\x1b[?1004l") > before.rfind("\x1b[?1004h"),
+        "focus reporting is off before the pager"
+    );
+    assert!(
+        after.contains("\x1b[?1004h"),
+        "focus reporting is back after the pager"
+    );
     // A key scuttle had taken would sit in the composer, and turn `/quit` into a message.
     s.writer.write_all(b"/quit\r").unwrap();
     assert_eq!(s.exit_code(), 0);
@@ -724,6 +737,10 @@ async fn a_signal_outside_a_handoff_restores_the_terminal_and_exits() {
         assert!(
             tail.contains("\x1b[23;0t"),
             "SIG{signal}: the saved title is back"
+        );
+        assert!(
+            tail.contains("\x1b[?1004l"),
+            "SIG{signal}: focus reporting off"
         );
     }
 }

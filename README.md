@@ -292,7 +292,8 @@ A plan-mode question ends the turn the way a finished reply does, so it reads as
 `toast = false` in config.toml turns toasts off.
 
 While scuttle is not the focused window, the same events, the open chat's included, also reach you outside the terminal.
-scuttle turns on the terminal's focus reporting to know, and until the terminal reports focus it treats the window as unfocused.
+scuttle turns on the terminal's focus reporting to know.
+Until the terminal reports focus, at startup and again after the pager or an editor, only chats other than the open one reach you, since you are most likely watching the open one.
 `notifications` in config.toml picks how:
 
 | Value | What happens |
@@ -307,11 +308,11 @@ scuttle turns on the terminal's focus reporting to know, and until the terminal 
 | iTerm2 | OSC 9 |
 | Ghostty | OSC 777 `notify` |
 | kitty | OSC 99, shown only while its window is unfocused |
-| tmux | The outer terminal's sequence through tmux passthrough when `allow-passthrough` is `on` or `all`, else the bell |
+| tmux | The outer terminal's sequence through tmux passthrough when `allow-passthrough` is `all`, else the bell, since `on` forwards nothing from a hidden pane |
 | Zellij, GNU screen, and any other terminal | The bell |
 
 scuttle finds the terminal from `TERM_PROGRAM`, and inside tmux or over SSH from variables such as `LC_TERMINAL`, `KITTY_WINDOW_ID`, and `WARP_CLIENT_VERSION`.
-The chat title is sent without control characters or semicolons, cut to 100 characters, and nothing else from the chat or the session goes into a notification.
+The chat title is sent without control characters, line breaks, or semicolons, and cut to 80 columns before the words that say how it ended, and nothing else from the chat or the session goes into a notification.
 Your operating system must allow notifications from the terminal, and iTerm2 must allow escape-sequence alerts in the profile's Terminal settings.
 
 ## Config

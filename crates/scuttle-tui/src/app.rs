@@ -381,7 +381,8 @@ pub struct Tui {
     copied: Option<CopyNote>,
     /// The toast naming a background chat whose turn ended, drawn over the transcript.
     toast: Option<crate::toast::Toast>,
-    /// Whether the terminal last reported scuttle focused; `None` until it reports either.
+    /// Whether the terminal last reported scuttle focused; `None` until it reports either, and
+    /// again after a handoff, since the reports start over.
     focused: Option<bool>,
     /// Alerts for the main loop to send as desktop notifications or the bell.
     desktop: Vec<scuttle_core::alerts::ChatAlert>,
@@ -640,6 +641,7 @@ impl Tui {
     /// have set its own window title, so the next draw repaints both; a terminal that could
     /// not be restored makes the app quit.
     pub fn after_handoff(&mut self, text: &str, handed: Handed, resumed: std::io::Result<()>) {
+        self.focused = None;
         self.last_paged = Some(text.to_owned());
         self.needs_full_redraw = true;
         self.shown_title = None;
@@ -776,7 +778,7 @@ impl Tui {
     /// main loop as a desktop notification or the bell, unless `notifications = "off"`.
     fn take_alerts(&mut self) {
         for alert in std::mem::take(&mut self.core.alerts) {
-            if crate::notify::should_notify(self.config.notifications, self.focused) {
+            if crate::notify::should_notify(self.config.notifications, self.focused, alert.open) {
                 self.desktop.push(alert.clone());
             }
             if !alert.open && self.config.toast {
@@ -2283,6 +2285,7 @@ impl Tui {
             resumed = resume;
             edited
         });
+        self.focused = None;
         self.set_keyboard_enhanced(crate::terminal::keyboard_enhanced());
         if let Err(e) = result {
             self.notice(Notice::Error(format!("Editor failed: {e}")));
@@ -2308,6 +2311,7 @@ impl Tui {
         if !handed {
             return vec![];
         }
+        self.focused = None;
         self.needs_full_redraw = true;
         self.set_keyboard_enhanced(crate::terminal::keyboard_enhanced());
         // The resume restored the capture that was on before; a changed `mouse` takes over.
@@ -3254,6 +3258,60 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("\u{2713}"), "{shown}");
+    }
+
+    /// Ends a turn of chat `id` at minutes after `*minute`, and counts the desktop alerts.
+    fn end_turn(t: &mut Tui, id: uuid::Uuid, minute: &mut u32) -> usize {
+        t.update(watched("status_change", id, "running", *minute + 1));
+        t.update(watched("status_change", id, "waiting", *minute + 2));
+        *minute += 2;
+        t.take_desktop_alerts().len()
+    }
+
+    #[test]
+    fn before_any_focus_event_only_background_chats_notify() {
+        let (open, background) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut t = watching(LocalConfig::default(), open);
+        t.update(watched("status_change", background, "running", 0));
+        t.core.chat_id = Some(open);
+        let mut minute = 0;
+        assert_eq!(
+            end_turn(&mut t, open, &mut minute),
+            0,
+            "focus unknown: the open chat is most likely being watched"
+        );
+        assert_eq!(
+            end_turn(&mut t, background, &mut minute),
+            1,
+            "focus unknown: a background chat notifies"
+        );
+        t.handle(Event::FocusLost);
+        assert_eq!(
+            end_turn(&mut t, open, &mut minute),
+            1,
+            "FocusLost: the open chat notifies"
+        );
+        t.handle(Event::FocusGained);
+        assert_eq!(end_turn(&mut t, open, &mut minute), 0);
+        assert_eq!(
+            end_turn(&mut t, background, &mut minute),
+            0,
+            "FocusGained: none"
+        );
+    }
+
+    #[test]
+    fn a_handoff_makes_focus_unknown_again() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        t.core.chat_id = Some(id);
+        let mut minute = 0;
+        t.handle(Event::FocusLost);
+        t.after_handoff("+x\n", Handed::Ran(Ok(())), Ok(()));
+        assert_eq!(end_turn(&mut t, id, &mut minute), 0, "after the pager");
+        t.handle(Event::FocusLost);
+        let _ = t.open_editor_with(|_| (Ok(()), Ok(())));
+        assert_eq!(end_turn(&mut t, id, &mut minute), 0, "after the editor");
     }
 
     #[test]

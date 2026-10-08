@@ -73,12 +73,13 @@ pub fn detect(env: &dyn Fn(&str) -> Option<String>) -> Target {
     Target { kind, tmux }
 }
 
-/// `text` without control characters or `;`, so it can neither end a sequence early nor
-/// shift into another parameter, cut to `TEXT_MAX` characters.
+/// `text` without control characters, line or paragraph separators, or `;`, so it can
+/// neither end a sequence early, shift into another parameter, nor break a line, cut to
+/// `TEXT_MAX` characters.
 pub fn clean(text: &str) -> String {
     let kept: Vec<char> = text
         .chars()
-        .filter(|c| !c.is_control() && *c != ';')
+        .filter(|c| !c.is_control() && !matches!(c, ';' | '\u{2028}' | '\u{2029}'))
         .collect();
     if kept.len() <= TEXT_MAX {
         return kept.into_iter().collect();
@@ -88,15 +89,21 @@ pub fn clean(text: &str) -> String {
     cut
 }
 
+/// The display columns a notification keeps of the chat's title, so the words after it fit
+/// within `TEXT_MAX`.
+const TITLE_CELLS: usize = 80;
+
 /// The notification's title and body for `alert`. The body names the chat by its title only,
-/// never a URL or the session token.
+/// never a URL or the session token. The title alone is cut, by display width, so the words
+/// that say how the chat ended always remain.
 pub fn message(alert: &ChatAlert) -> (String, String) {
     let words = match alert.outcome {
         Outcome::Finished => "finished",
         Outcome::NeedsAnswer => "needs an answer",
         Outcome::Failed => "failed",
     };
-    ("scuttle".into(), format!("{} {words}", alert.title))
+    let title = crate::overlay::ellipsize(&clean(&alert.title), TITLE_CELLS);
+    ("scuttle".into(), format!("{title} {words}"))
 }
 
 /// The desktop notification sequence for `kind`, or `None` for a terminal that gets the bell.
@@ -123,20 +130,32 @@ pub fn tmux_wrap(sequence: &str) -> String {
     format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
 }
 
-/// Whether an alert goes out at all: `notifications` is not `off`, and scuttle is not known to
-/// be focused. `focused` is `None` until the terminal reports focus, and then an alert goes out,
-/// since a terminal that never reports it would otherwise get none.
-pub fn should_notify(mode: NotificationMode, focused: Option<bool>) -> bool {
-    mode != NotificationMode::Off && focused != Some(true)
+/// Whether an alert goes out at all: `notifications` is not `off`, and scuttle is not
+/// focused. `focused` is `None` until the terminal reports focus. Then a background chat's
+/// alert goes out, since a terminal that never reports focus would otherwise get none, but
+/// the `open` chat's does not, since the user is most likely watching it.
+pub fn should_notify(mode: NotificationMode, focused: Option<bool>, open: bool) -> bool {
+    mode != NotificationMode::Off
+        && match focused {
+            Some(focused) => !focused,
+            None => !open,
+        }
 }
 
-/// Asks tmux whether the pane forwards passthrough sequences: `allow-passthrough` is `on` or
-/// `all`, with inherited values. A failure to run tmux counts as off.
+/// Whether tmux's `allow-passthrough` value forwards a sequence from any pane. Only `all`
+/// does: `on` forwards only from a visible pane, and a notification matters most when the
+/// pane is hidden.
+fn passthrough_forwards(value: &str) -> bool {
+    value.trim() == "all"
+}
+
+/// Asks tmux whether the pane forwards passthrough sequences, with inherited values. A
+/// failure to run tmux counts as off.
 fn query_tmux_passthrough() -> bool {
     crate::runtime::child_command("tmux")
         .args(["show-options", "-Apv", "allow-passthrough"])
         .output()
-        .map(|o| matches!(String::from_utf8_lossy(&o.stdout).trim(), "on" | "all"))
+        .map(|o| passthrough_forwards(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or(false)
 }
 
@@ -317,6 +336,52 @@ mod tests {
     }
 
     #[test]
+    fn only_allow_passthrough_all_reaches_a_hidden_pane() {
+        assert!(passthrough_forwards("all\n"));
+        assert!(
+            !passthrough_forwards("on\n"),
+            "on forwards only from a visible pane"
+        );
+        assert!(!passthrough_forwards("off"));
+        assert!(!passthrough_forwards(""));
+    }
+
+    #[test]
+    fn a_huge_title_still_says_how_the_chat_ended() {
+        let huge = ChatAlert {
+            title: "\u{4fee}".repeat(10_000),
+            ..alert(Outcome::Failed)
+        };
+        let (_, body) = message(&huge);
+        assert!(body.ends_with("\u{2026} failed"), "{body}");
+        for kind in [
+            TerminalKind::Warp,
+            TerminalKind::ITerm2,
+            TerminalKind::Ghostty,
+            TerminalKind::Kitty,
+        ] {
+            let seq = sequence(kind, "scuttle", &body).unwrap();
+            assert!(seq.contains("\u{2026} failed"), "{kind:?}");
+        }
+        let asking = ChatAlert {
+            title: "x".repeat(10_000),
+            ..alert(Outcome::NeedsAnswer)
+        };
+        let seq = sequence(TerminalKind::Warp, "scuttle", &message(&asking).1).unwrap();
+        assert!(seq.ends_with("\u{2026} needs an answer\x07"), "{seq}");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_dropped() {
+        assert_eq!(clean("a\u{2028}b\u{2029}c"), "abc");
+        let titled = ChatAlert {
+            title: "one\u{2028}two".into(),
+            ..alert(Outcome::Finished)
+        };
+        assert_eq!(message(&titled).1, "onetwo finished");
+    }
+
+    #[test]
     fn tmux_passthrough_doubles_every_escape() {
         assert_eq!(
             tmux_wrap("\x1b]9;hi\x07"),
@@ -327,13 +392,22 @@ mod tests {
     #[test]
     fn only_an_unfocused_or_unknown_focus_notifies_and_off_never_does() {
         use NotificationMode::*;
-        assert!(should_notify(Desktop, None));
-        assert!(should_notify(Desktop, Some(false)));
-        assert!(!should_notify(Desktop, Some(true)));
-        assert!(should_notify(Bell, Some(false)));
-        assert!(!should_notify(Bell, Some(true)));
-        assert!(!should_notify(Off, Some(false)));
-        assert!(!should_notify(Off, None));
+        for open in [false, true] {
+            assert!(should_notify(Desktop, Some(false), open));
+            assert!(!should_notify(Desktop, Some(true), open));
+            assert!(should_notify(Bell, Some(false), open));
+            assert!(!should_notify(Bell, Some(true), open));
+            assert!(!should_notify(Off, Some(false), open));
+            assert!(!should_notify(Off, None, open));
+        }
+        assert!(
+            should_notify(Desktop, None, false),
+            "a background chat, focus unknown"
+        );
+        assert!(
+            !should_notify(Desktop, None, true),
+            "the open chat, focus unknown"
+        );
     }
 
     fn alert(outcome: Outcome) -> ChatAlert {
