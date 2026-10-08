@@ -49,7 +49,9 @@ fn runtime(url: &str) -> (Runtime, UnboundedReceiver<Msg>) {
     })
     .unwrap();
     let (tx, rx) = unbounded_channel();
-    (Runtime::new(client, token, tx), rx)
+    let mut rt = Runtime::new(client, token, tx);
+    rt.opener = std::sync::Arc::new(|_| Box::pin(async { Err("not opened".to_string()) }));
+    (rt, rx)
 }
 
 fn chat_json(id: Uuid) -> serde_json::Value {
