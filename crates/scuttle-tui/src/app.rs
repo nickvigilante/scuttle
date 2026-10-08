@@ -1732,22 +1732,30 @@ impl Tui {
     /// message held for a model pick, or a plan to implement. Only the held message shows
     /// while the composer holds text. Without keyboard enhancement, Ctrl+Enter
     /// arrives as Enter, so only `/implement` is offered.
-    fn hint(&self) -> Option<&'static str> {
+    fn hint(&self) -> Option<String> {
         if self.core.question_menu().is_some() {
             return None;
         }
         let empty = self.composer.text().is_empty();
         if empty && self.core.questions_hidden() {
-            Some("Questions hidden: Tab shows them")
+            Some("Questions hidden: Tab shows them".to_owned())
         } else if self.core.holds_draft_for_model() {
-            // Shown while typing too, since a refusal then leaves the picker closed.
-            Some("Held message: pick a model with /model to send it.")
+            // Shown while typing too, since a refusal then leaves the picker closed. While
+            // the send key sends a queued message instead, the row names both.
+            Some(if self.sends_now() {
+                format!(
+                    "Held message: /model to send it. {} {QUEUED_HINT}",
+                    self.send_now_key()
+                )
+            } else {
+                "Held message: pick a model with /model to send it.".to_owned()
+            })
         } else if !empty || !self.core.plan_ready() {
             None
         } else if self.keyboard_enhanced {
-            Some("Implement the plan: Ctrl+Enter or /implement")
+            Some("Implement the plan: Ctrl+Enter or /implement".to_owned())
         } else {
-            Some("Implement the plan: /implement")
+            Some("Implement the plan: /implement".to_owned())
         }
     }
 
@@ -2394,7 +2402,7 @@ impl Tui {
         // composer's rule instead, so a copy never moves the transcript.
         let status_row: Option<(String, Style)> = self
             .hint()
-            .map(|h| (h.to_owned(), self.theme.accent))
+            .map(|h| (h, self.theme.accent))
             .or_else(|| self.queued_hint().map(|h| (h, self.theme.dim)));
         let hint_height = u16::from(status_row.is_some());
         // Drawn on every frame, timer frames included, so an upload's spinner advances.
@@ -10327,15 +10335,26 @@ mod tests {
         apply_ui_effects(&mut t, effects);
         let shown = screen(&mut t, 100, 20);
         assert!(shown.contains(HELD_HINT), "even while typing:\n{shown}");
-        // It outranks the queued hint.
+        // With messages queued too, the send key sends the queued one, so the one hint row
+        // names both.
         t.composer.set_text("");
         queue(&mut t, one_queued());
         let shown = screen(&mut t, 100, 20);
-        assert!(shown.contains(HELD_HINT), "{shown}");
         assert!(
-            !shown.contains(QUEUED_HINT),
-            "one row, the held message first:\n{shown}"
+            !shown.contains(HELD_HINT),
+            "the plain held hint would hide what the send key does:\n{shown}"
         );
+        assert!(
+            shown.contains(&format!(
+                "Held message: /model to send it. {} {QUEUED_HINT}",
+                t.send_now_key()
+            )),
+            "{shown}"
+        );
+        // Typing leaves the send key to the draft, so the hint is the held one again.
+        t.composer.set_text("next");
+        assert!(screen(&mut t, 100, 20).contains(HELD_HINT));
+        t.composer.set_text("");
         // Given back, it clears.
         t.composer.set_text("/model");
         let effects = t.handle(key(KeyCode::Enter, KeyModifiers::NONE));
