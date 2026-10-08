@@ -65,11 +65,23 @@ impl IconSet {
     }
 }
 
+/// How `welcome.art_file`'s art is drawn, `welcome.art_color`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtColor {
+    /// The brand accent, like the built-in wordmark.
+    #[default]
+    Accent,
+    /// The terminal's normal text color.
+    Plain,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct WelcomeConfig {
     pub show: bool,
     pub art_file: Option<PathBuf>,
+    pub art_color: ArtColor,
 }
 
 impl Default for WelcomeConfig {
@@ -77,6 +89,7 @@ impl Default for WelcomeConfig {
         WelcomeConfig {
             show: true,
             art_file: None,
+            art_color: ArtColor::Accent,
         }
     }
 }
@@ -580,6 +593,9 @@ pub const TEMPLATE: &str = r##"# scuttle settings. Remove the "# " in front of a
 # show = true
 # A text file whose lines replace the Coder wordmark.
 # art_file = "/path/to/art.txt"
+# How art_file's art is drawn: "accent" for the brand color, or "plain" for the normal text
+# color. The built-in wordmark is always the accent, and NO_COLOR draws everything plain.
+# art_color = "accent"
 
 # [density]
 # How much of a tool's output shows, by tool name: "expanded", "summary", or "hidden".
@@ -741,6 +757,9 @@ pub fn restart_keys(old: &LocalConfig, new: &LocalConfig) -> Vec<&'static str> {
     }
     if old.welcome.art_file != new.welcome.art_file {
         keys.push("welcome.art_file");
+    }
+    if old.welcome.art_color != new.welcome.art_color {
+        keys.push("welcome.art_color");
     }
     if old.organization != new.organization {
         keys.push("organization");
@@ -924,6 +943,27 @@ mod tests {
         assert_eq!(cfg.composer_max_lines, 6);
         assert!(!cfg.welcome.show);
         assert_eq!(cfg.density.get("read_file"), Some(&Density::Hidden));
+    }
+
+    #[test]
+    fn welcome_art_color_is_accent_or_plain_and_anything_else_names_its_line() {
+        assert_eq!(WelcomeConfig::default().art_color, ArtColor::Accent);
+        assert_eq!(
+            load_from_str("[welcome]\nshow = true")
+                .unwrap()
+                .welcome
+                .art_color,
+            ArtColor::Accent,
+            "left out, custom art takes the accent"
+        );
+        for (value, want) in [("accent", ArtColor::Accent), ("plain", ArtColor::Plain)] {
+            let cfg = load_from_str(&format!("[welcome]\nart_color = \"{value}\"")).unwrap();
+            assert_eq!(cfg.welcome.art_color, want);
+        }
+        match load_from_str("[welcome]\nart_color = \"rainbow\"") {
+            Err(ConfigError::Parse(m)) => assert!(m.starts_with("line 2"), "{m}"),
+            other => panic!("an unknown art_color gave {other:?}"),
+        }
     }
 
     #[test]

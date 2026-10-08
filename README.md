@@ -302,6 +302,7 @@ A missing file means all defaults.
 | `files.save_dir` | unset | Where `/files` saves; `~/` is your home directory. Unset gives `~/Downloads` when it exists, else your home directory. |
 | `welcome.show` | `true` | Welcome screen on a blank chat. |
 | `welcome.art_file` | unset | Text file whose lines replace the Coder wordmark. |
+| `welcome.art_color` | `"accent"` | `"accent"` or `"plain"`. How `welcome.art_file`'s art is drawn: in the brand accent like the wordmark, or in the normal text color. The built-in wordmark is always the accent, and `NO_COLOR` draws everything plain. |
 | `density.<tool>` | unset | How much of a tool's output shows: `"expanded"`, `"summary"`, or `"hidden"`. |
 | `organization` | unset | Saved by `/organization`. A non-UUID value is ignored. |
 | `efforts.<model-uuid>` | unset | Effort per model, saved by `/effort`. Invalid entries are dropped. |

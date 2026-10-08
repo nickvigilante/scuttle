@@ -300,6 +300,7 @@ async fn run() -> ExitCode {
         url: display_origin(&session.url),
         user: String::new(),
         art,
+        art_accent: local.welcome.art_color == config::ArtColor::Accent,
         show: local.welcome.show,
         tip,
     };
@@ -511,6 +512,7 @@ mod tests {
                 url: "https://x".into(),
                 user: String::new(),
                 art: vec![],
+                art_accent: true,
                 show: true,
                 tip: true,
             },
