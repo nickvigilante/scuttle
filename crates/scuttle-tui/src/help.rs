@@ -162,7 +162,7 @@ pub const KEYS: &[KeyInfo] = &[
     },
     KeyInfo {
         keys: "In /mcp",
-        action: "Enter turns an organization server on or off for the next message",
+        action: "Enter or Space turns an organization server on or off for the next message",
     },
     KeyInfo {
         keys: "In /git",
@@ -615,10 +615,9 @@ mod tests {
             .find(|l| l.starts_with("In /files"))
             .expect("a /files line");
         assert!(!files.contains("opens"), "{files}");
-        // Enter, not Space, as in every other overlay.
         line_with(
             "In /mcp",
-            &["Enter turns an organization server on or off for the next message"],
+            &["Enter or Space turns an organization server on or off for the next message"],
         );
         line_with("In /git", &["Enter", "pull request", "your git pager"]);
         line_with("In /workspace", &["Enter", "SSH", "detaches", "switches"]);
