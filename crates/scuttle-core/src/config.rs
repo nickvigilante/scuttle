@@ -38,6 +38,17 @@ pub enum SpinnerSetting {
     Bar,
 }
 
+/// How a chat's turn ending reaches the user while scuttle is not the focused window,
+/// `notifications`: not at all, the terminal's bell, or a desktop notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationMode {
+    Off,
+    Bell,
+    #[default]
+    Desktop,
+}
+
 /// Which icons scuttle draws, `icons`: Nerd Font glyphs, or the plain text and emoji that
 /// any font shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -398,6 +409,10 @@ pub struct LocalConfig {
     /// The footer's fields and their warnings, which `/statusline` edits.
     pub statusline: StatuslineConfig,
     pub density: BTreeMap<String, Density>,
+    /// Whether another chat finishing, failing, or needing an answer shows a toast.
+    pub toast: bool,
+    /// How a chat's turn ending is announced while scuttle is not focused.
+    pub notifications: NotificationMode,
     /// The organization new chats go to, saved by `/organization`. An ID, not a secret.
     /// A value that is not a valid ID is ignored, so startup falls back to the default.
     #[serde(deserialize_with = "lenient_uuid")]
@@ -423,6 +438,8 @@ impl Default for LocalConfig {
             files: FilesConfig::default(),
             statusline: StatuslineConfig::default(),
             density: BTreeMap::new(),
+            toast: true,
+            notifications: NotificationMode::default(),
             organization: None,
             efforts: BTreeMap::new(),
         }
@@ -563,6 +580,15 @@ pub const TEMPLATE: &str = r##"# scuttle settings. Remove the "# " in front of a
 # "text" keeps plain text and emoji. Left out, NERD_FONT=1 in the environment picks "nerd",
 # and otherwise scuttle uses "text". Get a font at https://www.nerdfonts.com/.
 # icons = "text"
+
+# Show a toast in the top-right corner when another chat finishes, fails, or needs an answer.
+# toast = true
+
+# How a chat finishing, failing, or needing an answer reaches you while scuttle is not the
+# focused window: "desktop" sends a desktop notification through terminals known to show
+# one (Warp, iTerm2, Ghostty, and kitty) and rings the bell in others, "bell" always rings
+# the bell, and "off" does neither.
+# notifications = "desktop"
 
 # [statusline]
 # The footer's fields, in order; /statusline edits this list. A field with nothing to show
@@ -930,6 +956,34 @@ mod tests {
     fn defaults_apply_to_an_empty_file() {
         assert_eq!(load_from_str("").unwrap(), LocalConfig::default());
         assert!(LocalConfig::default().mouse);
+    }
+
+    #[test]
+    fn the_toast_is_on_by_default_and_false_turns_it_off() {
+        assert!(LocalConfig::default().toast);
+        assert!(load_from_str("").unwrap().toast);
+        assert!(!load_from_str("toast = false\n").unwrap().toast);
+        assert!(load_from_str("toast = \"no\"\n").is_err());
+    }
+
+    #[test]
+    fn notifications_default_to_desktop_and_read_off_and_bell() {
+        assert_eq!(
+            LocalConfig::default().notifications,
+            NotificationMode::Desktop
+        );
+        let mode = |text: &str| load_from_str(text).map(|c| c.notifications);
+        assert_eq!(mode(""), Ok(NotificationMode::Desktop));
+        assert_eq!(mode("notifications = \"off\"\n"), Ok(NotificationMode::Off));
+        assert_eq!(
+            mode("notifications = \"bell\"\n"),
+            Ok(NotificationMode::Bell)
+        );
+        assert_eq!(
+            mode("notifications = \"desktop\"\n"),
+            Ok(NotificationMode::Desktop)
+        );
+        assert!(mode("notifications = \"loud\"\n").is_err());
     }
 
     #[test]

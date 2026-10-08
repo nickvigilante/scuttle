@@ -379,6 +379,13 @@ pub struct Tui {
     /// The copy confirmation, shown in the composer's rule until `COPY_TTL` after its first
     /// draw or the next key.
     copied: Option<CopyNote>,
+    /// The toast naming a background chat whose turn ended, drawn over the transcript.
+    toast: Option<crate::toast::Toast>,
+    /// Whether the terminal last reported scuttle focused; `None` until it reports either, and
+    /// again after a handoff, since the reports start over.
+    focused: Option<bool>,
+    /// Alerts for the main loop to send as desktop notifications or the bell.
+    desktop: Vec<scuttle_core::alerts::ChatAlert>,
     /// Set when the screen may hold foreign output, for example after the external editor.
     needs_full_redraw: bool,
     /// Whether keyboard enhancement flags are active, which decides the send and newline keys.
@@ -520,6 +527,9 @@ impl Tui {
             unshown_notices: VecDeque::new(),
             startup_notices: None,
             copied: None,
+            toast: None,
+            focused: None,
+            desktop: Vec::new(),
             needs_full_redraw: false,
             keyboard_enhanced: true,
             fatal: None,
@@ -631,6 +641,7 @@ impl Tui {
     /// have set its own window title, so the next draw repaints both; a terminal that could
     /// not be restored makes the app quit.
     pub fn after_handoff(&mut self, text: &str, handed: Handed, resumed: std::io::Result<()>) {
+        self.focused = None;
         self.last_paged = Some(text.to_owned());
         self.needs_full_redraw = true;
         self.shown_title = None;
@@ -708,6 +719,7 @@ impl Tui {
         }
         let idle = self.core.activity().is_none();
         let mut effects = self.core.update(msg);
+        self.take_alerts();
         // A turn starts when the agent goes from idle to working, which is when a random
         // spinner draws its style.
         if idle && self.core.activity().is_some() {
@@ -758,6 +770,31 @@ impl Tui {
         // another organization.
         self.sync_arguments();
         effects
+    }
+
+    /// Takes the core's alerts. A chat other than the open one shows a toast, unless
+    /// `toast = false`; the newest alert replaces any toast already showing. While scuttle is
+    /// not known to be focused, any chat's alert, the open one's included, also goes to the
+    /// main loop as a desktop notification or the bell, unless `notifications = "off"`.
+    fn take_alerts(&mut self) {
+        for alert in std::mem::take(&mut self.core.alerts) {
+            if crate::notify::should_notify(self.config.notifications, self.focused, alert.open) {
+                self.desktop.push(alert.clone());
+            }
+            if !alert.open && self.config.toast {
+                self.toast = Some(crate::toast::Toast::new(alert));
+            }
+        }
+    }
+
+    /// The alerts to announce outside the terminal, for the main loop to write between draws.
+    pub fn take_desktop_alerts(&mut self) -> Vec<scuttle_core::alerts::ChatAlert> {
+        std::mem::take(&mut self.desktop)
+    }
+
+    /// How alerts are announced outside the terminal, from config.toml.
+    pub fn notifications(&self) -> config::NotificationMode {
+        self.config.notifications
     }
 
     /// Hands the composer the argument entries for the command its text is completing, so the
@@ -852,7 +889,8 @@ impl Tui {
             .and_then(|(i, _)| self.core.notices.get(i))
     }
 
-    /// When the active notice or the copy notice expires, so the loop can redraw then.
+    /// When the active notice, the copy notice, or the toast expires, so the loop can redraw
+    /// then.
     pub fn notice_deadline(&self) -> Option<Instant> {
         let notice = self.active_notice.map(|(_, since)| since + NOTICE_TTL);
         let copied = self
@@ -860,7 +898,8 @@ impl Tui {
             .as_ref()
             .and_then(|c| c.since)
             .map(|since| since + COPY_TTL);
-        notice.into_iter().chain(copied).min()
+        let toast = self.toast.as_ref().and_then(|t| t.deadline());
+        notice.into_iter().chain(copied).chain(toast).min()
     }
 
     /// Whether the next draw must repaint every cell. Resets the request.
@@ -1423,6 +1462,11 @@ impl Tui {
         // hover follows it even where no move is reported.
         if let Event::Mouse(m) = &event {
             self.pointer = Some((m.column, m.row));
+        }
+        match event {
+            Event::FocusGained => self.focused = Some(true),
+            Event::FocusLost => self.focused = Some(false),
+            _ => {}
         }
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key, now),
@@ -2241,6 +2285,7 @@ impl Tui {
             resumed = resume;
             edited
         });
+        self.focused = None;
         self.set_keyboard_enhanced(crate::terminal::keyboard_enhanced());
         if let Err(e) = result {
             self.notice(Notice::Error(format!("Editor failed: {e}")));
@@ -2266,6 +2311,7 @@ impl Tui {
         if !handed {
             return vec![];
         }
+        self.focused = None;
         self.needs_full_redraw = true;
         self.set_keyboard_enhanced(crate::terminal::keyboard_enhanced());
         // The resume restored the capture that was on before; a changed `mouse` takes over.
@@ -2393,6 +2439,9 @@ impl Tui {
         self.prune_live_toggles();
         self.sync_notice(now);
         self.sync_copied(now);
+        if self.toast.as_mut().is_some_and(|t| !t.live_at(now)) {
+            self.toast = None;
+        }
         self.screen_width = f.area().width;
         let outer = padded(f.area());
         let activity = self.core.activity();
@@ -2811,6 +2860,10 @@ impl Tui {
             );
         }
         self.draw_editor(f, composer);
+        // Last, so the toast sits over every overlay; it takes no rows from the layout.
+        if let Some(toast) = self.toast.as_ref() {
+            crate::toast::render(f, transcript, toast, &self.theme);
+        }
     }
 
     /// The chips above the composer, laid out in at most `max_rows` rows of `width` columns: a
@@ -3096,6 +3149,226 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A watch event of `kind` for root chat `id` with `status` at minute `minute`.
+    fn watched(kind: &str, id: uuid::Uuid, status: &str, minute: u32) -> Msg {
+        let chat = coder_sdk::types::CodersdkChat {
+            id: Some(id),
+            title: Some("Fix the swagger annotations".into()),
+            status: Some(coder_sdk::types::CodersdkChatStatus(status.into())),
+            updated_at: Some(format!("2026-10-08T10:{minute:02}:00Z").parse().unwrap()),
+            ..Default::default()
+        };
+        Msg::Watch(coder_sdk::WatchEvent {
+            kind: kind.into(),
+            event: Some(coder_sdk::types::CodersdkChatWatchEvent {
+                chat: Some(chat),
+                kind: Some(coder_sdk::types::CodersdkChatWatchEventKind(kind.into())),
+                tool_calls: vec![],
+            }),
+            raw: serde_json::Value::Null,
+        })
+    }
+
+    /// The screen's rows as drawn at `now`.
+    fn rows_at(t: &mut Tui, w: u16, h: u16, now: Instant) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| t.draw_at(f, now)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_owned()).collect())
+            .collect()
+    }
+
+    /// A Tui whose watch saw background chat `id` start running.
+    fn watching(config: LocalConfig, id: uuid::Uuid) -> Tui {
+        let mut t = Tui::new(
+            config,
+            None,
+            Theme::terminal(true),
+            Welcome {
+                url: "https://x".into(),
+                user: "nick".into(),
+                art: vec![],
+                show: true,
+                tip: false,
+                art_accent: true,
+            },
+            0,
+        );
+        t.update(Msg::Started {
+            org_id: uuid::Uuid::new_v4(),
+            open_chat: None,
+        });
+        t.update(watched("status_change", id, "running", 0));
+        t
+    }
+
+    #[test]
+    fn a_background_chat_finishing_shows_a_toast_that_clears_and_moves_nothing() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        let now = Instant::now();
+        let before = rows_at(&mut t, 80, 20, now);
+        t.update(watched("status_change", id, "waiting", 1));
+        let shown = rows_at(&mut t, 80, 20, now + Duration::from_secs(1));
+        let toast_row = shown
+            .iter()
+            .position(|r| r.contains("\u{2713} Fix the swagger annotations"))
+            .unwrap_or_else(|| panic!("no toast:\n{}", shown.join("\n")));
+        assert!(
+            shown[toast_row]
+                .trim_end()
+                .ends_with("Fix the swagger annotations"),
+            "flush right: {:?}",
+            shown[toast_row]
+        );
+        assert!(toast_row <= 1, "at the top: row {toast_row}");
+        for (n, (a, b)) in before.iter().zip(&shown).enumerate() {
+            if n != toast_row {
+                assert_eq!(a, b, "row {n} moved");
+            }
+        }
+        let left: String = shown[toast_row].chars().take(40).collect();
+        let was: String = before[toast_row].chars().take(40).collect();
+        assert_eq!(left, was, "the toast covers only its own cells");
+        assert_eq!(
+            t.notice_deadline(),
+            Some(now + Duration::from_secs(1) + crate::toast::TOAST_TTL)
+        );
+        assert_eq!(
+            rows_at(&mut t, 80, 20, now + Duration::from_secs(6)),
+            before,
+            "the toast clears after five seconds"
+        );
+        assert_eq!(t.notice_deadline(), None);
+    }
+
+    #[test]
+    fn a_newer_alert_replaces_the_toast() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut t = watching(LocalConfig::default(), a);
+        t.update(watched("status_change", b, "running", 0));
+        t.update(watched("status_change", a, "waiting", 1));
+        t.update(watched("status_change", b, "error", 1));
+        let shown = rows_at(&mut t, 80, 20, Instant::now()).join("\n");
+        assert!(
+            shown.contains("Fix the swagger annotations failed"),
+            "{shown}"
+        );
+        assert!(!shown.contains("\u{2713}"), "{shown}");
+    }
+
+    /// Ends a turn of chat `id` at minutes after `*minute`, and counts the desktop alerts.
+    fn end_turn(t: &mut Tui, id: uuid::Uuid, minute: &mut u32) -> usize {
+        t.update(watched("status_change", id, "running", *minute + 1));
+        t.update(watched("status_change", id, "waiting", *minute + 2));
+        *minute += 2;
+        t.take_desktop_alerts().len()
+    }
+
+    #[test]
+    fn before_any_focus_event_only_background_chats_notify() {
+        let (open, background) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut t = watching(LocalConfig::default(), open);
+        t.update(watched("status_change", background, "running", 0));
+        t.core.chat_id = Some(open);
+        let mut minute = 0;
+        assert_eq!(
+            end_turn(&mut t, open, &mut minute),
+            0,
+            "focus unknown: the open chat is most likely being watched"
+        );
+        assert_eq!(
+            end_turn(&mut t, background, &mut minute),
+            1,
+            "focus unknown: a background chat notifies"
+        );
+        t.handle(Event::FocusLost);
+        assert_eq!(
+            end_turn(&mut t, open, &mut minute),
+            1,
+            "FocusLost: the open chat notifies"
+        );
+        t.handle(Event::FocusGained);
+        assert_eq!(end_turn(&mut t, open, &mut minute), 0);
+        assert_eq!(
+            end_turn(&mut t, background, &mut minute),
+            0,
+            "FocusGained: none"
+        );
+    }
+
+    #[test]
+    fn a_handoff_makes_focus_unknown_again() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        t.core.chat_id = Some(id);
+        let mut minute = 0;
+        t.handle(Event::FocusLost);
+        t.after_handoff("+x\n", Handed::Ran(Ok(())), Ok(()));
+        assert_eq!(end_turn(&mut t, id, &mut minute), 0, "after the pager");
+        t.handle(Event::FocusLost);
+        let _ = t.open_editor_with(|_| (Ok(()), Ok(())));
+        assert_eq!(end_turn(&mut t, id, &mut minute), 0, "after the editor");
+    }
+
+    #[test]
+    fn desktop_alerts_go_out_only_while_scuttle_is_unfocused() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        let mut minute = 0;
+        let mut end_turn = |t: &mut Tui| {
+            t.update(watched("status_change", id, "running", minute + 1));
+            t.update(watched("status_change", id, "waiting", minute + 2));
+            minute += 2;
+            t.take_desktop_alerts().len()
+        };
+        assert_eq!(
+            end_turn(&mut t),
+            1,
+            "focus is unknown until the terminal reports it"
+        );
+        t.handle(Event::FocusGained);
+        assert_eq!(end_turn(&mut t), 0, "focused relies on the toast");
+        t.handle(Event::FocusLost);
+        assert_eq!(end_turn(&mut t), 1);
+        t.core.chat_id = Some(id);
+        assert_eq!(
+            end_turn(&mut t),
+            1,
+            "the open chat notifies while unfocused"
+        );
+        t.config.notifications = config::NotificationMode::Off;
+        assert_eq!(end_turn(&mut t), 0, "off sends nothing");
+        t.config.notifications = config::NotificationMode::Bell;
+        assert_eq!(end_turn(&mut t), 1);
+        assert_eq!(t.notifications(), config::NotificationMode::Bell);
+    }
+
+    #[test]
+    fn toast_off_shows_none() {
+        let id = uuid::Uuid::new_v4();
+        let config = LocalConfig {
+            toast: false,
+            ..LocalConfig::default()
+        };
+        let mut t = watching(config, id);
+        t.update(watched("status_change", id, "waiting", 1));
+        let shown = rows_at(&mut t, 80, 20, Instant::now()).join("\n");
+        assert!(!shown.contains("swagger"), "{shown}");
+        assert_eq!(t.notice_deadline(), None);
+    }
+
+    #[test]
+    fn the_open_chat_never_toasts() {
+        let id = uuid::Uuid::new_v4();
+        let mut t = watching(LocalConfig::default(), id);
+        t.core.chat_id = Some(id);
+        t.update(watched("status_change", id, "waiting", 1));
+        let shown = rows_at(&mut t, 80, 20, Instant::now()).join("\n");
+        assert!(!shown.contains("\u{2713} Fix"), "{shown}");
     }
 
     #[test]

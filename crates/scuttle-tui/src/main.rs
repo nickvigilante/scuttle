@@ -9,6 +9,7 @@ mod highlight;
 mod icons;
 mod links;
 mod markdown;
+mod notify;
 mod overlay;
 mod paths;
 mod picker;
@@ -19,6 +20,7 @@ mod subagent;
 mod table;
 mod terminal;
 mod theme;
+mod toast;
 mod transcript_view;
 #[cfg(test)]
 mod turn_tests;
@@ -374,6 +376,7 @@ async fn run() -> ExitCode {
     };
     tui.set_keyboard_enhanced(terminal::keyboard_enhanced());
     let mut input = terminal::Input::start();
+    let mut notifier = notify::Notifier::new();
     let mut pending = first;
     pending.extend(tui.update(Msg::SessionStarted));
     let mut failure = None;
@@ -442,6 +445,10 @@ async fn run() -> ExitCode {
         }
         if tui.take_full_redraw() && term.clear().is_err() {
             break ExitCode::FAILURE;
+        }
+        // Written between draws, as the title is, so no sequence lands inside a frame.
+        for alert in tui.take_desktop_alerts() {
+            let _ = notifier.notify(tui.notifications(), &alert);
         }
         if let Some(title) = tui.take_title() {
             let _ = terminal::set_title(&title);

@@ -281,6 +281,40 @@ the spend reset text first, then `workspace`, `organization`, `queue`, `mcp`, `c
 A field that is warning, or an unavailable model, drops only after every field that is not.
 `status` never drops, and is only cut when nothing else is left.
 
+## Notifications
+
+When a chat other than the open one finishes, fails, or needs an answer, a toast names it in the top-right corner for five seconds.
+It reads `✓ <title>`, `? <title> needs an answer`, or `✗ <title> failed`, and with Nerd Font icons the Octicons question and alert glyphs replace `?` and `✗`.
+A newer toast replaces the one showing.
+The toast covers that corner of the transcript, above any overlay, and never moves the transcript or the composer.
+Subagents raise none.
+A plan-mode question ends the turn the way a finished reply does, so it reads as finished.
+`toast = false` in config.toml turns toasts off.
+
+While scuttle is not the focused window, the same events, the open chat's included, also reach you outside the terminal.
+scuttle turns on the terminal's focus reporting to know.
+Until the terminal reports focus, at startup and again after the pager or an editor, only chats other than the open one reach you, since you are most likely watching the open one.
+`notifications` in config.toml picks how:
+
+| Value | What happens |
+|---|---|
+| `"desktop"` (default) | A desktop notification, titled scuttle, whose body names the chat and how it ended. Only terminals known to show one get a notification sequence, and every other terminal gets the bell. |
+| `"bell"` | The bell, which the terminal may turn into a sound, a flash, or a notification. |
+| `"off"` | Nothing. |
+
+| Terminal | Sequence |
+|---|---|
+| Warp | OSC 777 `notify` |
+| iTerm2 | OSC 9 |
+| Ghostty | OSC 777 `notify` |
+| kitty | OSC 99, shown only while its window is unfocused |
+| tmux | The outer terminal's sequence through tmux passthrough when `allow-passthrough` is `all`, else the bell, since `on` forwards nothing from a hidden pane |
+| Zellij, GNU screen, and any other terminal | The bell |
+
+scuttle finds the terminal from `TERM_PROGRAM`, and inside tmux or over SSH from variables such as `LC_TERMINAL`, `KITTY_WINDOW_ID`, and `WARP_CLIENT_VERSION`.
+The chat title is sent without control characters, line breaks, or semicolons, and cut to 80 columns before the words that say how it ended, and nothing else from the chat or the session goes into a notification.
+Your operating system must allow notifications from the terminal, and iTerm2 must allow escape-sequence alerts in the profile's Terminal settings.
+
 ## Config
 
 Path: `$XDG_CONFIG_HOME/scuttle/config.toml`, else `~/.config/scuttle/config.toml`.
@@ -294,6 +328,8 @@ A missing file means all defaults.
 | `composer_max_lines` | `10` | The most rows the composer grows to. |
 | `spinner` | `"random"` | Or `"braille"`, `"line"`, `"arc"`, `"bounce"`, `"bar"`. |
 | `icons` | unset | `"nerd"` or `"text"`. Unset follows `NERD_FONT`, then text. |
+| `toast` | `true` | A toast when another chat finishes, fails, or needs an answer. `false` turns it off. |
+| `notifications` | `"desktop"` | While scuttle is unfocused: `"desktop"`, `"bell"`, or `"off"`. See [Notifications](#notifications). |
 | `statusline.fields` | model, effort, context, workspace, organization, plan-mode, spend, status | Repeats keep their first place. |
 | `statusline.thresholds.context` | unset | Percent, 1 to 100. Unset means no warning. |
 | `statusline.thresholds.spend` | unset | Same. |
