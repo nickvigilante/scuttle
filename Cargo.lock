@@ -2714,6 +2714,7 @@ dependencies = [
  "crossterm",
  "futures",
  "insta",
+ "libc",
  "portable-pty",
  "progenitor-client",
  "pulldown-cmark",

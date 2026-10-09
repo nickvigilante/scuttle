@@ -492,7 +492,9 @@ async fn run() -> ExitCode {
     let _ = terminal::finish();
     match failure.or_else(|| tui.take_fatal()) {
         Some(e) => {
-            eprintln!("scuttle: {e}");
+            // Not `eprintln!`, which panics when standard error is a terminal that closed.
+            let _ =
+                std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("scuttle: {e}\n"));
             ExitCode::FAILURE
         }
         None => code,
