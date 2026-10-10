@@ -763,3 +763,105 @@ async fn ctrl_c_that_ends_the_pager_leaves_scuttle_running() {
     assert_eq!(s.exit_code(), 0);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// Runs scuttle in a pty until it has drawn `Signed in as nick`, then closes every handle on
+/// the pty's master side and returns how long scuttle took to exit afterwards, or `None` if
+/// it was still running `within` later (it is killed then). Without a controlling terminal
+/// the kernel sends no SIGHUP when the master closes, so only the dead terminal can end it.
+fn exit_after_master_closes(
+    name: &str,
+    controlling_tty: bool,
+    within: Duration,
+) -> Option<Duration> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(fake_coder());
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_scuttle"));
+    cmd.set_controlling_tty(controlling_tty);
+    let home = std::env::temp_dir().join(format!("scuttle-pty-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", home.join("config"));
+    cmd.env("XDG_STATE_HOME", home.join("state"));
+    cmd.env("CODER_CONFIG_DIR", home.join("coder"));
+    cmd.env("SCUTTLE_NO_TERMINAL_QUERY", "1");
+    cmd.env("SCUTTLE_NO_BROWSER", "1");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("CODER_URL", server.uri());
+    cmd.env("CODER_SESSION_TOKEN", "test-token-not-real");
+    cmd.env_remove("NERD_FONT");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let writer = pair.master.take_writer().unwrap();
+    // The reader stops, dropping its handle on the master, once the UI is up, so nothing
+    // keeps the master open after the test drops its own handles.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            let mut parser = vt100::Parser::new(24, 80, 0);
+            parser.process(&seen);
+            if parser.screen().contents().contains("Signed in as nick") {
+                let _ = ready_tx.send(());
+                return;
+            }
+        }
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(15));
+    drop(writer);
+    drop(pair.master);
+    let mut exited = None;
+    if ready.is_ok() {
+        let closed = Instant::now();
+        while closed.elapsed() < within {
+            if child.try_wait().unwrap().is_some() {
+                exited = Some(closed.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if exited.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(ready.is_ok(), "{name}: scuttle never drew its UI");
+    exited
+}
+
+#[test]
+fn closing_the_terminal_without_a_hangup_ends_scuttle() {
+    let exited = exit_after_master_closes("dead-terminal-no-hup", false, Duration::from_secs(5))
+        .expect("scuttle was still running 5 seconds after its terminal closed");
+    // Noticing the closed terminal ends the input thread within one poll interval. Left
+    // to crossterm, the thread spins until dropping the input gives up on it after 500 ms,
+    // so an exit this fast shows the detection, not that timeout, ended scuttle.
+    assert!(
+        exited < Duration::from_millis(400),
+        "scuttle took {exited:?} to exit, so its input spun until the shutdown timeout"
+    );
+}
+
+#[test]
+fn closing_the_terminal_with_a_hangup_ends_scuttle() {
+    let exited = exit_after_master_closes("dead-terminal-hup", true, Duration::from_secs(5));
+    assert!(
+        exited.is_some(),
+        "scuttle was still running 5 seconds after its terminal hung up"
+    );
+}

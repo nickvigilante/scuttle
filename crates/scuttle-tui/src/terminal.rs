@@ -306,6 +306,10 @@ struct Shared {
 }
 
 impl Shared {
+    fn get(&self) -> InputState {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn set(&self, state: InputState) {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
         self.changed.notify_all();
@@ -339,7 +343,7 @@ impl Input {
     pub fn start() -> Input {
         Input::start_with(
             Box::new(|| {
-                if crossterm::event::poll(INPUT_POLL)? {
+                if input_ready(INPUT_POLL)? {
                     crossterm::event::read().map(Some)
                 } else {
                     Ok(None)
@@ -347,17 +351,42 @@ impl Input {
             }),
             parsed_events,
             drain_terminal,
+            #[cfg(unix)]
+            || output_open(libc::STDOUT_FILENO),
+            #[cfg(not(unix))]
+            || true,
         )
     }
 
     /// Starts the thread on `source`. `pending` takes what crossterm has already parsed, and
     /// the thread delivers it before it acknowledges a pause, so `drain` at `resume` discards
     /// only what was typed during the handoff.
-    fn start_with(mut source: Source, pending: fn() -> Vec<Event>, drain: fn()) -> Input {
+    ///
+    /// A second thread asks `open` every [`LIVENESS_CHECK`] whether the terminal is still
+    /// there and, once it is not, ends the input with an error, even while `source` is stuck
+    /// inside crossterm.
+    fn start_with(
+        mut source: Source,
+        pending: fn() -> Vec<Event>,
+        drain: fn(),
+        open: fn() -> bool,
+    ) -> Input {
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(InputState::Reading),
             changed: Condvar::new(),
+        });
+        let watch_tx = tx.clone();
+        let watch_shared = shared.clone();
+        // Stops once the input thread has, so the channel still closes after it.
+        std::thread::spawn(move || {
+            while !watch_tx.is_closed() && watch_shared.get() != InputState::Ended {
+                if !open() {
+                    let _ = watch_tx.send(Err(closed_terminal()));
+                    return;
+                }
+                std::thread::sleep(LIVENESS_CHECK);
+            }
         });
         let thread_shared = shared.clone();
         let thread = std::thread::spawn(move || {
@@ -434,16 +463,25 @@ impl Input {
 }
 
 impl Drop for Input {
-    /// Stops the thread and waits for it, at most one poll interval.
+    /// Stops the thread and waits for it, usually one poll interval. A thread still stuck in
+    /// a read after [`INPUT_JOIN_GRACE`] is left to end with the process.
     fn drop(&mut self) {
-        {
+        let ended = {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if *state != InputState::Ended {
                 *state = InputState::Quit;
                 self.shared.changed.notify_all();
             }
-        }
-        if let Some(thread) = self.thread.take() {
+            let (state, _) = self
+                .shared
+                .changed
+                .wait_timeout_while(state, INPUT_JOIN_GRACE, |s| *s != InputState::Ended)
+                .unwrap_or_else(|e| e.into_inner());
+            *state == InputState::Ended
+        };
+        if let Some(thread) = self.thread.take()
+            && ended
+        {
             let _ = thread.join();
         }
     }
@@ -452,7 +490,7 @@ impl Drop for Input {
 /// Takes the events crossterm has already parsed, and any input already waiting.
 fn parsed_events() -> Vec<Event> {
     let mut events = Vec::new();
-    while let Ok(true) = crossterm::event::poll(std::time::Duration::ZERO) {
+    while let Ok(true) = input_waiting() {
         match crossterm::event::read() {
             Ok(event) => events.push(event),
             Err(_) => break,
@@ -463,11 +501,141 @@ fn parsed_events() -> Vec<Event> {
 
 /// Reads and discards the input already waiting on the terminal.
 fn drain_terminal() {
-    while let Ok(true) = crossterm::event::poll(std::time::Duration::ZERO) {
+    while let Ok(true) = input_waiting() {
         if crossterm::event::read().is_err() {
             break;
         }
     }
+}
+
+/// How often the input's watcher checks that the terminal is still open.
+const LIVENESS_CHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long dropping [`Input`] waits for its thread, which may be stuck inside crossterm on a
+/// closed terminal, before leaving it to end with the process.
+const INPUT_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The error that ends the input once the terminal is gone.
+fn closed_terminal() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the terminal closed")
+}
+
+/// Whether `e`, from reading, writing, or polling the terminal, means the terminal is gone:
+/// end of file, or EIO, EBADF, or ENXIO from a hung up, revoked, or closed terminal.
+#[cfg(unix)]
+fn terminal_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::UnexpectedEof
+        || matches!(
+            e.raw_os_error(),
+            Some(libc::EIO | libc::EBADF | libc::ENXIO)
+        )
+}
+
+/// Whether input is waiting for crossterm to read now.
+fn input_waiting() -> std::io::Result<bool> {
+    input_ready(std::time::Duration::ZERO)
+}
+
+/// Waits up to `timeout` for an event crossterm can read without blocking, and fails once
+/// the terminal is gone.
+fn input_ready(timeout: std::time::Duration) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `isatty` only inspects the descriptor.
+        let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        input_ready_on(tty_to_check(stdin_is_tty), timeout, crossterm::event::poll)
+    }
+    #[cfg(not(unix))]
+    {
+        crossterm::event::poll(timeout)
+    }
+}
+
+/// The descriptor whose hangup [`input_ready_on`] watches: standard input when it is a
+/// terminal, which is what crossterm reads then. Otherwise crossterm reads `/dev/tty`, and
+/// no check is made, since macOS reports POLLNVAL for a `/dev/tty` descriptor however live
+/// it is. The output watcher in [`Input::start_with`] still notices a closed terminal then.
+#[cfg(unix)]
+fn tty_to_check(stdin_is_tty: bool) -> Option<std::os::unix::io::RawFd> {
+    stdin_is_tty.then_some(libc::STDIN_FILENO)
+}
+
+/// [`input_ready`] on `tty`, with `poll` as crossterm's poll. crossterm retries a read of a
+/// closed terminal forever, so `poll` is called only while `tty` is open: for an event it
+/// already parsed, or once new input arrived. Without a `tty` it is left to `poll` alone.
+#[cfg(unix)]
+fn input_ready_on(
+    tty: Option<std::os::unix::io::RawFd>,
+    timeout: std::time::Duration,
+    mut poll: impl FnMut(std::time::Duration) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let Some(fd) = tty else {
+        return poll(timeout);
+    };
+    wait_for_input(fd, std::time::Duration::ZERO)?;
+    if poll(std::time::Duration::ZERO)? {
+        return Ok(true);
+    }
+    if timeout.is_zero() || !wait_for_input(fd, timeout)? {
+        return Ok(false);
+    }
+    poll(std::time::Duration::ZERO)
+}
+
+/// Whether `revents` from `poll(2)` says the descriptor's terminal is gone.
+#[cfg(unix)]
+fn hung_up(revents: libc::c_short) -> bool {
+    revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// What one `poll(2)` of the terminal means: its `revents`, or the error it failed with.
+/// An interrupted or temporarily failed poll is retried later, as no input yet.
+#[cfg(unix)]
+fn poll_outcome(polled: std::io::Result<libc::c_short>) -> std::io::Result<bool> {
+    match polled {
+        Ok(revents) if hung_up(revents) => Err(closed_terminal()),
+        Ok(revents) => Ok(revents & libc::POLLIN != 0),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Waits up to `timeout` for input on `fd`: `true` once some is waiting, `false` when none
+/// arrived, and an error once the terminal is gone.
+#[cfg(unix)]
+fn wait_for_input(
+    fd: std::os::unix::io::RawFd,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `pollfd` is one valid, initialized entry, matching the count of 1.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+    poll_outcome(if ready < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(pollfd.revents)
+    })
+}
+
+/// Whether `fd`, the terminal scuttle draws on, is still open: an empty write fails with EIO
+/// once its terminal has hung up or been revoked, and writes nothing otherwise.
+#[cfg(unix)]
+fn output_open(fd: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: a zero-length write reads nothing from the buffer.
+    let written = unsafe { libc::write(fd, std::ptr::null(), 0) };
+    written >= 0 || !terminal_gone(&std::io::Error::last_os_error())
 }
 
 #[cfg(test)]
@@ -517,8 +685,12 @@ mod tests {
     fn a_paused_input_reads_nothing_until_it_resumes_and_drains_first() {
         let paused = Arc::new(AtomicBool::new(false));
         let (tx, source) = source(paused.clone());
-        let mut input =
-            Input::start_with(source, Vec::new, || DRAINED.store(true, Ordering::SeqCst));
+        let mut input = Input::start_with(
+            source,
+            Vec::new,
+            || DRAINED.store(true, Ordering::SeqCst),
+            || true,
+        );
         tx.send(Ok(Event::FocusGained)).unwrap();
         assert_eq!(next(&mut input).unwrap(), Event::FocusGained);
         input.pause();
@@ -540,7 +712,7 @@ mod tests {
     #[test]
     fn a_read_error_ends_the_input_and_pausing_it_then_returns() {
         let (tx, source) = source(Arc::new(AtomicBool::new(false)));
-        let mut input = Input::start_with(source, Vec::new, || {});
+        let mut input = Input::start_with(source, Vec::new, || {}, || true);
         tx.send(Err(std::io::Error::other("tty closed"))).unwrap();
         assert!(next(&mut input).is_err());
         input.pause();
@@ -550,7 +722,7 @@ mod tests {
     #[test]
     fn dropping_the_receiver_ends_the_thread() {
         let (_tx, source) = source(Arc::new(AtomicBool::new(false)));
-        let mut input = Input::start_with(source, Vec::new, || {});
+        let mut input = Input::start_with(source, Vec::new, || {}, || true);
         let thread = input.thread.take().unwrap();
         drop(input);
         thread.join().unwrap();
@@ -579,7 +751,7 @@ mod tests {
     #[test]
     fn events_parsed_before_a_pause_are_delivered_not_drained() {
         let (_tx, source) = source(Arc::new(AtomicBool::new(false)));
-        let mut input = Input::start_with(source, || vec![Event::FocusLost], || {});
+        let mut input = Input::start_with(source, || vec![Event::FocusLost], || {}, || true);
         input.pause();
         assert_eq!(
             input.events.try_recv().ok().map(Result::unwrap),
@@ -591,7 +763,7 @@ mod tests {
 
     #[test]
     fn a_panic_on_the_input_thread_ends_it_so_pausing_returns() {
-        let mut input = Input::start_with(Box::new(|| panic!("boom")), Vec::new, || {});
+        let mut input = Input::start_with(Box::new(|| panic!("boom")), Vec::new, || {}, || true);
         let thread = input.thread.take().unwrap();
         let _ = thread.join();
         assert!(pause_returns(input), "pause() waited forever");
@@ -600,19 +772,198 @@ mod tests {
     #[test]
     fn a_closed_channel_ends_the_thread_while_the_input_lives() {
         let (_tx, idle) = source(Arc::new(AtomicBool::new(false)));
-        let mut input = Input::start_with(idle, Vec::new, || {});
+        let mut input = Input::start_with(idle, Vec::new, || {}, || true);
         input.events.close();
         let thread = input.thread.take().unwrap();
         assert!(ends(thread), "an idle poll notices the closed channel");
         assert_eq!(*input.shared.state.lock().unwrap(), InputState::Ended);
 
         let (tx, busy) = source(Arc::new(AtomicBool::new(false)));
-        let mut input = Input::start_with(busy, Vec::new, || {});
+        let mut input = Input::start_with(busy, Vec::new, || {}, || true);
         input.events.close();
         tx.send(Ok(Event::FocusGained)).unwrap();
         let thread = input.thread.take().unwrap();
         assert!(ends(thread), "a failed send ends the thread");
         assert!(pause_returns(input));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn errors_from_a_closed_terminal_say_it_is_gone() {
+        use std::io::{Error, ErrorKind};
+        for errno in [libc::EIO, libc::EBADF, libc::ENXIO] {
+            assert!(
+                terminal_gone(&Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        assert!(terminal_gone(&Error::from(ErrorKind::UnexpectedEof)));
+        assert!(terminal_gone(&closed_terminal()));
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(!terminal_gone(&Error::from(kind)), "{kind:?}");
+        }
+        assert!(!terminal_gone(&Error::from_raw_os_error(libc::EAGAIN)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_events_from_a_closed_terminal_say_it_is_gone() {
+        for revents in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL] {
+            assert!(hung_up(revents), "{revents:#x}");
+            assert!(hung_up(revents | libc::POLLIN), "{revents:#x} with input");
+        }
+        assert!(!hung_up(libc::POLLIN));
+        assert!(!hung_up(0));
+    }
+
+    /// A pseudo terminal's two sides, as raw descriptors.
+    #[cfg(unix)]
+    fn pty() -> (libc::c_int, libc::c_int) {
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: both out pointers are valid, and the name, termios, and size are optional.
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
+        (master, slave)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_whose_other_side_closed_is_gone_not_readable() {
+        let (master, slave) = pty();
+        // crossterm's poll, which must not run on a closed terminal.
+        let asked = std::cell::Cell::new(0);
+        let crossterm = |_| {
+            asked.set(asked.get() + 1);
+            Ok(false)
+        };
+        assert!(
+            !input_ready_on(Some(slave), Duration::ZERO, crossterm).unwrap(),
+            "a live terminal with no input is not gone"
+        );
+        assert!(asked.get() > 0, "a live terminal is left to crossterm");
+        // SAFETY: `master` came from `openpty` and is closed once.
+        unsafe { libc::close(master) };
+        asked.set(0);
+        let err = input_ready_on(Some(slave), Duration::from_millis(100), crossterm)
+            .expect_err("a closed terminal is an error, not input");
+        assert!(terminal_gone(&err), "{err}");
+        assert_eq!(asked.get(), 0, "crossterm never reads a closed terminal");
+        // SAFETY: `slave` came from `openpty` and is closed once.
+        unsafe { libc::close(slave) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_output_check_fails_once_the_terminal_closed() {
+        let (master, slave) = pty();
+        assert!(output_open(slave), "a live terminal is open");
+        // SAFETY: `master` came from `openpty` and is closed once.
+        unsafe { libc::close(master) };
+        assert!(!output_open(slave), "writes to a closed terminal fail");
+        // SAFETY: `slave` came from `openpty` and is closed once.
+        unsafe { libc::close(slave) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_poll_that_failed_for_now_is_retried_not_a_closed_terminal() {
+        use std::io::{Error, ErrorKind};
+        for errno in [libc::EAGAIN, libc::EINTR] {
+            assert_eq!(
+                poll_outcome(Err(Error::from_raw_os_error(errno))).ok(),
+                Some(false),
+                "errno {errno} is no input yet"
+            );
+        }
+        assert!(poll_outcome(Err(Error::from(ErrorKind::Other))).is_err());
+        assert_eq!(poll_outcome(Ok(libc::POLLIN)).ok(), Some(true));
+        assert_eq!(poll_outcome(Ok(0)).ok(), Some(false));
+        let err = poll_outcome(Ok(libc::POLLIN | libc::POLLHUP)).unwrap_err();
+        assert!(terminal_gone(&err), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_terminal_on_standard_input_is_checked_for_a_hangup() {
+        assert_eq!(tty_to_check(true), Some(libc::STDIN_FILENO));
+        // crossterm reads `/dev/tty` then, which macOS always polls as POLLNVAL.
+        assert_eq!(tty_to_check(false), None);
+        let asked = std::cell::Cell::new(None);
+        let ready = input_ready_on(None, Duration::from_millis(7), |t| {
+            asked.set(Some(t));
+            Ok(true)
+        });
+        assert!(ready.unwrap());
+        assert_eq!(
+            asked.get(),
+            Some(Duration::from_millis(7)),
+            "without a checked terminal crossterm waits the whole timeout"
+        );
+    }
+
+    #[test]
+    fn a_closed_terminal_ends_the_input_even_while_a_read_is_stuck() {
+        let mut input = Input::start_with(
+            Box::new(|| {
+                loop {
+                    std::thread::park();
+                }
+            }),
+            Vec::new,
+            || {},
+            || false,
+        );
+        let err = next(&mut input).expect_err("the input ends with an error");
+        assert!(terminal_gone(&err), "{err}");
+    }
+
+    #[test]
+    fn dropping_the_input_returns_while_its_read_is_stuck() {
+        let input = Input::start_with(
+            Box::new(|| {
+                loop {
+                    std::thread::park();
+                }
+            }),
+            Vec::new,
+            || {},
+            || true,
+        );
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            drop(input);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "dropping the input waited for a read that never returns"
+        );
+    }
+
+    #[test]
+    fn the_channel_closes_once_the_input_thread_ends() {
+        let mut input = Input::start_with(Box::new(|| panic!("boom")), Vec::new, || {}, || true);
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(input.events.blocking_recv().is_none());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(3)),
+            Ok(true),
+            "the main loop learns the input ended"
+        );
     }
 
     /// Serializes the tests that take `handoff_signals`, so no test can end another's handoff

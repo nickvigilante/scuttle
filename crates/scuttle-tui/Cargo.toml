@@ -39,6 +39,8 @@ uuid.workspace = true
 # Keeps Ctrl+C and Ctrl+\ typed in the pager or $EDITOR from killing scuttle. Already in
 # Cargo.lock through crossterm, so it adds no code to the build.
 signal-hook = { version = "0.3", default-features = false }
+# Notices a closed terminal, which crossterm's reader retries forever. Already in Cargo.lock.
+libc = "0.2"
 
 [dev-dependencies]
 insta = "1"
