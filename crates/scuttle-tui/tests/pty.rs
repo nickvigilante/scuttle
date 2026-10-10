@@ -832,7 +832,7 @@ fn exit_after_master_closes(
                 exited = Some(closed.elapsed());
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     if exited.is_none() {
@@ -846,10 +846,14 @@ fn exit_after_master_closes(
 
 #[test]
 fn closing_the_terminal_without_a_hangup_ends_scuttle() {
-    let exited = exit_after_master_closes("dead-terminal-no-hup", false, Duration::from_secs(5));
+    let exited = exit_after_master_closes("dead-terminal-no-hup", false, Duration::from_secs(5))
+        .expect("scuttle was still running 5 seconds after its terminal closed");
+    // Noticing the closed terminal ends the input thread within one poll interval. Left
+    // to crossterm, the thread spins until dropping the input gives up on it after 500 ms,
+    // so an exit this fast shows the detection, not that timeout, ended scuttle.
     assert!(
-        exited.is_some(),
-        "scuttle was still running 5 seconds after its terminal closed"
+        exited < Duration::from_millis(400),
+        "scuttle took {exited:?} to exit, so its input spun until the shutdown timeout"
     );
 }
 

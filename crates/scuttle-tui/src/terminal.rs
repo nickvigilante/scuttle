@@ -351,7 +351,10 @@ impl Input {
             }),
             parsed_events,
             drain_terminal,
-            output_open,
+            #[cfg(unix)]
+            || output_open(libc::STDOUT_FILENO),
+            #[cfg(not(unix))]
+            || true,
         )
     }
 
@@ -519,21 +522,13 @@ fn closed_terminal() -> std::io::Error {
 
 /// Whether `e`, from reading, writing, or polling the terminal, means the terminal is gone:
 /// end of file, or EIO, EBADF, or ENXIO from a hung up, revoked, or closed terminal.
-pub fn terminal_gone(e: &std::io::Error) -> bool {
-    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        matches!(
+#[cfg(unix)]
+fn terminal_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::UnexpectedEof
+        || matches!(
             e.raw_os_error(),
             Some(libc::EIO | libc::EBADF | libc::ENXIO)
         )
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
 }
 
 /// Whether input is waiting for crossterm to read now.
@@ -541,69 +536,75 @@ fn input_waiting() -> std::io::Result<bool> {
     input_ready(std::time::Duration::ZERO)
 }
 
-/// Waits up to `timeout` for an event crossterm can read without blocking. A closed terminal
-/// is an error: crossterm would retry its read of one forever, so it is only asked while the
-/// terminal is open, either for an event it already parsed or once new input arrived.
+/// Waits up to `timeout` for an event crossterm can read without blocking, and fails once
+/// the terminal is gone.
 fn input_ready(timeout: std::time::Duration) -> std::io::Result<bool> {
     #[cfg(unix)]
-    if let Ok(tty) = TtyFd::open() {
-        wait_for_input(tty.fd(), std::time::Duration::ZERO)?;
-        if crossterm::event::poll(std::time::Duration::ZERO)? {
-            return Ok(true);
-        }
-        if timeout.is_zero() || !wait_for_input(tty.fd(), timeout)? {
-            return Ok(false);
-        }
-        return crossterm::event::poll(std::time::Duration::ZERO);
-    }
-    crossterm::event::poll(timeout)
-}
-
-/// Whether the terminal scuttle draws on is still open.
-fn output_open() -> bool {
-    #[cfg(unix)]
     {
-        fd_open(libc::STDOUT_FILENO)
+        // SAFETY: `isatty` only inspects the descriptor.
+        let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        input_ready_on(tty_to_check(stdin_is_tty), timeout, crossterm::event::poll)
     }
     #[cfg(not(unix))]
     {
-        true
+        crossterm::event::poll(timeout)
     }
 }
 
-/// The terminal crossterm reads: standard input when it is a terminal, else `/dev/tty`.
+/// The descriptor whose hangup [`input_ready_on`] watches: standard input when it is a
+/// terminal, which is what crossterm reads then. Otherwise crossterm reads `/dev/tty`, and
+/// no check is made, since macOS reports POLLNVAL for a `/dev/tty` descriptor however live
+/// it is. The output watcher in [`Input::start_with`] still notices a closed terminal then.
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-struct TtyFd(std::os::unix::io::RawFd);
+fn tty_to_check(stdin_is_tty: bool) -> Option<std::os::unix::io::RawFd> {
+    stdin_is_tty.then_some(libc::STDIN_FILENO)
+}
 
+/// [`input_ready`] on `tty`, with `poll` as crossterm's poll. crossterm retries a read of a
+/// closed terminal forever, so `poll` is called only while `tty` is open: for an event it
+/// already parsed, or once new input arrived. Without a `tty` it is left to `poll` alone.
 #[cfg(unix)]
-impl TtyFd {
-    /// Opens the terminal once; later calls share that descriptor, which stays open for the
-    /// life of the process, as crossterm's own does.
-    fn open() -> std::io::Result<TtyFd> {
-        static TTY: std::sync::OnceLock<Option<TtyFd>> = std::sync::OnceLock::new();
-        TTY.get_or_init(|| {
-            use std::os::unix::io::IntoRawFd;
-            // SAFETY: `isatty` only inspects the descriptor.
-            if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-                return Some(TtyFd(libc::STDIN_FILENO));
-            }
-            std::fs::File::open("/dev/tty")
-                .ok()
-                .map(|f| TtyFd(f.into_raw_fd()))
-        })
-        .ok_or_else(|| std::io::Error::other("no terminal"))
+fn input_ready_on(
+    tty: Option<std::os::unix::io::RawFd>,
+    timeout: std::time::Duration,
+    mut poll: impl FnMut(std::time::Duration) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let Some(fd) = tty else {
+        return poll(timeout);
+    };
+    wait_for_input(fd, std::time::Duration::ZERO)?;
+    if poll(std::time::Duration::ZERO)? {
+        return Ok(true);
     }
-
-    fn fd(self) -> std::os::unix::io::RawFd {
-        self.0
+    if timeout.is_zero() || !wait_for_input(fd, timeout)? {
+        return Ok(false);
     }
+    poll(std::time::Duration::ZERO)
 }
 
 /// Whether `revents` from `poll(2)` says the descriptor's terminal is gone.
 #[cfg(unix)]
 fn hung_up(revents: libc::c_short) -> bool {
     revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// What one `poll(2)` of the terminal means: its `revents`, or the error it failed with.
+/// An interrupted or temporarily failed poll is retried later, as no input yet.
+#[cfg(unix)]
+fn poll_outcome(polled: std::io::Result<libc::c_short>) -> std::io::Result<bool> {
+    match polled {
+        Ok(revents) if hung_up(revents) => Err(closed_terminal()),
+        Ok(revents) => Ok(revents & libc::POLLIN != 0),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Waits up to `timeout` for input on `fd`: `true` once some is waiting, `false` when none
@@ -621,23 +622,17 @@ fn wait_for_input(
     let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
     // SAFETY: `pollfd` is one valid, initialized entry, matching the count of 1.
     let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
-    if ready < 0 {
-        let e = std::io::Error::last_os_error();
-        return match e.kind() {
-            std::io::ErrorKind::Interrupted => Ok(false),
-            _ => Err(e),
-        };
-    }
-    if hung_up(pollfd.revents) {
-        return Err(closed_terminal());
-    }
-    Ok(pollfd.revents & libc::POLLIN != 0)
+    poll_outcome(if ready < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(pollfd.revents)
+    })
 }
 
-/// Whether `fd` is still open for writing: an empty write fails with EIO once its terminal
-/// has hung up or been revoked, and writes nothing otherwise.
+/// Whether `fd`, the terminal scuttle draws on, is still open: an empty write fails with EIO
+/// once its terminal has hung up or been revoked, and writes nothing otherwise.
 #[cfg(unix)]
-fn fd_open(fd: std::os::unix::io::RawFd) -> bool {
+fn output_open(fd: std::os::unix::io::RawFd) -> bool {
     // SAFETY: a zero-length write reads nothing from the buffer.
     let written = unsafe { libc::write(fd, std::ptr::null(), 0) };
     written >= 0 || !terminal_gone(&std::io::Error::last_os_error())
@@ -792,6 +787,7 @@ mod tests {
         assert!(pause_returns(input));
     }
 
+    #[cfg(unix)]
     #[test]
     fn errors_from_a_closed_terminal_say_it_is_gone() {
         use std::io::{Error, ErrorKind};
@@ -846,19 +842,75 @@ mod tests {
     #[test]
     fn a_terminal_whose_other_side_closed_is_gone_not_readable() {
         let (master, slave) = pty();
+        // crossterm's poll, which must not run on a closed terminal.
+        let asked = std::cell::Cell::new(0);
+        let crossterm = |_| {
+            asked.set(asked.get() + 1);
+            Ok(false)
+        };
         assert!(
-            !wait_for_input(slave, Duration::ZERO).unwrap(),
-            "no input yet"
+            !input_ready_on(Some(slave), Duration::ZERO, crossterm).unwrap(),
+            "a live terminal with no input is not gone"
         );
-        assert!(fd_open(slave), "a live terminal is open");
+        assert!(asked.get() > 0, "a live terminal is left to crossterm");
         // SAFETY: `master` came from `openpty` and is closed once.
         unsafe { libc::close(master) };
-        let err = wait_for_input(slave, Duration::from_millis(100))
+        asked.set(0);
+        let err = input_ready_on(Some(slave), Duration::from_millis(100), crossterm)
             .expect_err("a closed terminal is an error, not input");
         assert!(terminal_gone(&err), "{err}");
-        assert!(!fd_open(slave), "writes to a closed terminal fail");
+        assert_eq!(asked.get(), 0, "crossterm never reads a closed terminal");
         // SAFETY: `slave` came from `openpty` and is closed once.
         unsafe { libc::close(slave) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_output_check_fails_once_the_terminal_closed() {
+        let (master, slave) = pty();
+        assert!(output_open(slave), "a live terminal is open");
+        // SAFETY: `master` came from `openpty` and is closed once.
+        unsafe { libc::close(master) };
+        assert!(!output_open(slave), "writes to a closed terminal fail");
+        // SAFETY: `slave` came from `openpty` and is closed once.
+        unsafe { libc::close(slave) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_poll_that_failed_for_now_is_retried_not_a_closed_terminal() {
+        use std::io::{Error, ErrorKind};
+        for errno in [libc::EAGAIN, libc::EINTR] {
+            assert_eq!(
+                poll_outcome(Err(Error::from_raw_os_error(errno))).ok(),
+                Some(false),
+                "errno {errno} is no input yet"
+            );
+        }
+        assert!(poll_outcome(Err(Error::from(ErrorKind::Other))).is_err());
+        assert_eq!(poll_outcome(Ok(libc::POLLIN)).ok(), Some(true));
+        assert_eq!(poll_outcome(Ok(0)).ok(), Some(false));
+        let err = poll_outcome(Ok(libc::POLLIN | libc::POLLHUP)).unwrap_err();
+        assert!(terminal_gone(&err), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_terminal_on_standard_input_is_checked_for_a_hangup() {
+        assert_eq!(tty_to_check(true), Some(libc::STDIN_FILENO));
+        // crossterm reads `/dev/tty` then, which macOS always polls as POLLNVAL.
+        assert_eq!(tty_to_check(false), None);
+        let asked = std::cell::Cell::new(None);
+        let ready = input_ready_on(None, Duration::from_millis(7), |t| {
+            asked.set(Some(t));
+            Ok(true)
+        });
+        assert!(ready.unwrap());
+        assert_eq!(
+            asked.get(),
+            Some(Duration::from_millis(7)),
+            "without a checked terminal crossterm waits the whole timeout"
+        );
     }
 
     #[test]
